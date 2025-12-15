@@ -26,6 +26,7 @@ from countdown import CTDDataset
 from sudoku import SudokuDataset
 
 
+# Map CLI dataset names to dataset classes
 DATASET_MAP = {
     "gsm8k": GSM8KDataset,
     "math": MATH500Dataset,
@@ -35,6 +36,7 @@ DATASET_MAP = {
 
 
 def init_seed(seed):
+    # Set RNG seeds for reproducibility across libraries
     random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
@@ -44,6 +46,7 @@ def init_seed(seed):
 
 
 def setup_ddp():
+    # Initialize torch.distributed on the current node
     dist.init_process_group("nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -51,6 +54,7 @@ def setup_ddp():
 
 
 def cleanup_ddp():
+    # Tear down the distributed process group cleanly
     dist.destroy_process_group()
 
 
@@ -66,6 +70,7 @@ def evaluate(
     filename=None,
     remasking="low_confidence",
 ):
+    # Loop over evaluation dataloader and capture generations/metrics
     model.eval()
     total_processed = torch.tensor(0, device=model.device)
     wall_times = []
@@ -79,6 +84,7 @@ def evaluate(
         questions = batch["questions"]
         prompts = batch["prompts"]
 
+        # Run diffusion-style generation for the current mini-batch
         out = generate(
             model,
             input_ids,
@@ -116,6 +122,7 @@ def evaluate(
             print("-" * 50)
             print(f"Ground truth: {gt_answers[idx]}")
 
+    # Aggregate simple wall-clock stats for logging
     avg_wall_time = sum(wall_times) / len(wall_times)
     metrics = {
         "wall_time": avg_wall_time,
@@ -145,6 +152,7 @@ class CustomDistributedSampler(DistributedSampler):
         seed=0,
         drop_last=False,
     ) -> None:
+        # Mirror torch DistributedSampler but avoid padding indices
         if num_replicas is None:
             if not dist.is_available():
                 raise RuntimeError("Requires distributed package to be available")
@@ -177,6 +185,7 @@ class CustomDistributedSampler(DistributedSampler):
 
 
 if __name__ == "__main__":
+    # Entrypoint: parse CLI args, set up DDP, and evaluate requested dataset
     init_seed(42)
 
     # Note: This evaluation script saves only model generations. A separate parser is used later to extract
@@ -185,6 +194,7 @@ if __name__ == "__main__":
     local_rank = setup_ddp()
 
     parser = argparse.ArgumentParser()
+    # Core paths and hyperparameters exposed to the cluster job
     parser.add_argument("--model_path", type=str, default="/data1/shared/LLaDA-8B-Instruct/")
     parser.add_argument("--few_shot", type=int, default=0)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -206,12 +216,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.seed is not None:
+        # Allow overriding the default seed via CLI
         init_seed(args.seed)
 
     args.diffusion_steps = args.gen_length // 2
+    # How many eval examples to consume per dataset (-1 means full split)
     num_evals = {"gsm8k": -1, "math": -1, "countdown": 256, "sudoku": 256}
 
     if len(args.checkpoint_path):
+        # Encode checkpoint identity in output filenames
         model_name = args.checkpoint_path.split("/")
         model_name = model_name[-2] + "_" + model_name[-1]
     else:
@@ -224,6 +237,7 @@ if __name__ == "__main__":
         model_name = model_name + f"_{args.suffix}"
 
     os.makedirs(args.output_dir, exist_ok=True)
+    # Each rank writes a shard; rank 0 is canonical
     filename = f"{args.output_dir}/{args.dataset}_{model_name}_{args.gen_length}_{args.diffusion_steps}_{dist.get_rank()}_generations.json"
     filename_0 = f"{args.output_dir}/{args.dataset}_{model_name}_{args.gen_length}_{args.diffusion_steps}_0_generations.json"
     # if the file already exists, directly exit
@@ -238,6 +252,7 @@ if __name__ == "__main__":
         import sys
         sys.exit(0)
 
+    # Load the diffusion LM (optionally LoRA-tuned later)
     model = AutoModel.from_pretrained(args.model_path, trust_remote_code=True, torch_dtype=torch.bfloat16).to(
         local_rank
     )
@@ -245,6 +260,7 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
 
     if args.checkpoint_path:
+        # Attach PEFT weights if provided and sync across ranks
         model = PeftModel.from_pretrained(model, args.checkpoint_path, torch_dtype=torch.bfloat16).to(
             local_rank
         )
@@ -255,6 +271,7 @@ if __name__ == "__main__":
                 dist.broadcast(param.data, src=0)
             print(f"Rank {local_rank}: Parameters synchronized")
 
+    # Instantiate dataset class with optional few-shot and subsample controls
     dataset = DATASET_MAP[args.dataset](
         tokenizer,
         subsample=num_evals[args.dataset],
@@ -262,6 +279,7 @@ if __name__ == "__main__":
         add_reasoning=True,  # prefill for all models
     )
 
+    # Build deterministic distributed dataloader for evaluation
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -271,6 +289,7 @@ if __name__ == "__main__":
 
     print(f"Saving generations to {filename}")
 
+    # Run generation loop and collect JSON-serializable metrics
     metrics = evaluate(
         model,
         tokenizer,
@@ -284,6 +303,7 @@ if __name__ == "__main__":
     )
 
     if not args.dont_save:
+        # Persist generations and metadata for downstream parsing
         with open(filename, "w") as f:
             json.dump(
                 {
