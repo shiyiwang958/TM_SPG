@@ -1,0 +1,170 @@
+import torch
+import wandb
+import os
+import hydra
+from omegaconf import DictConfig, OmegaConf
+from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig
+from peft import LoraConfig
+import pytorch_lightning as pl
+from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.utilities import rank_zero_only
+from lightning_modules import TiltMatchingModule
+
+from reward_func import (
+    xmlcount_reward_func,
+    soft_format_reward_func,
+    strict_format_reward_func,
+    int_reward_func,
+    correctness_reward_func,
+    countdown_reward_func,
+    correctness_reward_func_math,
+    sudoku_reward_func,
+    boxed_and_answer_tags_format_reward,
+    reward_len,
+)
+from data_utils import (
+    get_gsm8k_questions,
+    get_countdown_questions,
+    get_sudoku_questions,
+    get_sudoku_questions_new,
+    set_random_seed,
+    get_math_questions,
+)
+
+def train(cfg: DictConfig):
+
+    # Set seed for reproducibility
+    set_random_seed(cfg.seed)
+
+    # Load dataset based on configuration
+    if cfg.dataset == "gsm8k":
+        dataset = get_gsm8k_questions("train")
+        reward_functions = [
+            xmlcount_reward_func,
+            soft_format_reward_func,
+            strict_format_reward_func,
+            int_reward_func,
+            correctness_reward_func,
+        ]
+    elif cfg.dataset == "countdown":
+        dataset = get_countdown_questions("train")
+        reward_functions = [countdown_reward_func]
+    elif cfg.dataset == "sudoku_new":
+        dataset = get_sudoku_questions_new(few_shot=cfg.few_shot)
+        reward_functions = [sudoku_reward_func]
+    elif cfg.dataset == "math":
+        dataset = get_math_questions("train")
+        reward_functions = [
+            correctness_reward_func_math,
+            boxed_and_answer_tags_format_reward,
+        ]
+
+    # Shuffle dataset with fixed seed for reproducibility
+    dataset = dataset.shuffle(seed=cfg.seed)
+
+    # Split dataset if needed
+    if grpo_config.dataset in ["countdown", "sudoku", "sudoku_new"]:
+        train_set = dataset.select(range(0, len(dataset) - 500))  # Leave last 500 for evaluation
+    else:
+        train_set = dataset
+
+    # Set up device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 4 bit quantization configuration
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+    )
+
+    # Load base model and tokenizer
+    base_model = AutoModel.from_pretrained(
+        cfg.base_model_path,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        quantization_config=bnb_config,
+    ).to(device)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.base_model_path, trust_remote_code=True)
+    tokenizer.pad_token = tokenizer.eos_token
+    base_model.config.use_cache = False
+
+    # Load the Tilt Matching training module
+    model = TiltMatchingModule(
+        base_model=base_model,
+        tokenizer=tokenizer,
+        training_prompts_dataset=train_set,
+        reward_funcs=reward_functions,
+        **cfg,
+    )
+
+    # Configure trainer TODO: Check
+    trainer_kwargs = dict(
+        num_nodes = cfg.training.nodes,
+        accelerator = "gpu",
+        devices = cfg.training.devices,
+        strategy = "ddp" if cfg.training.nodes > 1 else "auto",
+
+        accumulate_grad_batches = 1,
+
+        log_every_n_steps = 10,
+        enable_checkpointing = True,
+        default_root_dir = cfg.training.checkpoint_dir,
+        enable_progress_bar = False,
+
+        # Unlimited steps; stop manually by setting trainer.should_stop = True
+        max_steps = -1,
+        # Lightning still requires a finite epoch cap; set a very large number
+        max_epochs = 10**12,
+    )
+    eps = 1e-6
+    ckpt_steps = int(cfg.tm.steps_per_h * math.floor((cfg.training.checkpoint_freq + eps) / cfg.tm.h))
+
+    checkpoint_callback = ModelCheckpoint(
+        save_last = True,
+        dirpath = cfg.training.checkpoint_dir,
+        save_top_k = -1,
+        every_n_train_steps = ckpt_steps,
+        save_on_train_epoch_end = False,
+        filename = "checkpoint-a-{ckpt_a:.3f}",
+        auto_insert_metric_name=False,
+    )
+
+    # finish trainer kwargs
+    trainer_kwargs["callbacks"] = [checkpoint_callback]
+    if wandb_logger is not None:
+        trainer_kwargs["logger"] = wandb_logger   
+    trainer = pl.Trainer(**trainer_kwargs)
+
+    # Create a dummy dataloader just to control how many times training_step is called
+    dummy_dataset = torch.utils.data.TensorDataset(torch.zeros(1))
+    dummy_loader = torch.utils.data.DataLoader(dummy_dataset, batch_size=1)
+
+    # Train the model
+    resume_path = getattr(cfg.training, "resume_path", None)
+    print(f"Resume path is: {resume_path}")
+    if resume_path is not None:
+        trainer.fit(
+            model,
+            train_dataloaders = dummy_loader,
+            ckpt_path = resume_path #TODO: Later add resume functionality
+        )
+    else:
+        trainer.fit(
+            model,
+            train_dataloaders = dummy_loader,
+        )
+
+
+#-------------------------------- Train ------------------------------------
+@hydra.main(config_path = "config", config_name = "tilt_matching.yaml")
+def main(cfg: DictConfig):
+    # print("[DEBUG] Printing out config in tilt_train main")
+    #print(OmegaConf.to_yaml(cfg))
+    train(cfg)
+
+
+if __name__=="__main__":
+    main()
