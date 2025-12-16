@@ -1,7 +1,6 @@
 import copy
 import logging
 import os
-from tabnanny import check
 from datetime import datetime
 import itertools
 from webbrowser import get
@@ -50,14 +49,22 @@ class TiltMatchingModule(pl.LightningModule):
         self.a_end = self.hparams.tm.a_end
         self.mask_id = 126336 # default from LLaDA
         self.checkpoint_freq = getattr(self.hparams.training, "checkpoint_freq", 0.3)
-        self._ckpt_eps = 1e-6 #TODO: What is this?
         self.cv = self.hparams.tm.control_variate
+        self.buffer = None
+        self.buffer_rewards = None
         self.num_buffer_distinct_prompts = self.hparams.tm.num_buffer_distinct_prompts
         self.buffer_update_counter = 0
         self._step_counter = 0
         # TODO: Dropouts?
 
-        # TODO: LR Scheduling
+        self.base_lr = float(getattr(self.hparams.etm, "learning_rate", 1e-3))
+        self.lr_schedule = getattr(self.hparams.etm, "lr_schedule", None)
+        self.lr_warmup_steps = int(getattr(self.hparams.etm, "lr_warmup_steps", 0))  # warmup per h-phase
+        self.min_lr = float(getattr(self.hparams.etm, "min_lr", 0.0))               # target at end of decay in each phase
+        self._etm_scheduler = None
+        self._etm_sched_state = None
+
+        # TODO: grad-clipping
 
     def on_train_start(self):
         super().on_train_start()
@@ -67,8 +74,14 @@ class TiltMatchingModule(pl.LightningModule):
             g["lr"] = self.hparams.tm.base_lr #TODO: implement LR
         self._init_tm_scheduler()
         # TODO: move training_prompts to device
+        # franklin: GPT says train_prompts are plain texts and don't have to move to device. Only torch tensors need to be on device.
 
+        print("Building initial buffer...")
+        buffer_start_time = datetime.now()
         self.update_buffer(self.num_buffer_distinct_prompts, self.hparams.tm.num_completions_per_prompt)
+        buffer_end_time = datetime.now()
+        buffer_build_time = (buffer_end_time - buffer_start_time).total_seconds()
+        print(f"Finish building sample buffer, took {buffer_build_time}")
 
     def _prepare_prompts(self, num_dinstinct_prompts, num_completions_per_prompts):
         """
@@ -107,7 +120,7 @@ class TiltMatchingModule(pl.LightningModule):
             prompts_text.append(text)
 
         input_ids = self.tokenizer(
-            text=repeated_prompts,
+            text=prompts_text,
             return_tensors="pt",
             padding=True,
             padding_side="left",
@@ -139,8 +152,8 @@ class TiltMatchingModule(pl.LightningModule):
         device = next(self.model.parameters()).device
 
         # ---- 1. Prepare prompts as token IDs ----
-        if num_buffer_updates == num_buffer_distinct_prompts:
-            update_rows = list(range(num_buffer_distinct_prompts))
+        if num_buffer_updates == self.num_buffer_distinct_prompts:
+            update_rows = list(range(self.num_buffer_distinct_prompts))
             self.buffer_update_counter = 0
         else:
             update_rows = [
@@ -161,7 +174,7 @@ class TiltMatchingModule(pl.LightningModule):
                 steps=self.hparams.diffusion_steps,
                 gen_length=gen_length,
                 block_length=self.hparams.block_length,
-                temperature=self.hparams.sampling_temperature,
+                temperature=self.hparams.sampling_temperature, #franklin: Temp = 1.0 is much better!
                 cfg_scale=self.hparams.cfg_scale,
                 remasking=self.hparams.remasking_strategy,
             ) # [total_batch, prompt_len + gen_length]
@@ -233,6 +246,9 @@ class TiltMatchingModule(pl.LightningModule):
             self.buffer_rewards = new_rewards_block
         else:
             self.buffer_rewards[update_rows, :, :] = new_rewards_block
+
+    # franklin: maybe getting the model running first and then set up LR scheduler later.
+    # otherwise the code is too much to handle at once.
 
     def generate(
         self,
