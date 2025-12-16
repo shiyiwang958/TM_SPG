@@ -125,6 +125,27 @@ def main(grpo_config, model_config):
     else:
         raise ValueError(f"Invalid trainer: {grpo_config.trainer}")
 
+    train_dataloader = trainer.get_train_dataloader()
+
+    if trainer.accelerator.is_main_process:
+        import math
+        L = len(train_dataloader)
+        print("len(train_dataloader) =", L)  # microsteps per epoch
+        K = trainer.args.gradient_accumulation_steps
+        mu = trainer.num_iterations
+        W = trainer.accelerator.num_processes
+        G = trainer.args.num_generations
+        Gb = trainer.args.generation_batch_size
+        U = math.ceil(L / K)  # optimizer (global) steps per epoch
+        S_gen = math.ceil(U / mu)  # generation optimizer steps per epoch
+        prompts_per_step = (Gb // G) * W  # distinct prompts per generation step (global)
+
+        print("optimizer steps per epoch =", U)
+        print("generation optimizer steps per epoch ≈", S_gen)
+        print("distinct prompts per generation step (global) =", prompts_per_step)
+        print("distinct prompts used for generation per epoch ≈",
+            S_gen * prompts_per_step)
+
     trainer.train()
 
 

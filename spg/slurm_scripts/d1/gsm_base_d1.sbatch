@@ -1,17 +1,19 @@
 #!/bin/bash
-#SBATCH --output=../../slurm/%A/slurm.out
+#SBATCH --output=/n/home06/yuyuan0/TM_SPG/output_logs/%A/slurm.out
 #SBATCH --job-name=gsm-d1
-#SBATCH --time=72:00:00
+#SBATCH --partition=gpu
+#SBATCH --account=albergo_lab
+#SBATCH --time=1:00:00
 #SBATCH --wait-all-nodes=1
 #SBATCH --open-mode=append
 
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:8
-#SBATCH --qos=storygen_high
-#SBATCH --account=storygen
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=50
+#SBATCH --mail-type=END,FAIL,BEGIN
+#SBATCH --mail-user=yuyuanchen@math.harvard.edu
 
-export LOGDIR=../../logs
+export LOGDIR=./logs
 mkdir -p $LOGDIR
 echo $LOGDIR
 
