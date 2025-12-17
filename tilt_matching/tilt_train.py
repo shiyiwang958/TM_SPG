@@ -1,5 +1,6 @@
 import torch
 import wandb
+import math
 import os
 import hydra
 import math
@@ -71,6 +72,9 @@ def train(cfg: DictConfig):
     elif cfg.dataset == "countdown":
         dataset = get_countdown_questions("train")
         reward_functions = [countdown_reward_func]
+    elif cfg.dataset == "sudoku":
+        dataset = get_sudoku_questions()
+        reward_functions = [sudoku_reward_func]
     elif cfg.dataset == "sudoku_new":
         dataset = get_sudoku_questions_new(few_shot=cfg.few_shot)
         reward_functions = [sudoku_reward_func]
@@ -111,6 +115,7 @@ def train(cfg: DictConfig):
     tokenizer = AutoTokenizer.from_pretrained(cfg.base_model_path, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
     base_model.config.use_cache = False
+    # TODO: Need to load the LoRA weights onto the base model when starting from a checkpoint
 
     # Load the Tilt Matching training module
     model = TiltMatchingModule(

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --output=../../slurm/%A/slurm.out
+#SBATCH --output=/n/home06/yuyuan0/TM_SPG/output_logs/%A/slurm.out
 #SBATCH --job-name=gsm-d1
 #SBATCH --time=72:00:00
 #SBATCH --partition=kempner
