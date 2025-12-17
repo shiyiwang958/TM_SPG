@@ -35,6 +35,7 @@ from data_utils import (
 )
 
 def main(grpo_config, model_config):
+    print("[DEBUG] Inside diffu_grpo_train main")
 
     # Set seed for reproducibility
     set_random_seed(grpo_config.seed)
@@ -64,6 +65,7 @@ def main(grpo_config, model_config):
             correctness_reward_func_math,
             boxed_and_answer_tags_format_reward,
         ]
+    print("[DEBUG] dataset loaded")
 
     # Shuffle dataset with fixed seed for reproducibility
     dataset = dataset.shuffle(seed=grpo_config.seed)
@@ -142,9 +144,9 @@ def main(grpo_config, model_config):
 
         print("optimizer steps per epoch =", U)
         print("generation optimizer steps per epoch ≈", S_gen)
-        print("distinct prompts per generation step (global) =", prompts_per_step)
+        print("distinct prompts per generation microstep =", prompts_per_step)
         print("distinct prompts used for generation per epoch ≈",
-            S_gen * prompts_per_step)
+            S_gen * prompts_per_step * K)
 
     trainer.train()
 

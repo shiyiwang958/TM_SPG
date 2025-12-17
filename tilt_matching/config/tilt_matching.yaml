@@ -1,77 +1,64 @@
-#----------------------------------------------------------------------------------------------------
-# ModelConfig
+#-----------------Tilt Matching Training Config-----------------
+tm:
+  a_end: 1.0
+  buffer_chunk_size: 8
+  buffer_refresh_steps: 64
+  control_variate: 1.0
+  h: 0.02
+  loss_type: itm
+  num_batch_prompts: 1
+  num_buffer_prompts: 4
+  num_buffer_refresh: 1
+  num_completions_per_prompt: 4
+  steps_per_h: 2000
+
+#-----------------Optimizer Config-----------------
+adam_beta1: 0.9
+adam_beta2: 0.99
+adam_epsilon: 1e-8
+weight_decay: 0.1
+
+max_grad_norm: 0.2
+learning_rate: 3e-6
+lr_decay_ratio: 0.2
+lr_min: 0.0
+lr_scheduler_type: linear
+lr_warmup_ratio: 0.1
+
+#-----------------Diffusion Generation Config-----------------
+block_length: 32
+cfg_scale: 0.0 #TODO: check
+diffusion_steps: 128
+max_completion_length: 256
+max_prompt_length: 1132  # for sudoku with few_shot=3
+remasking_strategy: low_confidence # or random
+sampling_temperature: 1.0
+
+#-----------------Model Config-----------------
 use_peft: true
 torch_dtype: bfloat16
 load_in_4bit: true
-base_model_path: 1 # TODO
-
-attn_implementation: flash_attention_2
+base_model_path: /n/netscratch/albergo_lab/Everyone/frank/hf_models/LLaDA-8B-Instruct
+attn_implementation: flash_attention_2 # TODO: What's this?
 
 lora_r: 128
 lora_alpha: 64
 lora_dropout: 0.05
 peft_task_type: CAUSAL_LM
 
+#-----------------Logging and Checkpointing Config-----------------
+checkpoint_dir: /n/netscratch/albergo_lab/Everyone/llada_tm
+checkpoint_freq: 0.2  # in units of h
+metrics_log_every: 10
+resume_path:  # leave empty if not resuming
+wandb:
+  entity: "yuyuanchen-harvard-university"
+  project: "LLaDA_TM"
+  name: "test_skeleton"
+
+#-----------------Other Training Config-----------------
 dataset: sudoku_new
+few_shot: 3
 seed: 42
-bf16: true
-
-sync_ref_model: True
-ref_model_sync_steps: 64
-
-adam_beta1: 0.9
-adam_beta2: 0.99
-weight_decay: 0.1
-max_grad_norm: 0.2
-
-use_vllm: false
-vllm_device: auto
-vllm_gpu_memory_utilization: 0.9
-
-warmup_ratio: 0.0001
-logging_steps: 1
-learning_rate: 3e-6
-lr_scheduler_type: constant_with_warmup
-
-num_generations: 6
-num_train_epochs: 10
-
-per_device_eval_batch_size: 1
-per_device_train_batch_size: 6
-gradient_accumulation_steps: 4
-
-
-gradient_checkpointing: false
-gradient_checkpointing_kwargs:
-  use_reentrant: false
-
-resume_from_checkpoint: false
-
-run_name: gsm_sft_bs12
-output_dir: /checkpoints/gsm_sft_bs12  # <-- Replace with desired output directory
-
-# Parameters for saving checkpoints
-save_steps: 100
-save_strategy: steps
-save_total_limit: 500 
-
-
-
-
-#-----------------Tilt Matching Training Config----------------------
-tm:
-  a_end: 1.0
-  control_variate: 1.0
-  h: 0.02
-  num_buffer_distinct_prompts: 1024
-  um_completions_per_prompt: 8
-  steps_per_h: 2000
-
-# Diffusion
-max_completion_length: 256
-max_prompt_length: 200
-block_length: 32
-diffusion_steps: 128
-remasking_strategy: low_confidence # or random
-sampling_temperature: 1.0
-cfg_scale: 0.0 #TODO: check
+nodes: 1
+devices: 1 # 8? 4?

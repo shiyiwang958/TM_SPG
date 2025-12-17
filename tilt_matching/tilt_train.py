@@ -3,9 +3,9 @@ import wandb
 import math
 import os
 import hydra
+import math
 from omegaconf import DictConfig, OmegaConf
 from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig
-from peft import LoraConfig
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
@@ -27,16 +27,37 @@ from reward_func import (
 from data_utils import (
     get_gsm8k_questions,
     get_countdown_questions,
-    get_sudoku_questions,
     get_sudoku_questions_new,
     set_random_seed,
     get_math_questions,
 )
 
 def train(cfg: DictConfig):
-
     # Set seed for reproducibility
     set_random_seed(cfg.seed)
+
+    # Set wandb logger if specified
+    if "wandb" in cfg and rank_zero_only.rank == 0:
+        wandb_name = cfg.wandb.name
+        init_kwargs = dict(
+            project = cfg.wandb.project,
+            entity = cfg.wandb.entity,
+            name = wandb_name,
+            config = OmegaConf.to_container(cfg, resolve = True)
+        )
+        # resume wandb run if we're resuming from a checkpoint
+        if "resume_path" in cfg:
+            init_kwargs["resume"] = "allow"
+
+        # init wandb    
+        wandb.init(**init_kwargs)
+        wandb_logger = WandbLogger(
+            project = wandb.run.project,
+            name = wandb.run.name,
+            log_model = False,
+        )
+    else:
+        wandb_logger = None
 
     # Load dataset based on configuration
     if cfg.dataset == "gsm8k":
@@ -107,16 +128,17 @@ def train(cfg: DictConfig):
 
     # Configure trainer TODO: Check
     trainer_kwargs = dict(
-        num_nodes = cfg.training.nodes,
+        num_nodes = cfg.nodes,
         accelerator = "gpu",
-        devices = cfg.training.devices,
-        strategy = "ddp" if cfg.training.nodes > 1 else "auto",
+        devices = cfg.devices,
+        strategy = "ddp" if cfg.nodes > 1 else "auto",
+        precision="bf16-mixed",
 
         accumulate_grad_batches = 1,
 
-        log_every_n_steps = 10,
+        log_every_n_steps = 1,
         enable_checkpointing = True,
-        default_root_dir = cfg.training.checkpoint_dir,
+        default_root_dir = cfg.checkpoint_dir,
         enable_progress_bar = False,
 
         # Unlimited steps; stop manually by setting trainer.should_stop = True
@@ -125,11 +147,11 @@ def train(cfg: DictConfig):
         max_epochs = 10**12,
     )
     eps = 1e-6
-    ckpt_steps = int(cfg.tm.steps_per_h * math.floor((cfg.training.checkpoint_freq + eps) / cfg.tm.h))
+    ckpt_steps = int(cfg.tm.steps_per_h * math.floor((cfg.checkpoint_freq + eps) / cfg.tm.h))
 
     checkpoint_callback = ModelCheckpoint(
         save_last = True,
-        dirpath = cfg.training.checkpoint_dir,
+        dirpath = cfg.checkpoint_dir,
         save_top_k = -1,
         every_n_train_steps = ckpt_steps,
         save_on_train_epoch_end = False,
@@ -140,15 +162,15 @@ def train(cfg: DictConfig):
     # finish trainer kwargs
     trainer_kwargs["callbacks"] = [checkpoint_callback]
     if wandb_logger is not None:
-        trainer_kwargs["logger"] = wandb_logger   
+        trainer_kwargs["logger"] = wandb_logger
     trainer = pl.Trainer(**trainer_kwargs)
 
-    # Create a dummy dataloader just to control how many times training_step is called
+    # Create a dummy dataloader since training is handled inside the module
     dummy_dataset = torch.utils.data.TensorDataset(torch.zeros(1))
     dummy_loader = torch.utils.data.DataLoader(dummy_dataset, batch_size=1)
 
     # Train the model
-    resume_path = getattr(cfg.training, "resume_path", None)
+    resume_path = getattr(cfg, "resume_path", None)
     print(f"Resume path is: {resume_path}")
     if resume_path is not None:
         trainer.fit(
