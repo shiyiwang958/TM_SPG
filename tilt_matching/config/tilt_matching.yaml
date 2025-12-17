@@ -1,14 +1,15 @@
 #-----------------Tilt Matching Training Config-----------------
 tm:
   a_end: 1.0
+  buffer_chunk_size: 8
   buffer_refresh_steps: 64
   control_variate: 1.0
   h: 0.02
   loss_type: itm
-  num_batch_prompts: 128
-  num_buffer_prompts: 1024
-  num_buffer_refresh: 128
-  num_completions_per_prompt: 8
+  num_batch_prompts: 1
+  num_buffer_prompts: 4
+  num_buffer_refresh: 1
+  num_completions_per_prompt: 4
   steps_per_h: 2000
 
 #-----------------Optimizer Config-----------------
@@ -29,7 +30,7 @@ block_length: 32
 cfg_scale: 0.0 #TODO: check
 diffusion_steps: 128
 max_completion_length: 256
-max_prompt_length: 200
+max_prompt_length: 1132  # for sudoku with few_shot=3
 remasking_strategy: low_confidence # or random
 sampling_temperature: 1.0
 
@@ -46,6 +47,7 @@ lora_dropout: 0.05
 peft_task_type: CAUSAL_LM
 
 #-----------------Logging and Checkpointing Config-----------------
+checkpoint_dir: /n/netscratch/albergo_lab/Everyone/llada_tm
 checkpoint_freq: 0.2  # in units of h
 metrics_log_every: 10
 resume_path:  # leave empty if not resuming
@@ -56,7 +58,7 @@ wandb:
 
 #-----------------Other Training Config-----------------
 dataset: sudoku_new
+few_shot: 3
 seed: 42
-bf16: true
 nodes: 1
 devices: 1 # 8? 4?

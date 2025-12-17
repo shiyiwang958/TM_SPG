@@ -127,12 +127,13 @@ def train(cfg: DictConfig):
         accelerator = "gpu",
         devices = cfg.devices,
         strategy = "ddp" if cfg.nodes > 1 else "auto",
+        precision="bf16-mixed",
 
         accumulate_grad_batches = 1,
 
-        log_every_n_steps = 10,
+        log_every_n_steps = 1,
         enable_checkpointing = True,
-        default_root_dir = cfg.training.checkpoint_dir,
+        default_root_dir = cfg.checkpoint_dir,
         enable_progress_bar = False,
 
         # Unlimited steps; stop manually by setting trainer.should_stop = True
@@ -141,11 +142,11 @@ def train(cfg: DictConfig):
         max_epochs = 10**12,
     )
     eps = 1e-6
-    ckpt_steps = int(cfg.tm.steps_per_h * math.floor((cfg.training.checkpoint_freq + eps) / cfg.tm.h))
+    ckpt_steps = int(cfg.tm.steps_per_h * math.floor((cfg.checkpoint_freq + eps) / cfg.tm.h))
 
     checkpoint_callback = ModelCheckpoint(
         save_last = True,
-        dirpath = cfg.training.checkpoint_dir,
+        dirpath = cfg.checkpoint_dir,
         save_top_k = -1,
         every_n_train_steps = ckpt_steps,
         save_on_train_epoch_end = False,
@@ -164,7 +165,7 @@ def train(cfg: DictConfig):
     dummy_loader = torch.utils.data.DataLoader(dummy_dataset, batch_size=1)
 
     # Train the model
-    resume_path = getattr(cfg.training, "resume_path", None)
+    resume_path = getattr(cfg, "resume_path", None)
     print(f"Resume path is: {resume_path}")
     if resume_path is not None:
         trainer.fit(

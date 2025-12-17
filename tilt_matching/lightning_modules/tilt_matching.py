@@ -5,7 +5,6 @@ import os
 from datetime import datetime
 import itertools
 import wandb
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -13,7 +12,7 @@ import pytorch_lightning as pl
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from peft import LoraConfig, get_peft_model
-# from tilt_matching.tilt_train import train
+
 
 class TiltMatchingModule(pl.LightningModule):
     def __init__(self, base_model, tokenizer, training_prompts_dataset, reward_funcs, **cfg):
@@ -66,7 +65,8 @@ class TiltMatchingModule(pl.LightningModule):
 
         # LR Scheduling
         self.lr = self.hparams.learning_rate
-        self.lr_scheduler_type = self.hparams.lr_scheduler_type  # "constant_with_warmup", etc.
+        self.lr_scheduler_type = self.hparams.lr_scheduler_type
+        self.lr_decay_ratio = self.hparams.lr_decay_ratio
         self.lr_warmup_ratio = getattr(self.hparams, "lr_warmup_ratio", 0)
         self.lr_min = getattr(self.hparams, "lr_min", 0.0)
         self._tm_sched_state = None
@@ -78,7 +78,6 @@ class TiltMatchingModule(pl.LightningModule):
         for g in self.tm_opt.param_groups:
             g["lr"] = self.lr
         self._init_tm_scheduler()
-        # TODO: move training_prompts to device
 
         self._update_buffer(self.base_model, self.num_buffer_prompts, self.comps_per_prompt)
         print(f"[DEBUG] Buffer initialized with shape {self.buffer.shape}")
@@ -284,11 +283,6 @@ class TiltMatchingModule(pl.LightningModule):
             add_special_tokens=False,
         )["input_ids"].to(self.device)
 
-        # # ---- 4. Optional prompt-length truncation (keep last tokens) ----
-        # max_prompt_length = getattr(self.hparams, "max_prompt_length", -1)
-        # if max_prompt_length > 0:
-        #     input_ids = input_ids[:, -max_prompt_length:]
-
         return input_ids.repeat_interleave(num_completions_per_prompts, dim=0)
 
     def _update_buffer(self, model, num_buffer_updates, num_completions_per_prompt):
@@ -327,18 +321,23 @@ class TiltMatchingModule(pl.LightningModule):
 
         # ---- 2. Run diffusion generation to get prompt+completion sequences ----
         gen_length = self.hparams.max_completion_length
-        # TODO: chucked generation for large batches
-        with torch.no_grad():
-            prompt_completion_ids = self._generate(
-                model=model,
-                prompt=prompt_ids,
-                steps=self.hparams.diffusion_steps,
-                gen_length=gen_length,
-                block_length=self.hparams.block_length,
-                temperature=self.hparams.sampling_temperature,
-                cfg_scale=self.hparams.cfg_scale,
-                remasking=self.hparams.remasking_strategy,
-            ) # [total_batch, prompt_len + gen_length]
+        outputs = []
+        chunk_size = max(1, min(self.hparams.tm.buffer_chunk_size, total_batch))
+        for start in range(0, total_batch, chunk_size):
+            end = min(start + chunk_size, total_batch)
+            with torch.no_grad():
+                chunk_completion_ids = self._generate(
+                    model=model,
+                    prompt=prompt_ids[start:end],
+                    steps=self.hparams.diffusion_steps,
+                    gen_length=gen_length,
+                    block_length=self.hparams.block_length,
+                    temperature=self.hparams.sampling_temperature,
+                    cfg_scale=self.hparams.cfg_scale,
+                    remasking=self.hparams.remasking_strategy,
+                ) # [chunk_size, seq_len]
+            outputs.append(chunk_completion_ids)
+        prompt_completion_ids = torch.cat(outputs, dim=0) # [total_batch, seq_len]
         seq_len = prompt_completion_ids.size(1) # seq_len = prompt_len + gen_length
         #TODO: DELETE
         assert seq_len == prompt_len + gen_length, (
@@ -523,7 +522,7 @@ class TiltMatchingModule(pl.LightningModule):
         mask_id=126336,
     ):
         """generation code adopted from llada (https://github.com/ML-GSAI/LLaDA)"""
-        with torch.cuda.amp.autocast(enabled=True):
+        with torch.amp.autocast("cuda", enabled=True):
             bs = prompt.shape[0]
             dtype = model.dtype
             x = torch.full((bs, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
