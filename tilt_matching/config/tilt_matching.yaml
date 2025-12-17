@@ -59,6 +59,6 @@ wandb:
 #-----------------Other Training Config-----------------
 dataset: sudoku_new
 few_shot: 3
-seed: 42
+seed: 42 # franklin: do we need this?
 nodes: 1
 devices: 1 # 8? 4?

@@ -108,8 +108,9 @@ class TiltMatchingModule(pl.LightningModule):
         self.manual_backward(loss)
 
         clip_grad_norm_([p for p in self.model.parameters() if p.requires_grad], self.hparams.max_grad_norm)
-        opt.step()
         self._step_tm_scheduler()
+        opt.step()
+
 
         # Log current learning rate
         self.dict_for_logs["train/lr"] = opt.param_groups[0]["lr"]
@@ -234,6 +235,7 @@ class TiltMatchingModule(pl.LightningModule):
         except Exception:
             pass
         self.log_dict(self.dict_for_logs, on_step=True, on_epoch=False, sync_dist=True)
+        self.monitor_sodoku()
         self.dict_for_logs = {}
         self._step_counter += 1
 
@@ -502,6 +504,100 @@ class TiltMatchingModule(pl.LightningModule):
                 pg["lr"] = float(base_lr)
 
         state["step"] = step + 1
+    
+    def monitor_soduku(self, num_soduku=3, num_completions=3):
+        """
+        monitor the teacher models performance on 10 fixed sodokus;
+        The fixed sodokus are taken from the eval set in dataset/test_sodoku_split_new.csv
+        For each sodoku, generate 5 completions and compute accuracy
+        log the 10 sodokus and their completions and accuracies to wandb
+        """
+        monitored_rows = [self.training_prompts_dataset[i] for i in range(num_soduku)]
+        monitored_prompts = [row["prompt"] for row in monitored_rows]
+        monitored_prompt_text = []
+        for sp in monitored_prompts:
+            if isinstance(sp, str):
+                text = sp # already a plain string
+            elif isinstance(sp, list):
+                # Typical case for Sudoku / GSM8K / math: [{"role": "...", "content": "..."}]
+                text = self.tokenizer.apply_chat_template(sp, tokenize=False, add_generation_prompt=True)
+            else:
+                raise TypeError(f"Unsupported prompt type {type(sp)} in training_prompts_dataset")
+            monitored_prompt_text.append(text)
+        
+        input_ids = self.tokenizer(
+            text = monitored_prompt_text,
+            return_tensors = "pt",
+            padding = "max_length",
+            truncation = True,
+            max_length = self.hparams.max_prompt_length,
+            padding_side = "left",
+            add_special_tokens = False,
+        )["input_ids"].to(self.device)
+        prompt_len =input_ids.shape[1]
+
+        input_ids = input_ids.repeat_interleave(num_completions, dim=0)
+        
+        with torch.no_grad():
+            monitored_answers = self._generate(
+                model = self.base_model,
+                prompt = input_ids,
+                steps =  self.hparams.diffusion_steps,
+                gen_length=self.hparams.max_completion_length,
+                block_length=self.hparams.block_length,
+                temperature=self.hparams.sampling_temperature,
+                cfg_scale=self.hparams.cfg_scale,
+                remasking=self.hparams.remasking_strategy,
+            ) # [num_soduku * num_completions, seq_len]
+
+        monitored_answers = torch.cat(monitored_answers, dim=0) # [num_soduku * num_completions, seq_len]
+
+        monitored_answers_text = monitored_answers[:, prompt_len:]
+        monitored_answers_text = self.tokenizer.batch_decode(monitored_answers_text, skip_special_tokens=True)
+        # [num_soduku * num_completions, gen_length]
+
+        # check if each answer is correct
+        reward_func = self.reward_funcs[0] # reward_func = sudoku_reward_func
+
+        data_keys = [key for key in monitored_rows[0].keys() if key != "prompt"]
+        prompts_for_rewards = []
+        reward_kwargs = {key: [] for key in data_keys}
+
+        for row in monitored_rows:
+            base_prompt = row["prompt"]
+            for _ in range(num_completions):
+                prompts_for_rewards.append(base_prompt)
+                for key in data_keys:
+                    reward_kwargs[key].append(row[key])
+
+        completions_for_rewards = []
+        for text in monitored_answers_text:
+            completions_for_rewards.append([{"role": "assistant", "content": text}])
+
+        scores = reward_func(
+            prompts=prompts_for_rewards,
+            completions=completions_for_rewards,
+            **reward_kwargs,
+        )
+
+        if wandb.run is not None:
+            log_sodoku = {}
+            for puzzle_idx in range(num_soduku):
+                start = puzzle_idx * num_completions
+                end = start + num_completions
+                table = wandb.Table(columns=["solution_index", "puzzle", "completion", "score"])
+                puzzle_text = monitored_rows[puzzle_idx].get("puzzle", "")
+                for completion_idx in range(num_completions):
+                    global_idx = start + completion_idx
+                    table.add_data(
+                        completion_idx,
+                        puzzle_text,
+                        monitored_answers_text[global_idx],
+                        float(scores[global_idx]),
+                    )
+                log_sodoku[f"sudoku_{puzzle_idx}"] = table
+            wandb.log(log_sodoku, step=self.global_step)
+
     
     def _kl_from_logits(self, logits_A, logits_B, mask_indices):
         log_A = F.log_softmax(logits_A, dim=-1) # [B, L, V]
