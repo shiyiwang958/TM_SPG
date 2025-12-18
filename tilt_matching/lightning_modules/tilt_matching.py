@@ -102,6 +102,7 @@ class TiltMatchingModule(pl.LightningModule):
             batch: Dummy batch (not used).
             batch_idx: Index of the batch (not used).
         """
+        self._step_tm_scheduler()
         opt = self.tm_opt
         opt.zero_grad()
         loss = self._tm_step()
@@ -114,7 +115,6 @@ class TiltMatchingModule(pl.LightningModule):
         grad_clipped = float(grad_norm_before > self.hparams.max_grad_norm + 1e-6)
 
         opt.step()
-        self._step_tm_scheduler()
 
         # Log current learning rate and grad norms
         self.dict_for_logs["train/lr"] = opt.param_groups[0]["lr"]
@@ -191,17 +191,18 @@ class TiltMatchingModule(pl.LightningModule):
         old_probs = F.softmax(old_logits, dim=-1) # [B, gen_length, V]
         
         loss_type = self.hparams.tm.loss_type
+        hr = self.h * rwd # [B,]
         if loss_type == "itm":
-            hr = self.h * rwd # [B,]
-            target = old_probs + x1_equals_v * torch.expm1(hr).view(-1, 1, 1) # [B, gen_length, V]
-            per_sample_losses = -(target * F.log_softmax(curr_logits, dim=-1)).sum(dim=-1) # [B, gen_length]
-            loss = per_sample_losses[mask_indices.bool()].mean()
+            target = self.cv * old_probs + x1_equals_v * (1 - self.cv + torch.expm1(hr)).view(-1, 1, 1) # [B, gen_length, V]
         elif loss_type == "etm":
-            raise NotImplementedError("ETM loss not implemented yet")
+            target = (1 - hr) * old_probs + x1_equals_v * hr.view(-1, 1, 1) # [B, gen_length, V]
         elif loss_type == "sg-itm":
-            raise NotImplementedError("stopgrad-ITM loss not implemented yet")
+            curr_probs = F.softmax(curr_logits, dim=-1) # [B, gen_length, V]
+            target = self.cv * old_probs + x1_equals_v * (1 - self.cv + torch.expm1(hr)).view(-1, 1, 1) - torch.expm1(hr) * curr_probs.detach()
         else:
             raise ValueError(f"Invalid loss_type: {loss_type}")
+        per_sample_losses = -(target * F.log_softmax(curr_logits, dim=-1)).sum(dim=-1) # [B, gen_length]
+        loss = per_sample_losses[mask_indices.bool()].mean()
 
         log_dict = {
             f"train/loss": loss,
@@ -351,10 +352,6 @@ class TiltMatchingModule(pl.LightningModule):
             outputs.append(chunk_completion_ids)
         prompt_completion_ids = torch.cat(outputs, dim=0) # [total_batch, seq_len]
         seq_len = prompt_completion_ids.size(1) # seq_len = prompt_len + gen_length
-        #TODO: DELETE
-        assert seq_len == prompt_len + gen_length, (
-            f"Expected seq_len={prompt_len + gen_length}, got {seq_len}"
-        )
 
         # ---- 3. Reshape into [num_updates, num_completions, seq_len] and update corresponding rows ----
         new_buffer_block = prompt_completion_ids.view(num_buffer_updates, -1, seq_len)
@@ -417,7 +414,7 @@ class TiltMatchingModule(pl.LightningModule):
 
         buffer_end_time = datetime.now()
         buffer_build_time = (buffer_end_time - buffer_start_time).total_seconds()
-        print(f"Finished {build_or_refresh} sample buffer, took {buffer_build_time}")
+        print(f"Finished {build_or_refresh} reward buffer, took {buffer_build_time}")
     
     def _init_tm_scheduler(self):
         """Initialize a per-h-phase, linear LR scheduler with warmup.
@@ -662,12 +659,10 @@ class TiltMatchingModule(pl.LightningModule):
                         logits, un_logits = torch.chunk(logits, 2, dim=0)
                         logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
                     else:
-                        # logits = self._new_forward(model, x, gen_length) # [B, gen_len, V]
-                        logits = model(x).logits[:, -gen_length:, :]
+                        logits = self._new_forward(model, x, gen_length) # [B, gen_len, V]
                         # logits_old_suffix = model(x).logits[:, -gen_length:, :] # [B, gen_len, V]
                         # diff = (logits_old_suffix - logits).abs()
-                        # if i == 0: print(f"[DEBUG] This is block {num_block}, step {i} in the block.")
-                        # if diff.max().item() > 1e-3:
+                        # if diff.max().item() > 1e-8:
                         #     print("[BUG] Large discrepancy between new_forward and model(x):")
                         #     print("max_abs:", diff.max().item())
                         #     print("max_rel:", (diff / (logits_old_suffix.abs() + 1e-4)).max().item())
