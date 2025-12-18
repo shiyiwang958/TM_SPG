@@ -1,7 +1,7 @@
 #-----------------Tilt Matching Training Config-----------------
 tm:
   a_end: 1.0
-  buffer_chunk_size: 8
+  buffer_chunk_size: 4
   buffer_refresh_steps: 64
   control_variate: 1.0
   h: 0.02
@@ -9,7 +9,7 @@ tm:
   num_batch_prompts: 1
   num_buffer_prompts: 4
   num_buffer_refresh: 1
-  num_completions_per_prompt: 4
+  num_completions_per_prompt: 1
   steps_per_h: 2000
 
 #-----------------Optimizer Config-----------------
