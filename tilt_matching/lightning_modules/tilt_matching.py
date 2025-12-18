@@ -11,7 +11,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
-from peft import LoraConfig, get_peft_model, PeftModelForCausalLM
+from peft import LoraConfig, get_peft_model, PeftModelForCausalLM, get_peft_model_state_dict, set_peft_model_state_dict
 
 
 class TiltMatchingModule(pl.LightningModule):
@@ -128,7 +128,8 @@ class TiltMatchingModule(pl.LightningModule):
             if self.a + self.h > self.a_end:
                 self.h = self.a_end - self.a
             with torch.no_grad():
-                self.base_model.load_state_dict(self.model.state_dict(), strict=True)
+                adapter_state = get_peft_model_state_dict(self.model, bias = "none")
+                set_peft_model_state_dict(self.base_model, adapter_state, bias = "none")
                 for p in self.base_model.parameters():
                     p.requires_grad_(False)
             self.base_model.eval()
