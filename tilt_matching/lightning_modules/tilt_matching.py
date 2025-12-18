@@ -146,7 +146,7 @@ class TiltMatchingModule(pl.LightningModule):
             # Reset buffer
             self._update_buffer(self.base_model, self.num_buffer_prompts, self.comps_per_prompt)
             print(f"[DEBUG] Buffer built at step {self._step_counter} with shape {self.buffer.shape}")
-            
+
         # Partially refresh buffer
         elif (self._step_counter + 1) % self.hparams.tm.buffer_refresh_steps == 0:
             print(f"[DEBUG] Refreshing {self.hparams.tm.num_buffer_refresh} prompts at step {self._step_counter}")
@@ -663,6 +663,18 @@ class TiltMatchingModule(pl.LightningModule):
                         logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
                     else:
                         logits = model(x).logits
+                        # TODO: DELETE; sanity check
+                        logits_ref_suffix = logits[:, -gen_length:, :] # [B, gen_len, V]
+                        # New path
+                        attn_mask = (x != self.tokenizer.pad_token_id).long()
+                        hidden = self.llada_hidden_no_logits(model, x, attention_mask=attn_mask)
+                        logits_new_suffix = self.llada_logits_on_suffix(model, hidden, gen_length)  # [B, gen_len, V]
+                        diff = (logits_ref_suffix - logits_new_suffix).abs()
+                        print("[DEBUG] LLADA logits consistency check:")
+                        print(f"ref logits: {logits_ref_suffix[0, 100, 100:105]}")
+                        print(f"new logits: {logits_new_suffix[0, 100, 100:105]}")
+                        print("max_abs:", diff.max().item())
+                        print("max_rel:", (diff / (logits_ref_suffix.abs() + 1e-6)).max().item())
 
                     # Apply Gumbel noise for sampling
                     logits_with_noise = self._add_gumbel_noise(
@@ -796,3 +808,188 @@ class TiltMatchingModule(pl.LightningModule):
         mask_indices[:, prompt_len:] = to_mask
 
         return xts, mask_indices
+
+    def _unwrap_llada_core(self, m: torch.nn.Module):
+        """
+        Get the core LLaDAModel (with .transformer and .config).
+        """
+        lm = m.base_model  # this should be LLaDAModelLM
+        core = getattr(lm, "model", None)
+        if core is None or not hasattr(core, "transformer"):
+            raise ValueError("Expected a LLaDA HF model with .model.transformer")
+        return core
+    
+    def llada_hidden_no_logits(self,
+        model: torch.nn.Module,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ):
+        """
+        Run the LLaDA stack up to final layer norm, but DO NOT compute logits yet.
+        Args:
+            model: PeftModelForCausalLM
+            input_ids: [B, L]
+            attention_mask: [B, L] with 1 = real token, 0 = pad (HF convention).
+        Returns:
+            hidden: [B, L, d_model]  (post-ln_f)
+        """
+        core = self._unwrap_llada_core(model)
+        cfg = core.config
+        tfm = core.transformer
+
+        # MDM constraints (same as in LLaDAModel.forward)
+        assert not cfg.alibi, "Alibi is not supported for LLaDA MDM."
+        assert cfg.rope, "Rope must be enabled for LLaDA-8B-Instruct."
+        # We don't use KV cache, consistent with MDM constraints.
+        use_cache = False
+        past_key_values = None
+
+        batch_size, seq_len = input_ids.shape
+        past_length = 0
+
+        # ---- Embeddings ----  (lines 2079–2086)
+        x = tfm.wte(input_ids)  # [B, L, d_model]
+        if cfg.input_emb_norm:
+            x = x * (cfg.d_model ** 0.5)
+
+        # No positional embeddings when RoPE is used. (2088–2099 is skipped because rope=True)
+
+        # Embedding dropout (2101–2105)
+        x = tfm.emb_drop(x)
+
+        # ---- Attention mask → additive bias ---- (2107–2118)
+        if attention_mask is not None and 0.0 in attention_mask:
+            # [B, 1, 1, L], 0 for keep, -inf for pad
+            attention_mask = attention_mask.to(dtype=torch.float).view(batch_size, -1)[:, None, None, :]
+            attention_mask = (1.0 - attention_mask) * torch.finfo(attention_mask.dtype).min
+        else:
+            attention_mask = None
+
+        attention_bias = None
+
+        # ---- Merge attention_mask with default bidirectional bias ---- (2122–2179)
+        if (
+            attention_mask is not None
+            or cfg.alibi
+            or past_key_values is not None
+            or attention_bias is not None
+        ):
+            if attention_bias is None and cfg.alibi:
+                # (we never hit this because cfg.alibi is False for LLaDA-8B-Instruct)
+                raise RuntimeError("ALiBi path should be disabled for LLaDA-8B-Instruct")
+            elif attention_bias is None:
+                # default: bidirectional bias (zeros)
+                attention_bias = core.get_bidirectional_attention_bias(past_length + seq_len, x.device)
+            elif attention_bias.dtype in (torch.int8, torch.bool):
+                attention_bias = attention_bias.to(dtype=torch.float)
+                attention_bias.masked_fill_(attention_bias == 0.0, torch.finfo(attention_bias.dtype).min)
+
+            mask_len = seq_len
+            if attention_mask is not None:
+                mask_len = attention_mask.shape[-1]
+
+            attention_bias = attention_bias[:, :, :mask_len, :mask_len].to(dtype=torch.float)
+
+            if attention_mask is not None:
+                attention_bias = attention_bias + attention_mask
+
+            # Avoid -inf + -inf → NaNs (2173–2179)
+            x.masked_fill_(x == float("-inf"), torch.finfo(x.dtype).min)
+        # else: attention_bias stays None
+
+        # ---- Transformer blocks / block groups ---- (2188–2279)
+        if cfg.block_group_size == 1:
+            for block_idx, block in enumerate(tfm.blocks):
+                from configuration_llada import ActivationCheckpointingStrategy
+                # (optional) hidden state logging
+                # all_hidden_states.append(x)
+
+                layer_past = None  # no KV cache for MDM
+                strat = core.activation_checkpointing_strategy
+
+                use_ckpt = (
+                    strat == ActivationCheckpointingStrategy.whole_layer
+                    or (strat == ActivationCheckpointingStrategy.one_in_two   and block_idx % 2 == 0)
+                    or (strat == ActivationCheckpointingStrategy.one_in_three and block_idx % 3 == 0)
+                    or (strat == ActivationCheckpointingStrategy.one_in_four  and block_idx % 4 == 0)
+                )
+
+                if use_ckpt:
+                    x, _ = core._activation_checkpoint_fn(
+                        block,
+                        x,
+                        attention_bias=attention_bias,
+                        layer_past=layer_past,
+                        use_cache=use_cache,
+                    )
+                else:
+                    x, _ = block(
+                        x,
+                        attention_bias=attention_bias,
+                        layer_past=layer_past,
+                        use_cache=use_cache,
+                    )
+        else:
+            for group_idx, block_group in enumerate(tfm.block_groups):
+                # all_hidden_states.append(x)
+                layers_past = None  # no KV cache
+                x, _ = block_group(
+                    x,
+                    attention_bias=attention_bias,
+                    layers_past=layers_past,
+                    use_cache=use_cache,
+                )
+
+        # We do **not** use last_logits_only here; we want full [B, L, d_model].
+
+        # ---- Final layer norm (2286–2290) ----
+        x = tfm.ln_f(x)  # [B, L, d_model]
+
+        return x
+    
+    def llada_logits_on_suffix(self,
+        model: torch.nn.Module,
+        hidden: torch.Tensor,  # [B, L, d_model] from llada_hidden_no_logits
+        gen_len: int,
+    ) -> torch.Tensor:
+        """
+        Compute logits **only** for the last `gen_len` positions of each sequence.
+
+        Args:
+            model: PeftModelForCausalLM or bare LLaDA HF model.
+            hidden: [B, L, d_model] (post-ln_f).
+            gen_len: number of completion tokens at the end of the sequence.
+
+        Returns:
+            logits_suffix: [B, gen_len, V]
+        """
+        lm = model.base_model
+        core = self._unwrap_llada_core(model)
+        cfg = core.config
+
+        B, L, d_model = hidden.shape
+        assert gen_len <= L, f"gen_len={gen_len} cannot exceed sequence length L={L}"
+        hidden_suffix = hidden[:, -gen_len:, :]  # [B, gen_len, d_model]
+
+        # Get the output embedding / projection the same way HF does.
+        out_module = lm.get_output_embeddings()  # nn.Embedding or nn.Linear 
+
+        if isinstance(out_module, torch.nn.Embedding):
+            # Weight tying case: logits = F.linear(x, wte.weight)
+            weight = out_module.weight          # [V, d_model]
+            bias = None
+            logits = F.linear(hidden_suffix, weight, bias)
+        elif isinstance(out_module, torch.nn.Linear):
+            # Non-tying case: use ff_out directly
+            logits = out_module(hidden_suffix)  # [B, gen_len, V]
+        else:
+            raise TypeError(
+                f"Unsupported output embeddings module type: {type(out_module)} "
+                "(expected nn.Embedding or nn.Linear)."
+            )
+
+        if getattr(cfg, "scale_logits", False):
+            logits = logits * (1.0 / math.sqrt(cfg.d_model))
+
+        return logits  # [B, gen_len, V]
+
