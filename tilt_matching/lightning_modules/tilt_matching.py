@@ -107,13 +107,20 @@ class TiltMatchingModule(pl.LightningModule):
         loss = self._tm_step()
         self.manual_backward(loss)
 
-        clip_grad_norm_([p for p in self.model.parameters() if p.requires_grad], self.hparams.max_grad_norm)
-        self._step_tm_scheduler()
+        # Gradient clipping
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        grad_norm_before = clip_grad_norm_(params, float('inf')).item()
+        grad_norm_after = clip_grad_norm_(params, self.hparams.max_grad_norm).item()
+        grad_clipped = float(grad_norm_before > self.hparams.max_grad_norm + 1e-6)
+
         opt.step()
+        self._step_tm_scheduler()
 
-
-        # Log current learning rate
+        # Log current learning rate and grad norms
         self.dict_for_logs["train/lr"] = opt.param_groups[0]["lr"]
+        self.dict_for_logs['grads/grad_norm_before'] = grad_norm_before
+        self.dict_for_logs['grads/grad_norm_after'] = grad_norm_after
+        self.dict_for_logs['grads/grad_clipped'] = grad_clipped
 
         # At each h phase boundary, update a and base_model; save ckpt if necessary
         if (self._step_counter + 1) % self.steps_per_h == 0:
@@ -139,6 +146,7 @@ class TiltMatchingModule(pl.LightningModule):
             # Reset buffer
             self._update_buffer(self.base_model, self.num_buffer_prompts, self.comps_per_prompt)
             print(f"[DEBUG] Buffer built at step {self._step_counter} with shape {self.buffer.shape}")
+            
         # Partially refresh buffer
         elif (self._step_counter + 1) % self.hparams.tm.buffer_refresh_steps == 0:
             print(f"[DEBUG] Refreshing {self.hparams.tm.num_buffer_refresh} prompts at step {self._step_counter}")
