@@ -11,7 +11,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, PeftModelForCausalLM
 
 
 class TiltMatchingModule(pl.LightningModule):
@@ -146,7 +146,7 @@ class TiltMatchingModule(pl.LightningModule):
             # Reset buffer
             self._update_buffer(self.base_model, self.num_buffer_prompts, self.comps_per_prompt)
             print(f"[DEBUG] Buffer built at step {self._step_counter} with shape {self.buffer.shape}")
-
+            
         # Partially refresh buffer
         elif (self._step_counter + 1) % self.hparams.tm.buffer_refresh_steps == 0:
             print(f"[DEBUG] Refreshing {self.hparams.tm.num_buffer_refresh} prompts at step {self._step_counter}")
@@ -179,20 +179,22 @@ class TiltMatchingModule(pl.LightningModule):
         # Get model predictions and compute loss
         temp = self.hparams.sampling_temperature
         with torch.no_grad():
-            old_logits = self.base_model(xts).logits # [B, L, V]
+            old_logits = self._new_forward(self.base_model, xts, gen_length) # [B, gen_length, V]
+            # old_logits = self.base_model(xts).logits # [B, L, V]
         V = old_logits.shape[-1]
-        x1_equals_v = F.one_hot(x1s.long(), num_classes = V) # [B, L, V]
-        curr_logits = self.model(xts).logits
+        x1_equals_v = F.one_hot(x1s.long()[:, -gen_length:], num_classes = V) # [B, gen_length, V]
+        curr_logits = self._new_forward(self.model, xts, gen_length) # [B, gen_length, V]
+        # curr_logits = self.model(xts).logits
         if temp > 0.0:
             old_logits  /= temp
             curr_logits /= temp
-        old_probs = F.softmax(old_logits, dim=-1) # [B, L, V]
+        old_probs = F.softmax(old_logits, dim=-1) # [B, gen_length, V]
         
         loss_type = self.hparams.tm.loss_type
         if loss_type == "itm":
             hr = self.h * rwd # [B,]
-            target = old_probs + x1_equals_v * torch.expm1(hr).view(-1, 1, 1) # [B, L, V]
-            per_sample_losses = -(target * F.log_softmax(curr_logits, dim=-1)).sum(dim=-1) # [B, L]
+            target = old_probs + x1_equals_v * torch.expm1(hr).view(-1, 1, 1) # [B, gen_length, V]
+            per_sample_losses = -(target * F.log_softmax(curr_logits, dim=-1)).sum(dim=-1) # [B, gen_length]
             loss = per_sample_losses[mask_indices.bool()].mean()
         elif loss_type == "etm":
             raise NotImplementedError("ETM loss not implemented yet")
@@ -243,7 +245,7 @@ class TiltMatchingModule(pl.LightningModule):
         except Exception:
             pass
         self.log_dict(self.dict_for_logs, on_step=True, on_epoch=False, sync_dist=True)
-        self.monitor_sodoku()
+        # self.monitor_sudoku()
         self.dict_for_logs = {}
         self._step_counter += 1
 
@@ -386,10 +388,6 @@ class TiltMatchingModule(pl.LightningModule):
                 # Copy all extra fields for this completion
                 for key in data_keys:
                     reward_kwargs[key].append(row[key])
-        # TODO: DELETE
-        assert len(prompts_for_rewards) == total_batch
-        for key in data_keys:
-            assert len(reward_kwargs[key]) == total_batch
 
         # Turn plain completions into chat-style completions [{"role": "assistant", "content": "..."}]
         completions_for_rewards = []
@@ -513,7 +511,7 @@ class TiltMatchingModule(pl.LightningModule):
 
         state["step"] = step + 1
     
-    def monitor_soduku(self, num_soduku=3, num_completions=3):
+    def monitor_sudoku(self, num_soduku=3, num_completions=3):
         """
         monitor the teacher models performance on 10 fixed sodokus;
         The fixed sodokus are taken from the eval set in dataset/test_sodoku_split_new.csv
@@ -608,9 +606,9 @@ class TiltMatchingModule(pl.LightningModule):
 
     
     def _kl_from_logits(self, logits_A, logits_B, mask_indices):
-        log_A = F.log_softmax(logits_A, dim=-1) # [B, L, V]
+        log_A = F.log_softmax(logits_A, dim=-1)
         log_B = F.log_softmax(logits_B, dim=-1)
-        kl = F.kl_div(log_A, log_B, reduction='none', log_target=True).sum(-1) # [B, L]
+        kl = F.kl_div(log_A, log_B, reduction='none', log_target=True).sum(-1)
         return kl[mask_indices.bool()].float().mean()
 
     def _generate(
@@ -629,8 +627,9 @@ class TiltMatchingModule(pl.LightningModule):
         with torch.amp.autocast("cuda", enabled=True):
             bs = prompt.shape[0]
             dtype = model.dtype
-            x = torch.full((bs, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
-            x[:, : prompt.shape[1]] = prompt.clone()
+            prompt_len = prompt.shape[1]
+            x = torch.full((bs, prompt_len + gen_length), mask_id, dtype=torch.long).to(model.device)
+            x[:, :prompt_len] = prompt.clone()
 
             prompt_index = x != mask_id
 
@@ -641,15 +640,15 @@ class TiltMatchingModule(pl.LightningModule):
             steps_per_block = max(1, steps // num_blocks)
 
             for num_block in range(num_blocks):
-                start_idx = prompt.shape[1] + num_block * block_length
-                end_idx = prompt.shape[1] + (num_block + 1) * block_length
+                start_idx = prompt_len + num_block * block_length
+                end_idx = prompt_len + (num_block + 1) * block_length
 
                 block_mask_index = x[:, start_idx:end_idx] == mask_id
                 num_transfer_tokens = self._get_num_transfer_tokens(block_mask_index, steps_per_block)
 
                 for i in range(steps_per_block):
                     torch.cuda.empty_cache()
-                    mask_index = x == mask_id
+                    mask_index = x[:, prompt_len:] == mask_id # [B, gen_len]
 
                     # Handle classifier-free guidance more efficiently
                     if cfg_scale > 0.0:
@@ -658,29 +657,26 @@ class TiltMatchingModule(pl.LightningModule):
                         x_ = torch.cat([x, un_x], dim=0)
 
                         # Get logits in a single forward pass
-                        logits = model(x_).logits
+                        # logits = model(x_).logits
+                        logits = self._new_forward(model, x_, gen_length) # [2*B, gen_len, V]
                         logits, un_logits = torch.chunk(logits, 2, dim=0)
                         logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
                     else:
-                        logits = model(x).logits
-                        # TODO: DELETE; sanity check
-                        logits_ref_suffix = logits[:, -gen_length:, :] # [B, gen_len, V]
-                        # New path
-                        attn_mask = (x != self.tokenizer.pad_token_id).long()
-                        hidden = self.llada_hidden_no_logits(model, x, attention_mask=attn_mask)
-                        logits_new_suffix = self.llada_logits_on_suffix(model, hidden, gen_length)  # [B, gen_len, V]
-                        diff = (logits_ref_suffix - logits_new_suffix).abs()
-                        print("[DEBUG] LLADA logits consistency check:")
-                        print(f"ref logits: {logits_ref_suffix[0, 100, 100:105]}")
-                        print(f"new logits: {logits_new_suffix[0, 100, 100:105]}")
-                        print("max_abs:", diff.max().item())
-                        print("max_rel:", (diff / (logits_ref_suffix.abs() + 1e-6)).max().item())
+                        # logits = self._new_forward(model, x, gen_length) # [B, gen_len, V]
+                        logits = model(x).logits[:, -gen_length:, :]
+                        # logits_old_suffix = model(x).logits[:, -gen_length:, :] # [B, gen_len, V]
+                        # diff = (logits_old_suffix - logits).abs()
+                        # if i == 0: print(f"[DEBUG] This is block {num_block}, step {i} in the block.")
+                        # if diff.max().item() > 1e-3:
+                        #     print("[BUG] Large discrepancy between new_forward and model(x):")
+                        #     print("max_abs:", diff.max().item())
+                        #     print("max_rel:", (diff / (logits_old_suffix.abs() + 1e-4)).max().item())
 
                     # Apply Gumbel noise for sampling
                     logits_with_noise = self._add_gumbel_noise(
                         logits, temperature=temperature, dtype=dtype
                     )
-                    x0 = torch.argmax(logits_with_noise, dim=-1)
+                    x0 = torch.argmax(logits_with_noise, dim=-1) # [B, gen_len]
                     del logits_with_noise
 
                     # Handle remasking strategy
@@ -688,17 +684,18 @@ class TiltMatchingModule(pl.LightningModule):
                         p = F.softmax(logits.to(dtype), dim=-1)
                         x0_p = torch.squeeze(
                             torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1
-                        )
+                        ) # [B, gen_len]
                     elif remasking == "random":
-                        x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
+                        x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device) # [B, gen_len]
                     else:
                         raise NotImplementedError(remasking)
+                    del logits
 
                     # Ensure we don't process tokens beyond the current block
-                    x0_p[:, end_idx:] = float("-inf")
+                    x0_p[:, end_idx-prompt_len:] = float("-inf")
 
                     # Update masked tokens
-                    x0 = torch.where(mask_index, x0, x)
+                    x0 = torch.where(mask_index, x0, x[:, prompt_len:])
                     confidence = torch.where(mask_index, x0_p, float("-inf"))
 
                     # Select tokens to transfer based on confidence
@@ -709,7 +706,7 @@ class TiltMatchingModule(pl.LightningModule):
                             _, select_index = torch.topk(confidence[j], k=num_tokens)
                             transfer_index[j, select_index] = True
 
-                    x[transfer_index] = x0[transfer_index]
+                    x[:, prompt_len:][transfer_index] = x0[transfer_index]
                     del x0, confidence, transfer_index
 
             return x
@@ -746,7 +743,7 @@ class TiltMatchingModule(pl.LightningModule):
         noise = torch.rand_like(logits, dtype=dtype)
         gumbel_noise = (-torch.log(noise)) ** temperature
         return logits.exp() / gumbel_noise
-    
+
     def _build_interpolant(self, x1s, num_to_mask, block_size):
         """
         Given a batch of fully generated sequences x_1, build partially masked x_t.
@@ -759,7 +756,7 @@ class TiltMatchingModule(pl.LightningModule):
                         block-wise left-to-right generation schedule.
         Returns:
             xts: Tensor of shape [B, L], the partially masked sequences at time t.
-            mask_indices: BoolTensor of shape [B, L], True where tokens are masked.
+            mask_indices: BoolTensor of shape [B, gen_length], True where tokens are masked.
         """
         device = x1s.device
         B, L = x1s.shape
@@ -773,7 +770,6 @@ class TiltMatchingModule(pl.LightningModule):
         assert gen_len % block_size == 0
 
         xts = x1s.clone()
-        mask_indices = torch.zeros_like(xts, dtype=torch.bool, device=device)
 
         # How many whole blocks to mask, and how many extra tokens in the next block
         full_blocks = (num_to_mask - 1) // block_size     # [B]
@@ -793,19 +789,16 @@ class TiltMatchingModule(pl.LightningModule):
         idx = partial_block_start + torch.arange(block_size, device=device) # [B, block_size]
         partial_to_mask = torch.zeros(B, gen_len, dtype=torch.bool, device=device)
         partial_to_mask.scatter_(1, idx, masks_within_block)                # [B, gen_len] bools
-        to_mask = full_blocks_to_mask | partial_to_mask                     # [B, gen_len] bools
+        mask_indices = full_blocks_to_mask | partial_to_mask                # [B, gen_len] bools
 
         # Apply mask to completions region
         completion_region = xts[:, prompt_len:]
         completion_region = torch.where(
-            to_mask,
+            mask_indices,
             torch.full_like(completion_region, self.mask_id),
             completion_region,
         ) # [B, gen_len]
         xts[:, prompt_len:] = completion_region
-
-        # Record masked positions in the full sequence
-        mask_indices[:, prompt_len:] = to_mask
 
         return xts, mask_indices
 
@@ -813,13 +806,14 @@ class TiltMatchingModule(pl.LightningModule):
         """
         Get the core LLaDAModel (with .transformer and .config).
         """
-        lm = m.base_model  # this should be LLaDAModelLM
-        core = getattr(lm, "model", None)
-        if core is None or not hasattr(core, "transformer"):
+        assert isinstance(m, PeftModelForCausalLM)
+        lm = m.base_model # peft.tuners.lora.model.LoraModel
+        core = getattr(lm, "model", None) # LLaDAModelLM
+        if core is None or not hasattr(core.base_model, "transformer"):
             raise ValueError("Expected a LLaDA HF model with .model.transformer")
-        return core
+        return core.base_model # LLaDAModel
     
-    def llada_hidden_no_logits(self,
+    def _llada_hidden_no_logits(self,
         model: torch.nn.Module,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
@@ -894,7 +888,7 @@ class TiltMatchingModule(pl.LightningModule):
                 attention_bias = attention_bias + attention_mask
 
             # Avoid -inf + -inf → NaNs (2173–2179)
-            x.masked_fill_(x == float("-inf"), torch.finfo(x.dtype).min)
+            attention_bias.masked_fill_(attention_bias == float("-inf"), torch.finfo(attention_bias.dtype).min)
         # else: attention_bias stays None
 
         # ---- Transformer blocks / block groups ---- (2188–2279)
@@ -947,7 +941,7 @@ class TiltMatchingModule(pl.LightningModule):
 
         return x
     
-    def llada_logits_on_suffix(self,
+    def _llada_logits_on_suffix(self,
         model: torch.nn.Module,
         hidden: torch.Tensor,  # [B, L, d_model] from llada_hidden_no_logits
         gen_len: int,
@@ -993,3 +987,7 @@ class TiltMatchingModule(pl.LightningModule):
 
         return logits  # [B, gen_len, V]
 
+    def _new_forward(self, model, x, gen_length):
+        # x: [B, L]
+        hidden = self._llada_hidden_no_logits(model, x, attention_mask=None)
+        return self._llada_logits_on_suffix(model, hidden, gen_length)  # [B, gen_len, V]
