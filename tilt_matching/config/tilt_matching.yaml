@@ -47,7 +47,7 @@ lora_dropout: 0.05
 peft_task_type: CAUSAL_LM
 
 #-----------------Logging and Checkpointing Config-----------------
-checkpoint_dir: /n/netscratch/albergo_lab/Everyone/llada_tm
+checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm
 checkpoint_freq: 0.2  # in units of h
 metrics_log_every: 10
 resume_path:  # leave empty if not resuming
