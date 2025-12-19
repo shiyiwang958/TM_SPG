@@ -128,8 +128,8 @@ class TiltMatchingModule(pl.LightningModule):
             if self.a + self.h > self.a_end:
                 self.h = self.a_end - self.a
             with torch.no_grad():
-                adapter_state = get_peft_model_state_dict(self.model, bias = "none")
-                set_peft_model_state_dict(self.base_model, adapter_state, bias = "none")
+                adapter_state = get_peft_model_state_dict(self.model)
+                set_peft_model_state_dict(self.base_model, adapter_state)
                 for p in self.base_model.parameters():
                     p.requires_grad_(False)
             self.base_model.eval()
@@ -247,7 +247,7 @@ class TiltMatchingModule(pl.LightningModule):
         except Exception:
             pass
         self.log_dict(self.dict_for_logs, on_step=True, on_epoch=False, sync_dist=True)
-        # self.monitor_sudoku()
+        self.monitor_sudoku()
         self.dict_for_logs = {}
         self._step_counter += 1
 
@@ -516,6 +516,7 @@ class TiltMatchingModule(pl.LightningModule):
         For each sodoku, generate 5 completions and compute accuracy
         log the 10 sodokus and their completions and accuracies to wandb
         """
+        print("Checking teacher model on fixed sodokus...")
         monitored_rows = [self.training_prompts_dataset[i] for i in range(num_soduku)]
         monitored_prompts = [row["prompt"] for row in monitored_rows]
         monitored_prompt_text = []
@@ -554,8 +555,6 @@ class TiltMatchingModule(pl.LightningModule):
                 remasking=self.hparams.remasking_strategy,
             ) # [num_soduku * num_completions, seq_len]
 
-        monitored_answers = torch.cat(monitored_answers, dim=0) # [num_soduku * num_completions, seq_len]
-
         monitored_answers_text = monitored_answers[:, prompt_len:]
         monitored_answers_text = self.tokenizer.batch_decode(monitored_answers_text, skip_special_tokens=True)
         # [num_soduku * num_completions, gen_length]
@@ -583,18 +582,18 @@ class TiltMatchingModule(pl.LightningModule):
             completions=completions_for_rewards,
             **reward_kwargs,
         )
+        print("Finished checking, logging puzzles to wandb...")
 
         if wandb.run is not None:
             log_sodoku = {}
             for puzzle_idx in range(num_soduku):
                 start = puzzle_idx * num_completions
                 end = start + num_completions
-                table = wandb.Table(columns=["solution_index", "puzzle", "completion", "score"])
+                table = wandb.Table(columns=["puzzle", "completion", "score"])
                 puzzle_text = monitored_rows[puzzle_idx].get("puzzle", "")
                 for completion_idx in range(num_completions):
                     global_idx = start + completion_idx
                     table.add_data(
-                        completion_idx,
                         puzzle_text,
                         monitored_answers_text[global_idx],
                         float(scores[global_idx]),
@@ -608,6 +607,27 @@ class TiltMatchingModule(pl.LightningModule):
         log_B = F.log_softmax(logits_B, dim=-1)
         kl = F.kl_div(log_A, log_B, reduction='none', log_target=True).sum(-1)
         return kl[mask_indices.bool()].float().mean()
+    
+    def on_save_checkpoint(self, checkpoint: dict):
+        print(f"saving checkpoint at a = {self.a:.4f}")
+        checkpoint["tilt"] = {"a": self.a, "h": self.h}
+        checkpoint["hparams"] = copy.deepcopy(self.hparams)
+        checkpoint["prompt_counter"] = self.curr_prompt_counter
+        checkpoint["_step_counter"] = self._step_counter
+        
+    
+    def on_load_checkpoint(self, checkpoint: dict):
+        tilt = checkpoint.get("tilt", None)
+        self.a = tilt.get("a", 0.0)
+        self.h = tilt.get("h", 2.5e-3)
+        self.curr_prompt_counter = checkpoint.get("prompt_counter", 0)
+        self._step_counter = checkpoint.get("_step_counter", 0)
+
+        hparams = checkpoint.get("hparams", None)
+        self.__dict__["hparams"] = hparams
+        self.__dict__["_hparams"] = hparams
+        
+        
 
     def _generate(
         self,
