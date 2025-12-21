@@ -184,6 +184,9 @@ class TiltMatchingModule(pl.LightningModule):
         grad_clipped = float(grad_norm_before > self.hparams.max_grad_norm + 1e-6)
 
         opt.step()
+        print(f"current a is {self.a:.4f}")
+        print(f"global step is {self.global_step}")
+        print(f"step_counter is {self._step_counter}")
 
         # Log current learning rate and grad norms
         self.dict_for_logs["train/lr"] = opt.param_groups[0]["lr"]
@@ -192,7 +195,7 @@ class TiltMatchingModule(pl.LightningModule):
         self.dict_for_logs['grads/grad_clipped'] = grad_clipped
 
         # At each h phase boundary, update a and base_model; save ckpt if necessary
-        if (self._step_counter + 1) % self.steps_per_h == 0:
+        if (self.global_step + 1) % self.steps_per_h == 0:
             self.a += self.h
             if self.a + self.h > self.a_end:
                 self.h = self.a_end - self.a
@@ -215,11 +218,11 @@ class TiltMatchingModule(pl.LightningModule):
 
             # Reset buffer
             self._update_buffer(self.base_model, self.num_buffer_prompts, self.comps_per_prompt)
-            print(f"[DEBUG] Buffer built at step {self._step_counter} with shape {self.buffer.shape}")
+            print(f"[DEBUG] Buffer built at step {self.global_step} with shape {self.buffer.shape}")
             
         # Partially refresh buffer
-        elif (self._step_counter + 1) % self.hparams.tm.buffer_refresh_steps == 0:
-            print(f"[DEBUG] Refreshing {self.hparams.tm.num_buffer_refresh} prompts at step {self._step_counter}")
+        elif (self.global_step + 1) % self.hparams.tm.buffer_refresh_steps == 0:
+            print(f"[DEBUG] Refreshing {self.hparams.tm.num_buffer_refresh} prompts at step {self.global_step}")
             self._update_buffer(self.base_model, self.hparams.tm.num_buffer_refresh, self.comps_per_prompt)
         
         self.log("ckpt_a", self.a, on_step=True, on_epoch=False, sync_dist=True)
@@ -299,7 +302,7 @@ class TiltMatchingModule(pl.LightningModule):
         return loss
     
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        if not self.dict_for_logs or self._step_counter % self.hparams.metrics_log_every != 0:
+        if not self.dict_for_logs or self.global_step % self.hparams.metrics_log_every != 0:
             self._step_counter += 1
             return
         # log all at once
@@ -471,7 +474,6 @@ class TiltMatchingModule(pl.LightningModule):
             scores = reward_func(
                 prompts=prompts_for_rewards,
                 completions=completions_for_rewards,
-                step=self._step_counter,
                 **reward_kwargs,
             )
             rewards_per_func[:, j] = torch.tensor(scores, device=device, dtype=torch.float32)
@@ -586,6 +588,12 @@ class TiltMatchingModule(pl.LightningModule):
         log the 10 sodokus and their completions and accuracies to wandb
         """
         print("Checking teacher model on fixed sodokus...")
+        
+        # only log from global rank 0
+        if not getattr(self.trainer, "is_global_zero", True):
+            return
+        
+         # prepare prompts
         monitored_rows = [self.training_prompts_dataset[i] for i in range(num_soduku)]
         monitored_prompts = [row["prompt"] for row in monitored_rows]
         monitored_prompt_text = []
