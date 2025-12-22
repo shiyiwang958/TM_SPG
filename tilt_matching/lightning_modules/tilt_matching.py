@@ -317,6 +317,24 @@ class TiltMatchingModule(pl.LightningModule):
         # self.monitor_sudoku()
         self.dict_for_logs = {}
         self._step_counter += 1
+    
+    def on_save_checkpoint(self, checkpoint: dict):
+        print(f"saving checkpoint at a = {self.a:.4f}")
+        checkpoint["tilt"] = {"a": self.a, "h": self.h}
+        checkpoint["hparams"] = copy.deepcopy(self.hparams)
+        checkpoint["prompt_counter"] = self.curr_prompt_counter
+        checkpoint["_step_counter"] = self._step_counter
+        
+    def on_load_checkpoint(self, checkpoint: dict):
+        tilt = checkpoint.get("tilt", None)
+        self.a = tilt.get("a", 0.0)
+        self.h = tilt.get("h", 2.5e-3)
+        self.curr_prompt_counter = checkpoint.get("prompt_counter", 0)
+        self._step_counter = checkpoint.get("_step_counter", 0)
+
+        hparams = checkpoint.get("hparams", None)
+        self.__dict__["hparams"] = hparams
+        self.__dict__["_hparams"] = hparams
 
     def _prepare_prompts(self, num_dinstinct_prompts, num_completions_per_prompts):
         """
@@ -1079,3 +1097,71 @@ class TiltMatchingModule(pl.LightningModule):
         # x: [B, L]
         hidden = self._llada_hidden_no_logits(model, x, attention_mask=None)
         return self._llada_logits_on_suffix(model, hidden, gen_length)  # [B, gen_len, V]
+
+    def state_dict(self, destination=None, keep_vars=False):
+        destination = OrderedDict() if destination is None else destination
+
+        model_adapter_state = get_peft_model_state_dict(self.model)
+        base_adapter_state = get_peft_model_state_dict(self.base_model)
+
+        for key, value in model_adapter_state.items():
+            tensor = value if keep_vars else value.detach()
+            destination[f"model_adapter.{key}"] = tensor.to("cpu")
+
+        for key, value in base_adapter_state.items():
+            tensor = value if keep_vars else value.detach()
+            destination[f"base_adapter.{key}"] = tensor.to("cpu")
+
+        return destination
+
+    def load_state_dict(self, state_dict, strict=True):
+        model_prefix = "model_adapter."
+        base_prefix = "base_adapter."
+
+        model_adapter_state = {}
+        base_adapter_state = {}
+        unexpected_keys = []
+
+        for key, value in state_dict.items():
+            if key.startswith(model_prefix):
+                model_adapter_state[key[len(model_prefix):]] = value
+            elif key.startswith(base_prefix):
+                base_adapter_state[key[len(base_prefix):]] = value
+            else:
+                unexpected_keys.append(key)
+
+        if model_adapter_state:
+            missing_model, unexpected_model = set_peft_model_state_dict(
+                self.model,
+                model_adapter_state,
+                adapter_name=self.model.active_adapter,
+            )
+        else:
+            missing_model, unexpected_model = [], []
+
+        if base_adapter_state:
+            missing_base, unexpected_base = set_peft_model_state_dict(
+                self.base_model,
+                base_adapter_state,
+                adapter_name=self.base_model.active_adapter,
+            )
+        else:
+            missing_base, unexpected_base = [], []
+
+        def _relevant_missing(key: str) -> bool:
+            # For LoRA checkpoints we only expect adapter weights; ignore base weights.
+            return "lora" in key.lower() or "ranknum" in key.lower()
+
+        missing_keys = [k for k in missing_model if _relevant_missing(k)]
+        missing_keys.extend(k for k in missing_base if _relevant_missing(k))
+        unexpected_keys.extend(list(unexpected_model))
+        unexpected_keys.extend(list(unexpected_base))
+
+        if strict and (missing_keys or unexpected_keys):
+            raise RuntimeError(
+                f"Error(s) in loading state_dict for {self.__class__.__name__}: "
+                f"missing keys: {missing_keys}; unexpected keys: {unexpected_keys}"
+            )
+
+        IncompatibleKeys = namedtuple("IncompatibleKeys", ["missing_keys", "unexpected_keys"])
+        return IncompatibleKeys(missing_keys, unexpected_keys)

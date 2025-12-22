@@ -9,7 +9,7 @@ tm:
   num_batch_prompts: 2
   num_buffer_prompts: 4
   num_buffer_refresh: 1
-  num_completions_per_prompt: 2
+  num_completions_per_prompt: 4
   steps_per_h: 200 # for phase transition test only
 
 #-----------------Optimizer Config-----------------
@@ -39,7 +39,6 @@ use_peft: true
 torch_dtype: bfloat16
 load_in_4bit: true
 base_model_path: /n/netscratch/albergo_lab/Everyone/frank/hf_models/LLaDA-8B-Instruct
-# don't implement any attention for llada
 
 lora_r: 128
 lora_alpha: 64
@@ -62,4 +61,4 @@ dataset: sudoku_new
 few_shot: 3
 seed: 42
 nodes: 1
-devices: 1 # 8? 4?
+devices: 4 # 8? 4?
