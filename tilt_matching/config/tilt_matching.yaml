@@ -6,7 +6,7 @@ tm:
   control_variate: 1.0
   h: 0.1
   loss_type: itm
-  num_batch_prompts: 2
+  num_batch_prompts: 1
   num_buffer_prompts: 4
   num_buffer_refresh: 1
   num_completions_per_prompt: 4
@@ -61,4 +61,4 @@ dataset: sudoku_new
 few_shot: 3
 seed: 42
 nodes: 1
-devices: 4 # 8? 4?
+devices: 1 # 8? 4?
