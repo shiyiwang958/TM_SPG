@@ -2,15 +2,15 @@
 tm:
   a_end: 1.0
   buffer_chunk_size: 16
-  buffer_refresh_steps: 16
+  buffer_refresh_steps: 8
   control_variate: 1.0
-  h: 0.025
+  h: 0.1
   loss_type: itm
-  num_batch_prompts: 1 
-  num_buffer_prompts: 2
+  num_batch_prompts: 2
+  num_buffer_prompts: 4
   num_buffer_refresh: 1
   num_completions_per_prompt: 2
-  steps_per_h: 16 # for phase transition test only
+  steps_per_h: 200 # for phase transition test only
 
 #-----------------Optimizer Config-----------------
 adam_beta1: 0.9
@@ -55,7 +55,7 @@ resume_path:
 wandb:
   entity: "yuyuanchen-harvard-university"
   project: "LLaDA_TM"
-  name: "test_skeleton"
+  name: "test_sudoku"
 
 #-----------------Other Training Config-----------------
 dataset: sudoku_new

@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --output=/n/home06/yuyuan0/TM_SPG/output_logs/%A/slurm.out
 #SBATCH --job-name=gsm-d1
-#SBATCH --partition=kempner
-#SBATCH --account=kempner_albergo_lab
-#SBATCH --time=0:5:00
+#SBATCH --partition=gpu
+#SBATCH --account=albergo_lab
+#SBATCH --time=3:00:00
 #SBATCH --wait-all-nodes=1
 #SBATCH --open-mode=append
 
@@ -45,7 +45,7 @@ srun --output ${LOGDIR}/d1_%j.out \
         --trainer diffu_grpo \
         --num_generations 6 \
         --per_device_train_batch_size 3 \
-        --gradient_accumulation_steps 4 \
+        --gradient_accumulation_steps 8 \
         --output_dir ./output_dir/$RUN_NAME \
         --temperature 0.3 \
         --few_shot $FEW_SHOT \

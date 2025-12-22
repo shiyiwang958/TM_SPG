@@ -120,7 +120,7 @@ def compute_score(solution_str, ground_truth, method="strict", format_score=0.1,
     numbers = ground_truth["numbers"]
 
     equation = extract_solution(solution_str)
-    do_print = np.random.rand() < 0.1
+    do_print = np.random.rand() < 0.4
 
     if do_print:
         print(f"--------------------------------")
