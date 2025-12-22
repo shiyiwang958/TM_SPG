@@ -9,8 +9,8 @@ def chat():
     model = AutoModel.from_pretrained("/n/netscratch/albergo_lab/Everyone/frank/hf_models/LLaDA-8B-Instruct", trust_remote_code=True, torch_dtype=torch.bfloat16).to(device).eval()
     tokenizer = AutoTokenizer.from_pretrained("/n/netscratch/albergo_lab/Everyone/frank/hf_models/LLaDA-8B-Instruct", trust_remote_code=True)
 
-    gen_length = 128
-    steps = 128
+    gen_length = 512
+    steps = 512
     print('*' * 66)
     print(f'**  Answer Length: {gen_length}  |  Sampling Steps: {steps}  **')
     print('*' * 66)

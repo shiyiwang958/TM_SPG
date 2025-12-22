@@ -1,14 +1,16 @@
 #!/bin/bash
 #SBATCH --job-name=eval_llada
-#SBATCH --output=logs_eval/eval_llada_%j.out
+#SBATCH --partition=kempner
+#SBATCH --account=kempner_albergo_lab
+#SBATCH --output=../logs_eval/eval_llada/job-%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:4
 #SBATCH --mem=64G
-#SBATCH --time=48:00:00
-#SBATCH --account=storygen
-#SBATCH --qos=storygen_high
+#SBATCH --time=2:00:00
+#SBATCH --mail-type=END,FAIL,BEGIN
+#SBATCH --mail-user=fwang@math.harvard.edu
 
 source activate spg
 
@@ -29,7 +31,7 @@ echo "Using random main_process_port: $MASTER_PORT"
 # Arrays of tasks and generation lengths
 TASKS=("gsm8k" "math" "countdown")
 GEN_LENGTHS=(128 256 512)
-SAVE_DIR=/fsx-checkpoints/
+SAVE_DIR=/n/home03/sw958/project_1/SPG
 
 # Use SLURM allocated GPUs
 if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
@@ -63,7 +65,7 @@ for task in "${TASKS[@]}"; do
       --batch_size $batch_size \
       --gen_length $gen_length \
       --output_dir "eval_results/eval_results_${task}_llada" \
-      --model_path "${SAVE_DIR}/hf_models/LLaDA-8B-Instruct/" 
+      --model_path "${SAVE_DIR}/hf_models" 
   done
 done
 
@@ -86,7 +88,7 @@ for gen_length in "${GEN_LENGTHS[@]}"; do
     --gen_length $gen_length \
     --few_shot 3 \
     --output_dir "eval_results/eval_results_sudoku_new_3shot_llada" \
-    --model_path "${SAVE_DIR}/hf_models/LLaDA-8B-Instruct/" 
+    --model_path "${SAVE_DIR}/hf_models" 
 done
 
 

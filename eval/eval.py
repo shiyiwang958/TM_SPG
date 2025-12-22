@@ -234,7 +234,7 @@ if __name__ == "__main__":
         model_name = model_name + f"_fs{args.few_shot}"
 
     if len(args.suffix) > 0:
-        model_name = model_name + f"_{args.suffix}"
+        model_name = model_name + f"_{args.suffix}" # add suffix to distinguish runs
 
     os.makedirs(args.output_dir, exist_ok=True)
     # Each rank writes a shard; rank 0 is canonical
