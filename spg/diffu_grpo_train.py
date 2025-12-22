@@ -35,7 +35,6 @@ from data_utils import (
 )
 
 def main(grpo_config, model_config):
-    print("[DEBUG] Inside diffu_grpo_train main")
 
     # Set seed for reproducibility
     set_random_seed(grpo_config.seed)
@@ -65,7 +64,6 @@ def main(grpo_config, model_config):
             correctness_reward_func_math,
             boxed_and_answer_tags_format_reward,
         ]
-    print("[DEBUG] dataset loaded")
 
     # Shuffle dataset with fixed seed for reproducibility
     dataset = dataset.shuffle(seed=grpo_config.seed)

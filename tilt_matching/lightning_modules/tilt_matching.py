@@ -72,6 +72,74 @@ class TiltMatchingModule(pl.LightningModule):
         self.lr_min = getattr(self.hparams, "lr_min", 0.0)
         self._tm_sched_state = None
 
+    def state_dict(self, destination=None, keep_vars=False):
+        destination = OrderedDict() if destination is None else destination
+
+        model_adapter_state = get_peft_model_state_dict(self.model)
+        base_adapter_state = get_peft_model_state_dict(self.base_model)
+
+        for key, value in model_adapter_state.items():
+            tensor = value if keep_vars else value.detach()
+            destination[f"model_adapter.{key}"] = tensor.to("cpu")
+
+        for key, value in base_adapter_state.items():
+            tensor = value if keep_vars else value.detach()
+            destination[f"base_adapter.{key}"] = tensor.to("cpu")
+
+        return destination
+
+    def load_state_dict(self, state_dict, strict=True):
+        model_prefix = "model_adapter."
+        base_prefix = "base_adapter."
+
+        model_adapter_state = {}
+        base_adapter_state = {}
+        unexpected_keys = []
+
+        for key, value in state_dict.items():
+            if key.startswith(model_prefix):
+                model_adapter_state[key[len(model_prefix):]] = value
+            elif key.startswith(base_prefix):
+                base_adapter_state[key[len(base_prefix):]] = value
+            else:
+                unexpected_keys.append(key)
+
+        if model_adapter_state:
+            missing_model, unexpected_model = set_peft_model_state_dict(
+                self.model,
+                model_adapter_state,
+                adapter_name=self.model.active_adapter,
+            )
+        else:
+            missing_model, unexpected_model = [], []
+
+        if base_adapter_state:
+            missing_base, unexpected_base = set_peft_model_state_dict(
+                self.base_model,
+                base_adapter_state,
+                adapter_name=self.base_model.active_adapter,
+            )
+        else:
+            missing_base, unexpected_base = [], []
+
+        def _relevant_missing(key: str) -> bool:
+            # For LoRA checkpoints we only expect adapter weights; ignore base weights.
+            return "lora" in key.lower() or "ranknum" in key.lower()
+
+        missing_keys = [k for k in missing_model if _relevant_missing(k)]
+        missing_keys.extend(k for k in missing_base if _relevant_missing(k))
+        unexpected_keys.extend(list(unexpected_model))
+        unexpected_keys.extend(list(unexpected_base))
+
+        if strict and (missing_keys or unexpected_keys):
+            raise RuntimeError(
+                f"Error(s) in loading state_dict for {self.__class__.__name__}: "
+                f"missing keys: {missing_keys}; unexpected keys: {unexpected_keys}"
+            )
+
+        IncompatibleKeys = namedtuple("IncompatibleKeys", ["missing_keys", "unexpected_keys"])
+        return IncompatibleKeys(missing_keys, unexpected_keys)
+
     def on_train_start(self):
         super().on_train_start()
         # Set up optimizer and LR
@@ -134,7 +202,7 @@ class TiltMatchingModule(pl.LightningModule):
                 for p in self.base_model.parameters():
                     p.requires_grad_(False)
             self.base_model.eval()
-            print(f"Degree of tilt a = {self.a:.4f} at step {self.global_step}")
+            print(f"Degree of tilt a = {self.a:.4f} at step {self._step_counter}")
 
             if self.a >= self.a_end:
                 print(f"Reached final a = {self.a_end:.2f}. Training Stopped", flush=True)
@@ -182,11 +250,9 @@ class TiltMatchingModule(pl.LightningModule):
         temp = self.hparams.sampling_temperature
         with torch.no_grad():
             old_logits = self._new_forward(self.base_model, xts, gen_length) # [B, gen_length, V]
-            # old_logits = self.base_model(xts).logits # [B, L, V]
         V = old_logits.shape[-1]
         x1_equals_v = F.one_hot(x1s.long()[:, -gen_length:], num_classes = V) # [B, gen_length, V]
         curr_logits = self._new_forward(self.model, xts, gen_length) # [B, gen_length, V]
-        # curr_logits = self.model(xts).logits
         if temp > 0.0:
             old_logits  /= temp
             curr_logits /= temp
@@ -421,7 +487,6 @@ class TiltMatchingModule(pl.LightningModule):
             scores = reward_func(
                 prompts=prompts_for_rewards,
                 completions=completions_for_rewards,
-                step=self._step_counter,
                 **reward_kwargs,
             )
             rewards_per_func[:, j] = torch.tensor(scores, device=device, dtype=torch.float32)
@@ -535,6 +600,8 @@ class TiltMatchingModule(pl.LightningModule):
         For each sodoku, generate 5 completions and compute accuracy
         log the 10 sodokus and their completions and accuracies to wandb
         """
+        print("Checking teacher model on fixed sodokus...")
+        
         # only log from global rank 0
         if not getattr(self.trainer, "is_global_zero", True):
             return
@@ -605,6 +672,7 @@ class TiltMatchingModule(pl.LightningModule):
             completions=completions_for_rewards,
             **reward_kwargs,
         )
+        print("Finished checking, logging puzzles to wandb...")
 
         if wandb.run is not None:
             log_sodoku = {}
@@ -629,6 +697,27 @@ class TiltMatchingModule(pl.LightningModule):
         log_B = F.log_softmax(logits_B, dim=-1)
         kl = F.kl_div(log_A, log_B, reduction='none', log_target=True).sum(-1)
         return kl[mask_indices.bool()].float().mean()
+    
+    def on_save_checkpoint(self, checkpoint: dict):
+        print(f"saving checkpoint at a = {self.a:.4f}")
+        checkpoint["tilt"] = {"a": self.a, "h": self.h}
+        checkpoint["hparams"] = copy.deepcopy(self.hparams)
+        checkpoint["prompt_counter"] = self.curr_prompt_counter
+        checkpoint["_step_counter"] = self._step_counter
+        
+    
+    def on_load_checkpoint(self, checkpoint: dict):
+        tilt = checkpoint.get("tilt", None)
+        self.a = tilt.get("a", 0.0)
+        self.h = tilt.get("h", 2.5e-3)
+        self.curr_prompt_counter = checkpoint.get("prompt_counter", 0)
+        self._step_counter = checkpoint.get("_step_counter", 0)
+
+        hparams = checkpoint.get("hparams", None)
+        self.__dict__["hparams"] = hparams
+        self.__dict__["_hparams"] = hparams
+        
+        
 
     def _generate(
         self,

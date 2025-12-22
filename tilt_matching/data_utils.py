@@ -11,6 +11,7 @@ import random
 import numpy as np
 import torch
 import os
+import pytorch_lightning as pl
 
 
 def set_random_seed(seed: int = 42):
@@ -25,6 +26,7 @@ def set_random_seed(seed: int = 42):
     # Ensure deterministic behavior in cuDNN (may impact performance)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    pl.seed_everything(seed)
 
 
 # Constants for prompts

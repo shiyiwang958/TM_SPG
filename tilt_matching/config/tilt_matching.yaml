@@ -2,9 +2,9 @@
 tm:
   a_end: 1.0
   buffer_chunk_size: 16
-  buffer_refresh_steps: 16
+  buffer_refresh_steps: 8
   control_variate: 1.0
-  h: 0.05
+  h: 0.1
   loss_type: itm
   num_batch_prompts: 2
   num_buffer_prompts: 4
@@ -46,14 +46,15 @@ lora_dropout: 0.05
 peft_task_type: CAUSAL_LM
 
 #-----------------Logging and Checkpointing Config-----------------
-checkpoint_dir: /n/netscratch/albergo_lab/Everyone/llada_tm
-checkpoint_freq: 0.2  # in units of h
+checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm
+checkpoint_freq: 0.1  # in units of h
 metrics_log_every: 10
-resume_path:  # leave empty if not resuming
+resume_path:
+# leave empty if not resuming
 wandb:
   entity: "yuyuanchen-harvard-university"
   project: "LLaDA_TM"
-  name: "test_skeleton"
+  name: "test_sudoku"
 
 #-----------------Other Training Config-----------------
 dataset: sudoku_new
