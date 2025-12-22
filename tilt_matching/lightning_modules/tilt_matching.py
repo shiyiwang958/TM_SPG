@@ -3,6 +3,7 @@ import logging
 import math
 import os
 from datetime import datetime
+from collections import OrderedDict, namedtuple
 import itertools
 import wandb
 
@@ -11,7 +12,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
-from peft import LoraConfig, get_peft_model, PeftModelForCausalLM
+from peft import LoraConfig, get_peft_model, PeftModelForCausalLM, get_peft_model_state_dict, set_peft_model_state_dict
 
 
 class TiltMatchingModule(pl.LightningModule):
@@ -128,7 +129,8 @@ class TiltMatchingModule(pl.LightningModule):
             if self.a + self.h > self.a_end:
                 self.h = self.a_end - self.a
             with torch.no_grad():
-                self.base_model.load_state_dict(self.model.state_dict(), strict=True)
+                adapter_state = get_peft_model_state_dict(self.model)
+                set_peft_model_state_dict(self.base_model, adapter_state)
                 for p in self.base_model.parameters():
                     p.requires_grad_(False)
             self.base_model.eval()
@@ -249,6 +251,24 @@ class TiltMatchingModule(pl.LightningModule):
         # self.monitor_sudoku()
         self.dict_for_logs = {}
         self._step_counter += 1
+    
+    def on_save_checkpoint(self, checkpoint: dict):
+        print(f"saving checkpoint at a = {self.a:.4f}")
+        checkpoint["tilt"] = {"a": self.a, "h": self.h}
+        checkpoint["hparams"] = copy.deepcopy(self.hparams)
+        checkpoint["prompt_counter"] = self.curr_prompt_counter
+        checkpoint["_step_counter"] = self._step_counter
+        
+    def on_load_checkpoint(self, checkpoint: dict):
+        tilt = checkpoint.get("tilt", None)
+        self.a = tilt.get("a", 0.0)
+        self.h = tilt.get("h", 2.5e-3)
+        self.curr_prompt_counter = checkpoint.get("prompt_counter", 0)
+        self._step_counter = checkpoint.get("_step_counter", 0)
+
+        hparams = checkpoint.get("hparams", None)
+        self.__dict__["hparams"] = hparams
+        self.__dict__["_hparams"] = hparams
 
     def _prepare_prompts(self, num_dinstinct_prompts, num_completions_per_prompts):
         """
@@ -515,6 +535,11 @@ class TiltMatchingModule(pl.LightningModule):
         For each sodoku, generate 5 completions and compute accuracy
         log the 10 sodokus and their completions and accuracies to wandb
         """
+        # only log from global rank 0
+        if not getattr(self.trainer, "is_global_zero", True):
+            return
+        
+         # prepare prompts
         monitored_rows = [self.training_prompts_dataset[i] for i in range(num_soduku)]
         monitored_prompts = [row["prompt"] for row in monitored_rows]
         monitored_prompt_text = []
@@ -553,8 +578,6 @@ class TiltMatchingModule(pl.LightningModule):
                 remasking=self.hparams.remasking_strategy,
             ) # [num_soduku * num_completions, seq_len]
 
-        monitored_answers = torch.cat(monitored_answers, dim=0) # [num_soduku * num_completions, seq_len]
-
         monitored_answers_text = monitored_answers[:, prompt_len:]
         monitored_answers_text = self.tokenizer.batch_decode(monitored_answers_text, skip_special_tokens=True)
         # [num_soduku * num_completions, gen_length]
@@ -588,12 +611,11 @@ class TiltMatchingModule(pl.LightningModule):
             for puzzle_idx in range(num_soduku):
                 start = puzzle_idx * num_completions
                 end = start + num_completions
-                table = wandb.Table(columns=["solution_index", "puzzle", "completion", "score"])
+                table = wandb.Table(columns=["puzzle", "completion", "score"])
                 puzzle_text = monitored_rows[puzzle_idx].get("puzzle", "")
                 for completion_idx in range(num_completions):
                     global_idx = start + completion_idx
                     table.add_data(
-                        completion_idx,
                         puzzle_text,
                         monitored_answers_text[global_idx],
                         float(scores[global_idx]),
@@ -986,3 +1008,71 @@ class TiltMatchingModule(pl.LightningModule):
         # x: [B, L]
         hidden = self._llada_hidden_no_logits(model, x, attention_mask=None)
         return self._llada_logits_on_suffix(model, hidden, gen_length)  # [B, gen_len, V]
+
+    def state_dict(self, destination=None, keep_vars=False):
+        destination = OrderedDict() if destination is None else destination
+
+        model_adapter_state = get_peft_model_state_dict(self.model)
+        base_adapter_state = get_peft_model_state_dict(self.base_model)
+
+        for key, value in model_adapter_state.items():
+            tensor = value if keep_vars else value.detach()
+            destination[f"model_adapter.{key}"] = tensor.to("cpu")
+
+        for key, value in base_adapter_state.items():
+            tensor = value if keep_vars else value.detach()
+            destination[f"base_adapter.{key}"] = tensor.to("cpu")
+
+        return destination
+
+    def load_state_dict(self, state_dict, strict=True):
+        model_prefix = "model_adapter."
+        base_prefix = "base_adapter."
+
+        model_adapter_state = {}
+        base_adapter_state = {}
+        unexpected_keys = []
+
+        for key, value in state_dict.items():
+            if key.startswith(model_prefix):
+                model_adapter_state[key[len(model_prefix):]] = value
+            elif key.startswith(base_prefix):
+                base_adapter_state[key[len(base_prefix):]] = value
+            else:
+                unexpected_keys.append(key)
+
+        if model_adapter_state:
+            missing_model, unexpected_model = set_peft_model_state_dict(
+                self.model,
+                model_adapter_state,
+                adapter_name=self.model.active_adapter,
+            )
+        else:
+            missing_model, unexpected_model = [], []
+
+        if base_adapter_state:
+            missing_base, unexpected_base = set_peft_model_state_dict(
+                self.base_model,
+                base_adapter_state,
+                adapter_name=self.base_model.active_adapter,
+            )
+        else:
+            missing_base, unexpected_base = [], []
+
+        def _relevant_missing(key: str) -> bool:
+            # For LoRA checkpoints we only expect adapter weights; ignore base weights.
+            return "lora" in key.lower() or "ranknum" in key.lower()
+
+        missing_keys = [k for k in missing_model if _relevant_missing(k)]
+        missing_keys.extend(k for k in missing_base if _relevant_missing(k))
+        unexpected_keys.extend(list(unexpected_model))
+        unexpected_keys.extend(list(unexpected_base))
+
+        if strict and (missing_keys or unexpected_keys):
+            raise RuntimeError(
+                f"Error(s) in loading state_dict for {self.__class__.__name__}: "
+                f"missing keys: {missing_keys}; unexpected keys: {unexpected_keys}"
+            )
+
+        IncompatibleKeys = namedtuple("IncompatibleKeys", ["missing_keys", "unexpected_keys"])
+        return IncompatibleKeys(missing_keys, unexpected_keys)
