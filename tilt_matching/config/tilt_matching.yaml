@@ -7,7 +7,7 @@ tm:
   h: 0.025
   loss_type: itm
   num_batch_prompts: 1 
-  num_buffer_prompts: 8
+  num_buffer_prompts: 16
   num_buffer_refresh: 1
   num_completions_per_prompt: 2
   steps_per_h: 16 # for phase transition test only
@@ -61,5 +61,5 @@ wandb:
 dataset: sudoku_new
 few_shot: 3
 seed: 42
-nodes: 1
-devices: 1 # 8? 4?
+nodes: 2
+devices: 4  # 8? 4?
