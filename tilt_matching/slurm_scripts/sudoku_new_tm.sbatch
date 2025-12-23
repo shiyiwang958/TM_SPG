@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --output=/n/home06/yuyuan0/TM_SPG/output_logs/%A/slurm.out
 #SBATCH --job-name=tm-sudoku
-#SBATCH --partition=gpu
-#SBATCH --account=albergo_lab
-#SBATCH --time=3:00:00
+#SBATCH --partition=kempner_h100
+#SBATCH --account=kempner_albergo_lab
+#SBATCH --time=6:00:00
 #SBATCH --wait-all-nodes=1
 #SBATCH --open-mode=append
 
@@ -17,12 +17,6 @@
 module load cuda/12.4.1-fasrc01
 source /n/sw/Anaconda2-2019.10/etc/profile.d/conda.sh
 conda activate /n/home06/yuyuan0/conda/envs/spg
-
-### Small debug prints (will go into slurm log)
-echo "Active conda envs:"
-conda info --envs
-echo "Python:     $(which python)"
-echo "Accelerate: $(which accelerate)"
 
 export LOGDIR=./logs
 mkdir -p $LOGDIR

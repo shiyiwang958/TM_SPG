@@ -1,16 +1,16 @@
 #-----------------Tilt Matching Training Config-----------------
 tm:
   a_end: 1.0
-  buffer_chunk_size: 16
-  buffer_refresh_steps: 8
+  buffer_chunk_size: 32
+  buffer_refresh_steps: 32
   control_variate: 1.0
-  h: 0.1
+  h: 4.0
   loss_type: itm
   num_batch_prompts: 1
-  num_buffer_prompts: 4
-  num_buffer_refresh: 1
+  num_buffer_prompts: 16
+  num_buffer_refresh: 4
   num_completions_per_prompt: 4
-  steps_per_h: 200 # for phase transition test only
+  steps_per_h: 2000
 
 #-----------------Optimizer Config-----------------
 adam_beta1: 0.9
@@ -18,10 +18,10 @@ adam_beta2: 0.99
 adam_epsilon: 1e-8
 weight_decay: 0.1
 
-max_grad_norm: 0.2
+max_grad_norm: 1.0
 learning_rate: 3e-6
-lr_decay_ratio: 0.2
-lr_min: 0.0
+lr_decay_ratio: 0.25
+lr_min: 1e-6
 lr_scheduler_type: linear
 lr_warmup_ratio: 0.1
 
@@ -47,7 +47,7 @@ peft_task_type: CAUSAL_LM
 
 #-----------------Logging and Checkpointing Config-----------------
 checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm
-checkpoint_freq: 0.1  # in units of h
+checkpoint_freq: 0.3  # in units of h
 metrics_log_every: 10
 resume_path:
 # leave empty if not resuming
@@ -61,4 +61,4 @@ dataset: sudoku_new
 few_shot: 3
 seed: 42
 nodes: 1
-devices: 1 # 8? 4?
+devices: 4 # 8? 4?

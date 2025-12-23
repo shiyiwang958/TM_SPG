@@ -6,6 +6,7 @@ from datetime import datetime
 from collections import OrderedDict, namedtuple
 import itertools
 import wandb
+import bitsandbytes as bnb
 
 import torch
 import torch.nn.functional as F
@@ -148,12 +149,32 @@ class TiltMatchingModule(pl.LightningModule):
             g["lr"] = self.lr
         self._init_tm_scheduler()
 
+        # --- DEBUG ---
+        rank = self.trainer.global_rank
+        device = self.device
+
+        mem_alloc = torch.cuda.memory_allocated(device) / 1024**3  # GB
+        mem_res = torch.cuda.memory_reserved(device) / 1024**3     # GB
+        print(
+            f"\n[DIAGNOSTIC] Rank: {rank} | "
+            f"Device: {device} | "
+            f"Base Model Device: {self.base_model.device} | "
+            f"VRAM Used: {mem_alloc:.2f}GB (Alloc) / {mem_res:.2f}GB (Res) | "
+        )
+
         self._update_buffer(self.base_model, self.num_buffer_prompts, self.comps_per_prompt)
         print(f"[DEBUG] Buffer initialized with shape {self.buffer.shape}")
     
     def configure_optimizers(self):
         params = [p for p in self.model.parameters() if p.requires_grad]
-        opt = AdamW(
+        # opt = AdamW(
+        #     params,
+        #     lr=self.hparams.learning_rate,
+        #     betas=(self.hparams.adam_beta1, self.hparams.adam_beta2),
+        #     eps=self.hparams.adam_epsilon,
+        #     weight_decay=self.hparams.weight_decay,
+        # )
+        opt = bnb.optim.PagedAdamW32bit(
             params,
             lr=self.hparams.learning_rate,
             betas=(self.hparams.adam_beta1, self.hparams.adam_beta2),
@@ -346,11 +367,16 @@ class TiltMatchingModule(pl.LightningModule):
         Returns: input_ids: torch.Tensor
             Shape: [num_dinstinct_prompts * num_completions_per_prompts, prompt_length]
         """
+        # Get DDP info (defaults to 1 if not distributed)
+        world_size = self.trainer.world_size
+        global_rank = self.trainer.global_rank
+
         # ---- 1. Choose distinct prompt indices (with wrap-around) ----
         indices = []
         for offset in range(num_dinstinct_prompts):
-            indices.append((self.curr_prompt_counter + offset) % self.training_prompts_dataset_len)
-        self.curr_prompt_counter += num_dinstinct_prompts
+            idx = (self.curr_prompt_counter + (offset * world_size) + global_rank) % self.training_prompts_dataset_len
+            indices.append(idx)
+        self.curr_prompt_counter += (num_dinstinct_prompts * world_size)
         self.curr_prompt_counter %= self.training_prompts_dataset_len
         # Remember which dataset rows were used, for reward computation later
         self._last_prompt_indices = indices
