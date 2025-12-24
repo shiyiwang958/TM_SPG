@@ -9,15 +9,14 @@
 #SBATCH --mem=64GB
 #SBATCH --time=6:00:00
 #SBATCH --mail-type=END,FAIL,BEGIN
-#SBATCH --mail-user=fwang@math.harvard.edu
+#SBATCH --mail-user=yuyuanchen@math.harvard.edu
 
-OUTPUT_DIR="/n/home03/sw958/project_1/SPG/tilt_matching/outputs/output_${SLURM_JOB_ID}"
+OUTPUT_DIR="/n/home06/yuyuan0/TM_SPG/tilt_matching/outputs/output_${SLURM_JOB_ID}"
 mkdir -p "$OUTPUT_DIR"
 
-source ~/.bashrc
-conda deactivate
-conda activate spg
 module load cuda/12.4.1-fasrc01
+source /n/sw/Anaconda2-2019.10/etc/profile.d/conda.sh
+conda activate /n/home06/yuyuan0/conda/envs/spg
 
 # -------------------------
 # Networking configuration
@@ -81,7 +80,7 @@ srun --ntasks-per-node=1 bash -lc \
 LOGDIR="$OUTPUT_DIR/logs"
 mkdir -p "$LOGDIR"
 
-cd /n/home03/sw958/project_1/SPG/tilt_matching
+cd /n/home06/yuyuan0/TM_SPG/tilt_matching
 
 
 srun --ntasks-per-node=1 --gpus-per-task=4 \
@@ -96,5 +95,5 @@ srun --ntasks-per-node=1 --gpus-per-task=4 \
     --redirects 3 \
     --tee 3 \
     tilt_train.py \
-    --config-path /n/home03/sw958/project_1/SPG/tilt_matching/config \
+    --config-path /n/home06/yuyuan0/TM_SPG/tilt_matching/config \
     --config-name tilt_matching.yaml

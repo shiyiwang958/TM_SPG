@@ -27,6 +27,7 @@ from reward_func import (
 from data_utils import (
     get_gsm8k_questions,
     get_countdown_questions,
+    # get_sudoku_questions,
     get_sudoku_questions_new,
     set_random_seed,
     get_math_questions,
@@ -72,9 +73,9 @@ def train(cfg: DictConfig):
     elif cfg.dataset == "countdown":
         dataset = get_countdown_questions("train")
         reward_functions = [countdown_reward_func]
-    elif cfg.dataset == "sudoku":
-        dataset = get_sudoku_questions()
-        reward_functions = [sudoku_reward_func]
+    # elif cfg.dataset == "sudoku":
+    #     dataset = get_sudoku_questions()
+    #     reward_functions = [sudoku_reward_func]
     elif cfg.dataset == "sudoku_new":
         dataset = get_sudoku_questions_new(few_shot=cfg.few_shot)
         reward_functions = [sudoku_reward_func]

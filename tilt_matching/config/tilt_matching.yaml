@@ -1,16 +1,17 @@
 #-----------------Tilt Matching Training Config-----------------
 tm:
   a_end: 100.0
-  buffer_chunk_size: 32
+  buffer_chunk_size: 64
   buffer_refresh_steps: 32
   control_variate: 1.0
-  h: 2.0
+  grad_accum_steps: 8
+  h: 1.0
   loss_type: itm
   num_batch_prompts: 1
-  num_buffer_prompts: 16
+  num_buffer_prompts: 32
   num_buffer_refresh: 4
   num_completions_per_prompt: 4
-  steps_per_h: 1024
+  steps_per_h: 1024 # this is the number of optimizer steps per h
 
 #-----------------Optimizer Config-----------------
 adam_beta1: 0.9

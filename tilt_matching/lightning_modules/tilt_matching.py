@@ -24,9 +24,6 @@ class TiltMatchingModule(pl.LightningModule):
         self.save_hyperparameters(ignore=["base_model", "tokenizer", "training_prompts_dataset", "reward_funcs"], logger=False)
         self.tokenizer = tokenizer
 
-        self.student_adapter_name = "student"
-        self.teacher_adapter_name = "teacher"
-
         peft_config = LoraConfig(
             r=self.hparams.lora_r,
             lora_alpha=self.hparams.lora_alpha,
@@ -35,16 +32,16 @@ class TiltMatchingModule(pl.LightningModule):
             lora_dropout=self.hparams.lora_dropout,
         )
 
-        peft_wrapped = get_peft_model(base_model, peft_config, adapter_name=self.student_adapter_name)
-        peft_wrapped.add_adapter(self.teacher_adapter_name, peft_config)
-        student_state = get_peft_model_state_dict(peft_wrapped, adapter_name=self.student_adapter_name)
-        set_peft_model_state_dict(peft_wrapped, student_state, adapter_name=self.teacher_adapter_name)
+        peft_wrapped = get_peft_model(base_model, peft_config, adapter_name="student")
+        peft_wrapped.add_adapter("teacher", peft_config)
+        student_state = get_peft_model_state_dict(peft_wrapped, adapter_name="student")
+        set_peft_model_state_dict(peft_wrapped, student_state, adapter_name="teacher")
 
         for name, param in peft_wrapped.named_parameters():
-            if f".{self.teacher_adapter_name}" in name:
+            if ".teacher" in name:
                 param.requires_grad = False
 
-        peft_wrapped.set_adapter(self.student_adapter_name)
+        peft_wrapped.set_adapter("student")
         self.model = peft_wrapped
 
         self.curr_prompt_counter = 0
@@ -65,7 +62,7 @@ class TiltMatchingModule(pl.LightningModule):
         self.num_buffer_prompts = self.hparams.tm.num_buffer_prompts
         self.comps_per_prompt = self.hparams.tm.num_completions_per_prompt
         self.buffer_update_counter = 0
-        self._step_counter = 0
+        self._grad_accum_counter = 0
         self.dict_for_logs = {}
 
         self.lr = self.hparams.learning_rate
@@ -87,8 +84,8 @@ class TiltMatchingModule(pl.LightningModule):
     def state_dict(self, destination=None, keep_vars=False):
         destination = OrderedDict() if destination is None else destination
 
-        model_adapter_state = get_peft_model_state_dict(self.model, adapter_name=self.student_adapter_name)
-        base_adapter_state = get_peft_model_state_dict(self.model, adapter_name=self.teacher_adapter_name)
+        model_adapter_state = get_peft_model_state_dict(self.model, adapter_name="student")
+        base_adapter_state = get_peft_model_state_dict(self.model, adapter_name="teacher")
 
         for key, value in model_adapter_state.items():
             tensor = value if keep_vars else value.detach()
@@ -120,7 +117,7 @@ class TiltMatchingModule(pl.LightningModule):
             missing_model, unexpected_model = set_peft_model_state_dict(
                 self.model,
                 model_adapter_state,
-                adapter_name=self.student_adapter_name,
+                adapter_name="student",
             )
         else:
             missing_model, unexpected_model = [], []
@@ -129,7 +126,7 @@ class TiltMatchingModule(pl.LightningModule):
             missing_base, unexpected_base = set_peft_model_state_dict(
                 self.model,
                 base_adapter_state,
-                adapter_name=self.teacher_adapter_name,
+                adapter_name="teacher",
             )
         else:
             missing_base, unexpected_base = [], []
@@ -165,65 +162,102 @@ class TiltMatchingModule(pl.LightningModule):
     
     def configure_optimizers(self):
         params = [p for p in self.model.parameters() if p.requires_grad]
-        # opt = AdamW(
-        #     params,
-        #     lr=self.hparams.learning_rate,
-        #     betas=(self.hparams.adam_beta1, self.hparams.adam_beta2),
-        #     eps=self.hparams.adam_epsilon,
-        #     weight_decay=self.hparams.weight_decay,
-        # )
-        opt = bnb.optim.PagedAdamW32bit(
+        opt = AdamW(
             params,
             lr=self.hparams.learning_rate,
             betas=(self.hparams.adam_beta1, self.hparams.adam_beta2),
             eps=self.hparams.adam_epsilon,
             weight_decay=self.hparams.weight_decay,
         )
+        # opt = bnb.optim.PagedAdamW32bit(
+        #     params,
+        #     lr=self.hparams.learning_rate,
+        #     betas=(self.hparams.adam_beta1, self.hparams.adam_beta2),
+        #     eps=self.hparams.adam_epsilon,
+        #     weight_decay=self.hparams.weight_decay,
+        # )
         return opt
         
     def training_step(self, batch, batch_idx):
         """
-        Perform one training step of Tilt Matching.
-        The actual training logic is handled inside this method.
+        Perform one training micro-step of Tilt Matching.
+
+        We use manual optimization, so we implement gradient accumulation ourselves:
+          - run `_tm_step()` every call (new sampled batch each micro-step)
+          - accumulate grads for `grad_accum_steps` micro-steps
+          - run a single optimizer update + LR schedule step on the last micro-step
+
+        Note: When using DDP, we disable gradient synchronization on non-update
+        micro-steps to avoid an all-reduce every backward pass.
 
         Args:
             batch: Dummy batch (not used).
             batch_idx: Index of the batch (not used).
         """
-        self._step_tm_scheduler()
         opt = self.tm_opt
-        opt.zero_grad()
-        loss = self._tm_step()
-        self.manual_backward(loss)
+        accum = self.hparams.tm.grad_accum_steps
 
-        # Gradient clipping
+        # Clear grads at the start of a new accumulation window
+        if (self._grad_accum_counter % accum) == 0:
+            # set_to_none=True is slightly faster / uses less memory
+            try:
+                opt.zero_grad(set_to_none=True)
+            except TypeError:
+                print(f"[WARNING] optimizer.zero_grad() does not support set_to_none; using standard zero_grad()")
+                opt.zero_grad()
+
+        loss = self._tm_step()
+        loss_scaled = loss / float(accum)
+
+        # Backward (avoid DDP grad sync on non-update micro-steps)
+        self._grad_accum_counter += 1
+        is_update_step = (self._grad_accum_counter % accum) == 0
+        if (not is_update_step) and hasattr(self, "no_sync"):
+            with self.no_sync():
+                self.manual_backward(loss_scaled)
+        else:
+            print(f"[WARNING] DDP no_sync not available; grads will be synced every micro-step")
+            self.manual_backward(loss_scaled)
+
+        # Only update weights / schedules on the last micro-step of the window
+        if not is_update_step:
+            # Prevent logging hooks from trying to log multiple micro-steps at the same global_step
+            self.dict_for_logs = {}
+            return loss
+
+        # ---- Optimizer / scheduler step ----
+        self._step_tm_scheduler()
+
+        # Gradient clipping (on accumulated grads)
         params = [p for p in self.model.parameters() if p.requires_grad]
-        grad_norm_before = clip_grad_norm_(params, float('inf')).item()
+        grad_norm_before = clip_grad_norm_(params, float("inf")).item()
         grad_norm_after = clip_grad_norm_(params, self.hparams.max_grad_norm).item()
         grad_clipped = float(grad_norm_before > self.hparams.max_grad_norm + 1e-6)
 
         opt.step()
-        print(f"current a is {self.a:.4f}")
-        print(f"global step is {self.global_step}")
+
+        if (self.global_step + 2) % self.steps_per_h < 10:
+            print(f"current a is {self.a:.4f}")
+            print(f"global step is {self.global_step}")
 
         # Log current learning rate and grad norms
         self.dict_for_logs["train/lr"] = opt.param_groups[0]["lr"]
-        self.dict_for_logs['grads/grad_norm_before'] = grad_norm_before
-        self.dict_for_logs['grads/grad_norm_after'] = grad_norm_after
-        self.dict_for_logs['grads/grad_clipped'] = grad_clipped
+        self.dict_for_logs["grads/grad_norm_before"] = grad_norm_before
+        self.dict_for_logs["grads/grad_norm_after"] = grad_norm_after
+        self.dict_for_logs["grads/grad_clipped"] = grad_clipped
 
         # At each h phase boundary, update a and the teacher adapter; save ckpt if necessary
-        if (self.global_step + 1) % self.steps_per_h == 0:
+        if self.global_step % self.steps_per_h == 0:
             self.a += self.h
             if self.a + self.h > self.a_end:
                 self.h = self.a_end - self.a
             with torch.no_grad():
-                adapter_state = get_peft_model_state_dict(self.model, adapter_name=self.student_adapter_name)
-                set_peft_model_state_dict(self.model, adapter_state, adapter_name=self.teacher_adapter_name)
+                adapter_state = get_peft_model_state_dict(self.model, adapter_name="student")
+                set_peft_model_state_dict(self.model, adapter_state, adapter_name="teacher")
                 for name, p in self.model.named_parameters():
-                    if f".{self.teacher_adapter_name}" in name:
+                    if ".teacher" in name:
                         p.requires_grad_(False)
-            print(f"Degree of tilt a = {self.a:.4f} at step {self.global_step}")
+            print(f"Degree of tilt a = {self.a:.4f} at global step {self.global_step}")
 
             if self.a >= self.a_end:
                 print(f"Reached final a = {self.a_end:.2f}. Training Stopped", flush=True)
@@ -236,15 +270,16 @@ class TiltMatchingModule(pl.LightningModule):
 
             # Reset buffer
             self._update_buffer(self.model, self.num_buffer_prompts, self.comps_per_prompt)
-            print(f"[DEBUG] Buffer built at step {self.global_step} with shape {self.buffer.shape}")
+            print(f"[DEBUG] Buffer built at global step {self.global_step} with shape {self.buffer.shape}")
             self.monitor_sudoku()
-            
+
         # Partially refresh buffer
-        elif (self.global_step + 1) % self.hparams.tm.buffer_refresh_steps == 0:
-            print(f"[DEBUG] Refreshing {self.hparams.tm.num_buffer_refresh} prompts at step {self.global_step}")
+        elif self.global_step % self.hparams.tm.buffer_refresh_steps == 0:
+            print(f"[DEBUG] Refreshing {self.hparams.tm.num_buffer_refresh} prompts at global step {self.global_step}")
             self._update_buffer(self.model, self.hparams.tm.num_buffer_refresh, self.comps_per_prompt)
-        
+
         self.log("ckpt_a", self.a, on_step=True, on_epoch=False, sync_dist=True)
+        return loss
 
     def _tm_step(self):
         num_buffer_prompts, comps_per_prompt, L = self.buffer.shape
@@ -270,12 +305,12 @@ class TiltMatchingModule(pl.LightningModule):
 
         # Get model predictions and compute loss
         temp = self.hparams.sampling_temperature
-        with torch.no_grad(), self._use_adapter(self.teacher_adapter_name):
+        with torch.no_grad(), self._use_adapter("teacher"):
             old_logits = self._new_forward(self.model, xts, gen_length) # [B, gen_length, V]
             # old_logits = self.model(xts).logits # [B, L, V]
         V = old_logits.shape[-1]
         x1_equals_v = F.one_hot(x1s.long()[:, -gen_length:], num_classes = V) # [B, gen_length, V]
-        with self._use_adapter(self.student_adapter_name):
+        with self._use_adapter("student"):
             curr_logits = self._new_forward(self.model, xts, gen_length) # [B, gen_length, V]
         # curr_logits = self.model(xts).logits
         if temp > 0.0:
@@ -322,8 +357,7 @@ class TiltMatchingModule(pl.LightningModule):
         return loss
     
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        if not self.dict_for_logs or self.global_step % self.hparams.metrics_log_every != 0:
-            self._step_counter += 1
+        if not self.dict_for_logs or (self.global_step - 1) % self.hparams.metrics_log_every != 0:
             return
         # log all at once
         try:
@@ -341,21 +375,20 @@ class TiltMatchingModule(pl.LightningModule):
         self.log_dict(self.dict_for_logs, on_step=True, on_epoch=False, sync_dist=True)
         # self.monitor_sudoku()
         self.dict_for_logs = {}
-        self._step_counter += 1
     
     def on_save_checkpoint(self, checkpoint: dict):
         print(f"saving checkpoint at a = {self.a:.4f}")
         checkpoint["tilt"] = {"a": self.a, "h": self.h}
         checkpoint["hparams"] = copy.deepcopy(self.hparams)
         checkpoint["prompt_counter"] = self.curr_prompt_counter
-        checkpoint["_step_counter"] = self._step_counter
+        checkpoint["grad_accum_counter"] = getattr(self, "_grad_accum_counter", 0)
         
     def on_load_checkpoint(self, checkpoint: dict):
         tilt = checkpoint.get("tilt", None)
         self.a = tilt.get("a", 0.0)
         self.h = tilt.get("h", 2.5e-3)
         self.curr_prompt_counter = checkpoint.get("prompt_counter", 0)
-        self._step_counter = checkpoint.get("_step_counter", 0)
+        self._grad_accum_counter = checkpoint.get("grad_accum_counter", 0)
 
         hparams = checkpoint.get("hparams", None)
         self.__dict__["hparams"] = hparams
@@ -435,7 +468,7 @@ class TiltMatchingModule(pl.LightningModule):
         device = self.device
 
         prev_adapter = model.active_adapter
-        model.set_adapter(self.teacher_adapter_name)
+        model.set_adapter("teacher")
 
         # ---- 1. Prepare prompts as token IDs ----
         if num_buffer_updates == self.num_buffer_prompts:
@@ -666,7 +699,7 @@ class TiltMatchingModule(pl.LightningModule):
 
         input_ids = input_ids.repeat_interleave(num_completions, dim=0)
         
-        with torch.no_grad(), self._use_adapter(self.teacher_adapter_name):
+        with torch.no_grad(), self._use_adapter("teacher"):
             monitored_answers = self._generate(
                 model = self.model,
                 prompt = input_ids,
@@ -742,27 +775,6 @@ class TiltMatchingModule(pl.LightningModule):
         log_B = F.log_softmax(logits_B, dim=-1)
         kl = F.kl_div(log_A, log_B, reduction='none', log_target=True).sum(-1)
         return kl[mask_indices.bool()].float().mean()
-    
-    def on_save_checkpoint(self, checkpoint: dict):
-        print(f"saving checkpoint at a = {self.a:.4f}")
-        checkpoint["tilt"] = {"a": self.a, "h": self.h}
-        checkpoint["hparams"] = copy.deepcopy(self.hparams)
-        checkpoint["prompt_counter"] = self.curr_prompt_counter
-        checkpoint["_step_counter"] = self._step_counter
-        
-    
-    def on_load_checkpoint(self, checkpoint: dict):
-        tilt = checkpoint.get("tilt", None)
-        self.a = tilt.get("a", 0.0)
-        self.h = tilt.get("h", 2.5e-3)
-        self.curr_prompt_counter = checkpoint.get("prompt_counter", 0)
-        self._step_counter = checkpoint.get("_step_counter", 0)
-
-        hparams = checkpoint.get("hparams", None)
-        self.__dict__["hparams"] = hparams
-        self.__dict__["_hparams"] = hparams
-        
-        
 
     def _generate(
         self,
