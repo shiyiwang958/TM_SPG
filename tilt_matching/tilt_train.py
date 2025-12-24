@@ -95,7 +95,15 @@ def train(cfg: DictConfig):
         train_set = dataset
 
     # Set up device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if "LOCAL_RANK" in os.environ:
+        local_rank = int(os.environ["LOCAL_RANK"])
+    elif "SLURM_LOCALID" in os.environ:
+        local_rank = int(os.environ["SLURM_LOCALID"])
+    else:
+        # Fallback debug: if we are here, torchrun isn't passing the var
+        print("[WARNING] LOCAL_RANK not found in env, defaulting to 0. This will cause OOM on multi-GPU.")
+        local_rank = 0
+    torch.cuda.set_device(local_rank)
 
     # 4 bit quantization configuration
     bnb_config = BitsAndBytesConfig(
@@ -111,7 +119,8 @@ def train(cfg: DictConfig):
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
         quantization_config=bnb_config,
-    ).to(device)
+        device_map={"": torch.cuda.current_device()}
+    )
     tokenizer = AutoTokenizer.from_pretrained(cfg.base_model_path, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
     base_model.config.use_cache = False
@@ -126,12 +135,13 @@ def train(cfg: DictConfig):
         **cfg,
     )
 
-    # Configure trainer TODO: Check
+    # Configure trainer
     trainer_kwargs = dict(
         num_nodes = cfg.nodes,
         accelerator = "gpu",
         devices = cfg.devices,
-        strategy = "ddp" if cfg.nodes > 1 else "auto",
+        # strategy = "ddp" if cfg.nodes > 1 else "auto",
+        strategy = "ddp",
         precision="bf16-mixed",
 
         accumulate_grad_batches = 1,
@@ -188,8 +198,6 @@ def train(cfg: DictConfig):
 #-------------------------------- Train ------------------------------------
 @hydra.main(config_path = "config", config_name = "tilt_matching.yaml")
 def main(cfg: DictConfig):
-    # print("[DEBUG] Printing out config in tilt_train main")
-    #print(OmegaConf.to_yaml(cfg))
     train(cfg)
 
 

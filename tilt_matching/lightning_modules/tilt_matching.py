@@ -7,6 +7,7 @@ from collections import OrderedDict, namedtuple
 from contextlib import contextmanager
 import itertools
 import wandb
+import bitsandbytes as bnb
 
 import torch
 import torch.nn.functional as F
@@ -164,7 +165,14 @@ class TiltMatchingModule(pl.LightningModule):
     
     def configure_optimizers(self):
         params = [p for p in self.model.parameters() if p.requires_grad]
-        opt = AdamW(
+        # opt = AdamW(
+        #     params,
+        #     lr=self.hparams.learning_rate,
+        #     betas=(self.hparams.adam_beta1, self.hparams.adam_beta2),
+        #     eps=self.hparams.adam_epsilon,
+        #     weight_decay=self.hparams.weight_decay,
+        # )
+        opt = bnb.optim.PagedAdamW32bit(
             params,
             lr=self.hparams.learning_rate,
             betas=(self.hparams.adam_beta1, self.hparams.adam_beta2),
@@ -331,8 +339,27 @@ class TiltMatchingModule(pl.LightningModule):
         except Exception:
             pass
         self.log_dict(self.dict_for_logs, on_step=True, on_epoch=False, sync_dist=True)
+        # self.monitor_sudoku()
         self.dict_for_logs = {}
         self._step_counter += 1
+    
+    def on_save_checkpoint(self, checkpoint: dict):
+        print(f"saving checkpoint at a = {self.a:.4f}")
+        checkpoint["tilt"] = {"a": self.a, "h": self.h}
+        checkpoint["hparams"] = copy.deepcopy(self.hparams)
+        checkpoint["prompt_counter"] = self.curr_prompt_counter
+        checkpoint["_step_counter"] = self._step_counter
+        
+    def on_load_checkpoint(self, checkpoint: dict):
+        tilt = checkpoint.get("tilt", None)
+        self.a = tilt.get("a", 0.0)
+        self.h = tilt.get("h", 2.5e-3)
+        self.curr_prompt_counter = checkpoint.get("prompt_counter", 0)
+        self._step_counter = checkpoint.get("_step_counter", 0)
+
+        hparams = checkpoint.get("hparams", None)
+        self.__dict__["hparams"] = hparams
+        self.__dict__["_hparams"] = hparams
 
     def _prepare_prompts(self, num_dinstinct_prompts, num_completions_per_prompts):
         """
@@ -344,11 +371,16 @@ class TiltMatchingModule(pl.LightningModule):
         Returns: input_ids: torch.Tensor
             Shape: [num_dinstinct_prompts * num_completions_per_prompts, prompt_length]
         """
+        # Get DDP info (defaults to 1 if not distributed)
+        world_size = self.trainer.world_size
+        global_rank = self.trainer.global_rank
+
         # ---- 1. Choose distinct prompt indices (with wrap-around) ----
         indices = []
         for offset in range(num_dinstinct_prompts):
-            indices.append((self.curr_prompt_counter + offset) % self.training_prompts_dataset_len)
-        self.curr_prompt_counter += num_dinstinct_prompts
+            idx = (self.curr_prompt_counter + (offset * world_size) + global_rank) % self.training_prompts_dataset_len
+            indices.append(idx)
+        self.curr_prompt_counter += (num_dinstinct_prompts * world_size)
         self.curr_prompt_counter %= self.training_prompts_dataset_len
         # Remember which dataset rows were used, for reward computation later
         self._last_prompt_indices = indices
