@@ -197,9 +197,12 @@ class TiltMatchingModule(pl.LightningModule):
         opt = self.tm_opt
         accum = self.hparams.tm.grad_accum_steps
 
-        # Clear grads at the start of a new accumulation window
+        # At the start of a new accumulation window:
         if (self._grad_accum_counter % accum) == 0:
-            # set_to_none=True is slightly faster / uses less memory
+            # randomly choose the prompts to use for the microsteps
+            self._accum_prompts_idx = torch.randperm(self.buffer.shape[0], device=self.device)[:num_batch_prompts * accum]
+
+            # clear grads
             try:
                 opt.zero_grad(set_to_none=True)
             except TypeError:
@@ -212,11 +215,10 @@ class TiltMatchingModule(pl.LightningModule):
         # Backward (avoid DDP grad sync on non-update micro-steps)
         self._grad_accum_counter += 1
         is_update_step = (self._grad_accum_counter % accum) == 0
-        if (not is_update_step) and hasattr(self, "no_sync"):
-            with self.no_sync():
+        if not is_update_step:
+            with self.trainer.strategy.block_backward_sync():
                 self.manual_backward(loss_scaled)
         else:
-            print(f"[WARNING] DDP no_sync not available; grads will be synced every micro-step")
             self.manual_backward(loss_scaled)
 
         # Only update weights / schedules on the last micro-step of the window
@@ -288,7 +290,9 @@ class TiltMatchingModule(pl.LightningModule):
         gen_length = self.hparams.max_completion_length
 
         # Draw a batch from the buffer
-        prompts_idx = torch.randperm(num_buffer_prompts, device=self.device)[:num_batch_prompts]
+        start_idx = self._grad_accum_counter * num_batch_prompts
+        end_idx = start_idx + num_batch_prompts
+        prompts_idx = self._accum_prompts_idx[start_idx:end_idx]
         x1s = self.buffer[prompts_idx].reshape(B, L)           # [B, L]
         rwds = self.buffer_rewards[prompts_idx].reshape(B, -1) # [B, num_reward_funcs]
 

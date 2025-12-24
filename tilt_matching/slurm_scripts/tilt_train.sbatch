@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=tilt_sudoku
-#SBATCH --account=kempner_albergo_lab
-#SBATCH --partition=kempner
+#SBATCH --account=albergo_lab
+#SBATCH --partition=gpu
 #SBATCH --nodes=2
 #SBATCH --gpus-per-node=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=64GB
-#SBATCH --time=6:00:00
+#SBATCH --time=8:00:00
 #SBATCH --mail-type=END,FAIL,BEGIN
 #SBATCH --mail-user=yuyuanchen@math.harvard.edu
 

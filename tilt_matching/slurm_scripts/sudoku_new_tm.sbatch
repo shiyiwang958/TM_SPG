@@ -3,7 +3,7 @@
 #SBATCH --job-name=tm-sudoku
 #SBATCH --partition=kempner_h100
 #SBATCH --account=kempner_albergo_lab
-#SBATCH --time=6:00:00
+#SBATCH --time=0:20:00
 #SBATCH --wait-all-nodes=1
 #SBATCH --open-mode=append
 
@@ -28,4 +28,5 @@ srun --ntasks-per-node=1 --gpus-per-task=4 \
     --nproc_per_node=4 \
     /n/home06/yuyuan0/TM_SPG/tilt_matching/tilt_train.py \
     --config-path /n/home06/yuyuan0/TM_SPG/tilt_matching/config \
-    --config-name tilt_matching
+    --config-name tilt_matching \
+    nodes=1
