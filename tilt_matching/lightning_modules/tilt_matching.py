@@ -200,14 +200,8 @@ class TiltMatchingModule(pl.LightningModule):
         # At the start of a new accumulation window:
         if (self._grad_accum_counter % accum) == 0:
             # randomly choose the prompts to use for the microsteps
-            self._accum_prompts_idx = torch.randperm(self.buffer.shape[0], device=self.device)[:num_batch_prompts * accum]
-
-            # clear grads
-            try:
-                opt.zero_grad(set_to_none=True)
-            except TypeError:
-                print(f"[WARNING] optimizer.zero_grad() does not support set_to_none; using standard zero_grad()")
-                opt.zero_grad()
+            total_prompts_needed = self.hparams.tm.num_batch_prompts * accum
+            self._accum_prompts_idx = torch.randperm(self.buffer.shape[0], device=self.device)[:total_prompts_needed]
 
         loss = self._tm_step()
         loss_scaled = loss / float(accum)
@@ -237,8 +231,9 @@ class TiltMatchingModule(pl.LightningModule):
         grad_clipped = float(grad_norm_before > self.hparams.max_grad_norm + 1e-6)
 
         opt.step()
+        opt.zero_grad(set_to_none=True)
 
-        if (self.global_step + 2) % self.steps_per_h < 10:
+        if (self.global_step + 2) % self.steps_per_h < 5:
             print(f"current a is {self.a:.4f}")
             print(f"global step is {self.global_step}")
 
@@ -259,7 +254,7 @@ class TiltMatchingModule(pl.LightningModule):
                 for name, p in self.model.named_parameters():
                     if ".teacher" in name:
                         p.requires_grad_(False)
-            print(f"Degree of tilt a = {self.a:.4f} at global step {self.global_step}")
+            print(f"Model weights copied. Degree of tilt a = {self.a:.4f} at global step {self.global_step}")
 
             if self.a >= self.a_end:
                 print(f"Reached final a = {self.a_end:.2f}. Training Stopped", flush=True)
@@ -269,16 +264,6 @@ class TiltMatchingModule(pl.LightningModule):
             for g in opt.param_groups:
                 g["lr"] = self.lr
             self._init_tm_scheduler()
-
-            # Reset buffer
-            self._update_buffer(self.model, self.num_buffer_prompts, self.comps_per_prompt)
-            print(f"[DEBUG] Buffer built at global step {self.global_step} with shape {self.buffer.shape}")
-            self.monitor_sudoku()
-
-        # Partially refresh buffer
-        elif self.global_step % self.hparams.tm.buffer_refresh_steps == 0:
-            print(f"[DEBUG] Refreshing {self.hparams.tm.num_buffer_refresh} prompts at global step {self.global_step}")
-            self._update_buffer(self.model, self.hparams.tm.num_buffer_refresh, self.comps_per_prompt)
 
         self.log("ckpt_a", self.a, on_step=True, on_epoch=False, sync_dist=True)
         return loss
@@ -290,7 +275,7 @@ class TiltMatchingModule(pl.LightningModule):
         gen_length = self.hparams.max_completion_length
 
         # Draw a batch from the buffer
-        start_idx = self._grad_accum_counter * num_batch_prompts
+        start_idx = (self._grad_accum_counter % self.hparams.tm.grad_accum_steps) * num_batch_prompts
         end_idx = start_idx + num_batch_prompts
         prompts_idx = self._accum_prompts_idx[start_idx:end_idx]
         x1s = self.buffer[prompts_idx].reshape(B, L)           # [B, L]
@@ -361,6 +346,16 @@ class TiltMatchingModule(pl.LightningModule):
         return loss
     
     def on_train_batch_end(self, outputs, batch, batch_idx):
+        if (self._grad_accum_counter % self.hparams.tm.grad_accum_steps) == 0:
+            if self.global_step % self.steps_per_h == 0:
+                # Reset buffer
+                self._update_buffer(self.model, self.num_buffer_prompts, self.comps_per_prompt)
+                print(f"[DEBUG] Buffer built at global step {self.global_step} with shape {self.buffer.shape}")
+            # Partially refresh buffer
+            elif self.global_step % self.hparams.tm.buffer_refresh_steps == 0:
+                print(f"[DEBUG] Refreshing {self.hparams.tm.num_buffer_refresh} prompts at global step {self.global_step}")
+                self._update_buffer(self.model, self.hparams.tm.num_buffer_refresh, self.comps_per_prompt)
+
         if not self.dict_for_logs or (self.global_step - 1) % self.hparams.metrics_log_every != 0:
             return
         # log all at once
@@ -478,6 +473,8 @@ class TiltMatchingModule(pl.LightningModule):
         if num_buffer_updates == self.num_buffer_prompts:
             update_rows = list(range(self.num_buffer_prompts))
             self.buffer_update_counter = 0
+            self.buffer = None
+            self.buffer_rewards = None
         else:
             update_rows = [
                 (self.buffer_update_counter + u) % self.num_buffer_prompts
@@ -489,9 +486,15 @@ class TiltMatchingModule(pl.LightningModule):
         total_batch, prompt_len = prompt_ids.shape
 
         # ---- 2. Run diffusion generation to get prompt+completion sequences ----
-        gen_length = self.hparams.max_completion_length
-        outputs = []
         chunk_size = max(1, min(self.hparams.tm.buffer_chunk_size, total_batch))
+        gen_length = self.hparams.max_completion_length
+        seq_len = prompt_len + gen_length
+        # pre-allocate
+        prompt_completion_ids = torch.empty(
+            (total_batch, seq_len),
+            device=prompt_ids.device,
+            dtype=prompt_ids.dtype,
+        )
         for start in range(0, total_batch, chunk_size):
             end = min(start + chunk_size, total_batch)
             with torch.no_grad():
@@ -504,10 +507,30 @@ class TiltMatchingModule(pl.LightningModule):
                     temperature=self.hparams.sampling_temperature,
                     cfg_scale=self.hparams.cfg_scale,
                     remasking=self.hparams.remasking_strategy,
-                ) # [chunk_size, seq_len]
-            outputs.append(chunk_completion_ids)
-        prompt_completion_ids = torch.cat(outputs, dim=0) # [total_batch, seq_len]
-        seq_len = prompt_completion_ids.size(1) # seq_len = prompt_len + gen_length
+                )  # [end-start, seq_len]
+
+            prompt_completion_ids[start:end].copy_(chunk_completion_ids)
+
+        # # ---- 2. Run diffusion generation to get prompt+completion sequences ----
+        # gen_length = self.hparams.max_completion_length
+        # outputs = []
+        # chunk_size = max(1, min(self.hparams.tm.buffer_chunk_size, total_batch))
+        # for start in range(0, total_batch, chunk_size):
+        #     end = min(start + chunk_size, total_batch)
+        #     with torch.no_grad():
+        #         chunk_completion_ids = self._generate(
+        #             model=model,
+        #             prompt=prompt_ids[start:end],
+        #             steps=self.hparams.diffusion_steps,
+        #             gen_length=gen_length,
+        #             block_length=self.hparams.block_length,
+        #             temperature=self.hparams.sampling_temperature,
+        #             cfg_scale=self.hparams.cfg_scale,
+        #             remasking=self.hparams.remasking_strategy,
+        #         ) # [chunk_size, seq_len]
+        #     outputs.append(chunk_completion_ids)
+        # prompt_completion_ids = torch.cat(outputs, dim=0) # [total_batch, seq_len]
+        # seq_len = prompt_completion_ids.size(1) # seq_len = prompt_len + gen_length
 
         # ---- 3. Reshape into [num_updates, num_completions, seq_len] and update corresponding rows ----
         new_buffer_block = prompt_completion_ids.view(num_buffer_updates, -1, seq_len)

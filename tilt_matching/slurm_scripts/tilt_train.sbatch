@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=tilt_sudoku
-#SBATCH --account=albergo_lab
-#SBATCH --partition=gpu
+#SBATCH --account=kempner_albergo_lab
+#SBATCH --partition=kempner_h100
 #SBATCH --nodes=2
 #SBATCH --gpus-per-node=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=64GB
-#SBATCH --time=8:00:00
+#SBATCH --time=4:00:00
 #SBATCH --mail-type=END,FAIL,BEGIN
 #SBATCH --mail-user=yuyuanchen@math.harvard.edu
 
@@ -25,7 +25,7 @@ export NCCL_SOCKET_FAMILY=AF_INET
 export GLOO_USE_IPV6=0
 
 # Rendezvous (TCPStore/GLOO) over Ethernet (em2)
-export GLOO_SOCKET_IFNAME=em2
+export GLOO_SOCKET_IFNAME=em4
 
 # NCCL data plane over InfiniBand (ib0)
 export NCCL_SOCKET_IFNAME=ib0
@@ -44,7 +44,7 @@ MASTER_FILE="$OUTPUT_DIR/master_addr.txt"
 
 if [ "$SLURM_NODEID" -eq 0 ]; then
   # Pick em2 IPv4 on rank0 as MASTER_ADDR (rendezvous address)
-  MASTER_ADDR=$(ip -o -4 addr show dev em2 | awk '{print $4}' | cut -d/ -f1 || true)
+  MASTER_ADDR=$(ip -o -4 addr show dev em4 | awk '{print $4}' | cut -d/ -f1 || true)
   if [ -z "${MASTER_ADDR:-}" ]; then
     echo "ERROR: could not find IPv4 on em2 for rank0"
     ip -o -4 addr show
