@@ -450,12 +450,19 @@ class TiltMatchingModule(pl.LightningModule):
           buffer_rewards shape: [num_buffer_prompts, num_completions_per_prompt, num_reward_funcs]
         """
         build_or_refresh = "building" if num_buffer_updates == self.num_buffer_prompts else "refreshing"
-        print(f"{build_or_refresh} sample buffer ...")
-        buffer_start_time = datetime.now()
+        
         device = self.device
 
         prev_adapter = model.active_adapter
         model.set_adapter("teacher")
+        print("compiling the teacher model...")
+        compile_start_time = datetime.now()
+        model = torch.compile(model)
+        compile_end_time = datetime.now()
+        compile_time = (compile_end_time - compile_start_time).total_seconds()
+        print(f"finished compiling, took {compile_time:.2f} seconds.")
+        print(f"{build_or_refresh} sample buffer ...")
+        buffer_start_time = datetime.now()
 
         # ---- 1. Prepare prompts as token IDs ----
         if num_buffer_updates == self.num_buffer_prompts:
@@ -581,6 +588,10 @@ class TiltMatchingModule(pl.LightningModule):
         buffer_end_time = datetime.now()
         buffer_build_time = (buffer_end_time - buffer_start_time).total_seconds()
         print(f"Finished {build_or_refresh} reward buffer, took {buffer_build_time}")
+
+        # Uncompile the model
+        if hasattr(model, '_orig_mod'):
+            model = model._orig_mod
 
         # restore adapter
         model.set_adapter(prev_adapter)
