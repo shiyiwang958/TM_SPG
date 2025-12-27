@@ -97,57 +97,45 @@ class TiltMatchingModule(pl.LightningModule):
 
         return destination
 
-    def load_state_dict(self, state_dict, strict=True):
-        model_prefix = "model_adapter."
-        base_prefix = "base_adapter."
+    def load_state_dict(self, state_dict, strict: bool = True):
+        """
+        Load adapter weights saved via `state_dict`.
 
-        model_adapter_state = {}
-        base_adapter_state = {}
+        Expects keys with prefixes `model_adapter.` (student) and `base_adapter.` (teacher).
+        Returns a dict mirroring torch's load_state_dict with any missing or unexpected keys.
+        """
+        expected_student = set(get_peft_model_state_dict(self.model, adapter_name="student").keys())
+        expected_teacher = set(get_peft_model_state_dict(self.model, adapter_name="teacher").keys())
+
+        student_state = OrderedDict()
+        teacher_state = OrderedDict()
         unexpected_keys = []
 
         for key, value in state_dict.items():
-            if key.startswith(model_prefix):
-                model_adapter_state[key[len(model_prefix):]] = value
-            elif key.startswith(base_prefix):
-                base_adapter_state[key[len(base_prefix):]] = value
+            if key.startswith("model_adapter."):
+                bare = key[len("model_adapter."):]
+                student_state[bare] = value.to(self.model.device)
+            elif key.startswith("base_adapter."):
+                bare = key[len("base_adapter."):]
+                teacher_state[bare] = value.to(self.model.device)
             else:
                 unexpected_keys.append(key)
 
-        if model_adapter_state:
-            missing_model, unexpected_model = set_peft_model_state_dict(
-                self.model,
-                model_adapter_state,
-                adapter_name="student",
-            )
-        else:
-            missing_model, unexpected_model = [], []
+        set_peft_model_state_dict(self.model, student_state, adapter_name="student")
+        set_peft_model_state_dict(self.model, teacher_state, adapter_name="teacher")
 
-        if base_adapter_state:
-            missing_base, unexpected_base = set_peft_model_state_dict(
-                self.model,
-                base_adapter_state,
-                adapter_name="teacher",
-            )
-        else:
-            missing_base, unexpected_base = [], []
-
-        def _relevant_missing(key: str) -> bool:
-            # For LoRA checkpoints we only expect adapter weights; ignore base weights.
-            return "lora" in key.lower() or "ranknum" in key.lower()
-
-        missing_keys = [k for k in missing_model if _relevant_missing(k)]
-        missing_keys.extend(k for k in missing_base if _relevant_missing(k))
-        unexpected_keys.extend(list(unexpected_model))
-        unexpected_keys.extend(list(unexpected_base))
+        missing_student = list(expected_student - set(student_state.keys()))
+        missing_teacher = list(expected_teacher - set(teacher_state.keys()))
+        missing_keys = [f"model_adapter.{k}" for k in missing_student] + [f"base_adapter.{k}" for k in missing_teacher]
 
         if strict and (missing_keys or unexpected_keys):
             raise RuntimeError(
-                f"Error(s) in loading state_dict for {self.__class__.__name__}: "
-                f"missing keys: {missing_keys}; unexpected keys: {unexpected_keys}"
+                f"Error(s) in loading state_dict: missing keys {missing_keys}; unexpected keys {unexpected_keys}"
             )
 
-        IncompatibleKeys = namedtuple("IncompatibleKeys", ["missing_keys", "unexpected_keys"])
-        return IncompatibleKeys(missing_keys, unexpected_keys)
+        return {"missing_keys": missing_keys, "unexpected_keys": unexpected_keys}
+
+   
 
     def on_train_start(self):
         super().on_train_start()
@@ -385,13 +373,13 @@ class TiltMatchingModule(pl.LightningModule):
     def on_load_checkpoint(self, checkpoint: dict):
         tilt = checkpoint.get("tilt", None)
         self.a = tilt.get("a", 0.0)
-        self.h = tilt.get("h", 2.5e-3)
+        # self.h = tilt.get("h", 2.5e-3)
         self.curr_prompt_counter = checkpoint.get("prompt_counter", 0)
         self._grad_accum_counter = checkpoint.get("grad_accum_counter", 0)
 
-        hparams = checkpoint.get("hparams", None)
-        self.__dict__["hparams"] = hparams
-        self.__dict__["_hparams"] = hparams
+        # hparams = checkpoint.get("hparams", None)
+        # self.__dict__["hparams"] = hparams
+        # self.__dict__["_hparams"] = hparams
 
     def _prepare_prompts(self, num_dinstinct_prompts, num_completions_per_prompts):
         """
