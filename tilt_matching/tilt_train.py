@@ -157,8 +157,7 @@ def train(cfg: DictConfig):
         # Lightning still requires a finite epoch cap; set a very large number
         max_epochs = 10**12,
     )
-    eps = 1e-6
-    ckpt_steps = int(cfg.tm.steps_per_h * math.floor((cfg.checkpoint_freq + eps) / cfg.tm.h))
+    ckpt_steps = int(cfg.tm.steps_per_h * math.floor((cfg.checkpoint_freq) / cfg.tm.h) / 4)
 
     checkpoint_callback = ModelCheckpoint(
         save_last = True,
@@ -168,6 +167,7 @@ def train(cfg: DictConfig):
         save_on_train_epoch_end = False,
         filename = "checkpoint-a-{ckpt_a:.3f}",
         auto_insert_metric_name=False,
+        save_on_exception=True,
     )
 
     # finish trainer kwargs

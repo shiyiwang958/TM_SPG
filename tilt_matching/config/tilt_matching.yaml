@@ -5,7 +5,7 @@ tm:
   buffer_refresh_steps: 32
   control_variate: 1.0
   grad_accum_steps: 8
-  h: 1.0
+  h: 2.0
   loss_type: itm
   num_batch_prompts: 1
   num_buffer_prompts: 32
