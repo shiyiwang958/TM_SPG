@@ -216,7 +216,7 @@ def sudoku_reward_func(prompts, completions, run_name=None, step=None, rank=None
 
     scores = []
     for i, response in enumerate(responses):
-        do_print = np.random.rand() < 0.4
+        do_print = np.random.rand() < 0.0
         puzzle = kwargs["puzzle"][i]
         ground_truth = kwargs["solution"][i]
         solution = extract_answer_sudoku(response)
