@@ -14,6 +14,7 @@ tm:
   num_buffer_refresh: 16
   num_completions_per_prompt: 2
   rescale_logits: false
+  rwd_shift: -0.47
   steps_per_h: 256 # this is the number of optimizer steps per h
 
 #-----------------Optimizer Config-----------------
@@ -54,12 +55,12 @@ peft_task_type: CAUSAL_LM
 checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/1229
 checkpoint_freq: 5.0  # in units of h
 metrics_log_every: 4
-resume_path: # /n/netscratch/albergo_lab/Everyone/frank/llada_tm/1228/checkpoint-a-1.000.ckpt
+resume_path: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/1229/checkpoint-a-5.000.ckpt
 # leave empty if not resuming
 wandb:
   entity: "yuyuanchen-harvard-university"
   project: "LLaDA_TM"
-  name: "temp0.3_h=5_no_rescale"
+  name: "temp0.3_h=5_no_rescale_cv=2"
 
 #-----------------Other Training Config-----------------
 dataset: sudoku_new
@@ -68,5 +69,5 @@ few_shot: 3
 seed: 42
 nodes: 2
 devices: 4  # 8? 4?
-debug_loss_spike_threshold: 40
+debug_loss_spike_threshold: 60
 debug_loss_spike_topk: 3

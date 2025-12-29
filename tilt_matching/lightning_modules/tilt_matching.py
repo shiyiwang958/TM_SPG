@@ -362,7 +362,8 @@ class TiltMatchingModule(pl.LightningModule):
         old_probs = F.softmax(old_logits, dim=-1) # [B, gen_length, V]
         
         loss_type = self.hparams.tm.loss_type
-        hr = self.h * rwd # [B,]
+        # shift reward for minimizing gradient variance for loss computation
+        hr = self.h * (rwd + self.hparams.tm.rwd_shift) # [B,]
         if loss_type == "itm":
             target = self.cv * old_probs + x1_equals_v * (1 - self.cv + torch.expm1(hr)).view(-1, 1, 1) # [B, gen_length, V]
         elif loss_type == "etm":
@@ -418,9 +419,13 @@ class TiltMatchingModule(pl.LightningModule):
                         masked_pos = mask_indices[i].nonzero(as_tuple=False).squeeze(-1)
                         if masked_pos.numel() > 0:
                             # token with lowest prob under student among masked positions
-                            worst_tok_j = masked_pos[torch.argmin(logp_curr[i, masked_pos])]
+                            worst_tok_j = masked_pos[torch.argmax(per_sample_losses[i, masked_pos])]
+                            # then compute logps at that same position
                             curr_lp = logp_curr[i, worst_tok_j].item()
                             old_lp  = logp_old[i,  worst_tok_j].item()
+                            tok_loss = per_sample_losses[i, worst_tok_j].item()
+                            print(f"    tok_loss(NLL)={tok_loss:.4f}")
+                            print(f"    logp_student={curr_lp:.4f}  logp_teacher={old_lp:.4f}")
                             tok_id  = int(true_ids[i, worst_tok_j].item())
                             tok_str = self.tokenizer.decode([tok_id])
 
