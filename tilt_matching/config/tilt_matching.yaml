@@ -4,14 +4,15 @@ tm:
   buffer_chunk_size: 64
   buffer_refresh_steps: 32
   control_variate: 1.0
-  grad_accum_steps: 8
-  h: 2.0
+  grad_accum_steps: 16
+  h: 5.0
   loss_type: itm
-  num_batch_prompts: 1
-  num_buffer_prompts: 32
-  num_buffer_refresh: 8
-  num_completions_per_prompt: 4
-  steps_per_h: 512 # this is the number of optimizer steps per h
+  num_batch_prompts: 2
+  num_buffer_prompts: 64
+  num_buffer_refresh: 16
+  num_completions_per_prompt: 2
+  rescale_logits: false
+  steps_per_h: 256 # this is the number of optimizer steps per h
 
 #-----------------Optimizer Config-----------------
 adam_beta1: 0.9
@@ -19,12 +20,12 @@ adam_beta2: 0.99
 adam_epsilon: 1e-8
 weight_decay: 0.1
 
-max_grad_norm: 1.0
+max_grad_norm: 2.0
 learning_rate: 3e-6
-lr_decay_ratio: 0.25
+lr_decay_ratio: 0.1
 lr_min: 1e-6
 lr_scheduler_type: linear
-lr_warmup_ratio: 0.1
+lr_warmup_ratio: 0.15
 
 #-----------------Diffusion Generation Config-----------------
 block_length: 32
@@ -33,7 +34,7 @@ diffusion_steps: 128
 max_completion_length: 256
 max_prompt_length: 1132  # for sudoku with few_shot=3
 remasking_strategy: low_confidence # or random
-sampling_temperature: 1.0
+sampling_temperature: 0.3
 
 #-----------------Model Config-----------------
 use_peft: true
@@ -48,15 +49,15 @@ lora_dropout: 0.05
 peft_task_type: CAUSAL_LM
 
 #-----------------Logging and Checkpointing Config-----------------
-checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/1
+checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/1228
 checkpoint_freq: 1.0  # in units of h
 metrics_log_every: 4
-resume_path: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/1/checkpoint-a-1.000.ckpt
+resume_path: # /n/netscratch/albergo_lab/Everyone/frank/llada_tm/1228/checkpoint-a-1.000.ckpt
 # leave empty if not resuming
 wandb:
   entity: "yuyuanchen-harvard-university"
   project: "LLaDA_TM"
-  name: "frank_grad_accum"
+  name: "temp0.3"
 
 #-----------------Other Training Config-----------------
 dataset: sudoku_new

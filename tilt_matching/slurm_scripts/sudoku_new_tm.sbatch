@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --output=/n/home06/yuyuan0/TM_SPG/output_logs/%A/slurm.out
 #SBATCH --job-name=tm-sudoku
-#SBATCH --partition=kempner_h100
+#SBATCH --partition=kempner
 #SBATCH --account=kempner_albergo_lab
-#SBATCH --time=0:20:00
+#SBATCH --time=0:12:00
 #SBATCH --wait-all-nodes=1
 #SBATCH --open-mode=append
 

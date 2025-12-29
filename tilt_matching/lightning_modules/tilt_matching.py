@@ -213,6 +213,7 @@ class TiltMatchingModule(pl.LightningModule):
         self._step_tm_scheduler()
 
         # Gradient clipping (on accumulated grads)
+        # TODO: check if this is averaged across grad accum steps
         params = [p for p in self.model.parameters() if p.requires_grad]
         grad_norm_before = clip_grad_norm_(params, float("inf")).item()
         grad_norm_after = clip_grad_norm_(params, self.hparams.max_grad_norm).item()
@@ -284,13 +285,11 @@ class TiltMatchingModule(pl.LightningModule):
         temp = self.hparams.sampling_temperature
         with torch.no_grad(), self._use_adapter("teacher"):
             old_logits = self._new_forward(self.model, xts, gen_length) # [B, gen_length, V]
-            # old_logits = self.model(xts).logits # [B, L, V]
         V = old_logits.shape[-1]
         x1_equals_v = F.one_hot(x1s.long()[:, -gen_length:], num_classes = V) # [B, gen_length, V]
         with self._use_adapter("student"):
             curr_logits = self._new_forward(self.model, xts, gen_length) # [B, gen_length, V]
-        # curr_logits = self.model(xts).logits
-        if temp > 0.0:
+        if temp > 0.0 and self.hparams.tm.rescale_logits:
             old_logits  /= temp
             curr_logits /= temp
         old_probs = F.softmax(old_logits, dim=-1) # [B, gen_length, V]
@@ -309,6 +308,7 @@ class TiltMatchingModule(pl.LightningModule):
         per_sample_losses = -(target * F.log_softmax(curr_logits, dim=-1)).sum(dim=-1) # [B, gen_length]
         loss = per_sample_losses[mask_indices.bool()].mean()
 
+        # TODO: Average
         log_dict = {
             f"train/loss": loss,
             f"train/a": self.a,
@@ -366,7 +366,7 @@ class TiltMatchingModule(pl.LightningModule):
     def on_save_checkpoint(self, checkpoint: dict):
         print(f"saving checkpoint at a = {self.a:.4f}")
         checkpoint["tilt"] = {"a": self.a, "h": self.h}
-        checkpoint["hparams"] = copy.deepcopy(self.hparams)
+        # checkpoint["hparams"] = copy.deepcopy(self.hparams)
         checkpoint["prompt_counter"] = self.curr_prompt_counter
         checkpoint["grad_accum_counter"] = getattr(self, "_grad_accum_counter", 0)
         
@@ -455,12 +455,6 @@ class TiltMatchingModule(pl.LightningModule):
 
         prev_adapter = model.active_adapter
         model.set_adapter("teacher")
-        print("compiling the teacher model...")
-        compile_start_time = datetime.now()
-        model = torch.compile(model)
-        compile_end_time = datetime.now()
-        compile_time = (compile_end_time - compile_start_time).total_seconds()
-        print(f"finished compiling, took {compile_time:.2f} seconds.")
         print(f"{build_or_refresh} sample buffer ...")
         buffer_start_time = datetime.now()
 
@@ -588,10 +582,6 @@ class TiltMatchingModule(pl.LightningModule):
         buffer_end_time = datetime.now()
         buffer_build_time = (buffer_end_time - buffer_start_time).total_seconds()
         print(f"Finished {build_or_refresh} reward buffer, took {buffer_build_time}")
-
-        # Uncompile the model
-        if hasattr(model, '_orig_mod'):
-            model = model._orig_mod
 
         # restore adapter
         model.set_adapter(prev_adapter)
