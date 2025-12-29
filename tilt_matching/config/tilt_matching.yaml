@@ -71,3 +71,4 @@ nodes: 2
 devices: 4  # 8? 4?
 debug_loss_spike_threshold: 60
 debug_loss_spike_topk: 3
+world_size: 16  # set to 8 if need two gpus to read the same prompts.

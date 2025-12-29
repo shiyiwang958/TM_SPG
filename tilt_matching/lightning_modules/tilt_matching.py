@@ -451,18 +451,10 @@ class TiltMatchingModule(pl.LightningModule):
             f"train/a": self.a,
             f"train/h": self.h,
             f"train/drift_gap_kl": self._kl_from_logits(old_logits, curr_logits, mask_indices),
-<<<<<<< HEAD
             f"train/rwd_max": rwd.max(),
             f"train/rwd_min": rwd.min(),
             f"train/rwd_mean": rwd.mean(),
             f"train/rwd_std": rwd.std(),
-            f"train/correct_frac": correct_frac,
-=======
-            f"train/rwd_max": rwd.max() / 20.0 + 0.5,
-            f"train/rwd_min": rwd.min() / 20.0 + 0.5,
-            f"train/rwd_mean": rwd.mean() / 20.0 + 0.5,
-            f"train/rwd_std": rwd.std() / 20.0 + 0.5,
->>>>>>> d4beeeb (few edits)
         }
         
         return loss, log_dict
@@ -499,10 +491,6 @@ class TiltMatchingModule(pl.LightningModule):
     def on_save_checkpoint(self, checkpoint: dict):
         print(f"saving checkpoint at a = {self.a:.4f}")
         checkpoint["tilt"] = {"a": self.a, "h": self.h}
-<<<<<<< HEAD
-=======
-        # checkpoint["hparams"] = copy.deepcopy(self.hparams)
->>>>>>> d4beeeb (few edits)
         checkpoint["prompt_counter"] = self.curr_prompt_counter
         checkpoint["grad_accum_counter"] = getattr(self, "_grad_accum_counter", 0)
         
@@ -532,8 +520,8 @@ class TiltMatchingModule(pl.LightningModule):
         # will share the same prompts when running with 16 GPUs.
         physical_world_size = self.trainer.world_size
         global_rank = self.trainer.global_rank
-        logical_world_size = min(physical_world_size, 8)
-        logical_rank = global_rank % 8
+        logical_world_size = min(physical_world_size, self.hparams.world_size)
+        logical_rank = global_rank % self.hparams.world_size
 
         # ---- 1. Choose distinct prompt indices (with wrap-around) ----
         indices = []
