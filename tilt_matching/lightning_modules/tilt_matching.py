@@ -276,10 +276,9 @@ class TiltMatchingModule(pl.LightningModule):
         self._step_tm_scheduler()
 
         # Gradient clipping (on accumulated grads)
-        # TODO: check if this is averaged across grad accum steps
         params = [p for p in self.model.parameters() if p.requires_grad]
-        grad_norm_before = clip_grad_norm_(params, float("inf")).item()
-        grad_norm_after = clip_grad_norm_(params, self.hparams.max_grad_norm).item()
+        grad_norm_before = clip_grad_norm_(params, self.hparams.max_grad_norm).item()
+        grad_norm_after = clip_grad_norm_(params, float("inf")).item()
         grad_clipped = float(grad_norm_before > self.hparams.max_grad_norm + 1e-6)
 
         opt.step()
