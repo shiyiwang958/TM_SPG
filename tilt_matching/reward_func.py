@@ -222,14 +222,15 @@ def sudoku_reward_func(prompts, completions, run_name=None, step=None, rank=None
         solution = extract_answer_sudoku(response)
 
         score = 0.0 if solution is None else validate_sudoku_solution(solution, ground_truth, puzzle)
-        scores.append(score)
+        scaled_score = (score - 0.5) * 20  # shift and scale to keep max at 1 while lowering min
+        scores.append(scaled_score)
 
         if do_print:
             print(f"--------------------------------")
             print(f"Puzzle: {puzzle} (length: {len(puzzle)})")
             print(f"Extracted solution: {solution}  (length: {len(solution) if solution else 0})")
             print(f"Ground_truth: {ground_truth}")
-            print(f"Score: {score:.4f}")
+            print(f"Score: {scaled_score:.4f}")
 
     return scores
 

@@ -9,7 +9,6 @@ import itertools
 import wandb
 import re
 import bitsandbytes as bnb
-
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
@@ -452,11 +451,18 @@ class TiltMatchingModule(pl.LightningModule):
             f"train/a": self.a,
             f"train/h": self.h,
             f"train/drift_gap_kl": self._kl_from_logits(old_logits, curr_logits, mask_indices),
+<<<<<<< HEAD
             f"train/rwd_max": rwd.max(),
             f"train/rwd_min": rwd.min(),
             f"train/rwd_mean": rwd.mean(),
             f"train/rwd_std": rwd.std(),
             f"train/correct_frac": correct_frac,
+=======
+            f"train/rwd_max": rwd.max() / 20.0 + 0.5,
+            f"train/rwd_min": rwd.min() / 20.0 + 0.5,
+            f"train/rwd_mean": rwd.mean() / 20.0 + 0.5,
+            f"train/rwd_std": rwd.std() / 20.0 + 0.5,
+>>>>>>> d4beeeb (few edits)
         }
         
         return loss, log_dict
@@ -493,6 +499,10 @@ class TiltMatchingModule(pl.LightningModule):
     def on_save_checkpoint(self, checkpoint: dict):
         print(f"saving checkpoint at a = {self.a:.4f}")
         checkpoint["tilt"] = {"a": self.a, "h": self.h}
+<<<<<<< HEAD
+=======
+        # checkpoint["hparams"] = copy.deepcopy(self.hparams)
+>>>>>>> d4beeeb (few edits)
         checkpoint["prompt_counter"] = self.curr_prompt_counter
         checkpoint["grad_accum_counter"] = getattr(self, "_grad_accum_counter", 0)
         
@@ -518,15 +528,23 @@ class TiltMatchingModule(pl.LightningModule):
             Shape: [num_dinstinct_prompts * num_completions_per_prompts, prompt_length]
         """
         # Get DDP info (defaults to 1 if not distributed)
-        world_size = self.trainer.world_size
+        # We only want 8 unique prompt groups. Ranks separated by 8 (0/8, 1/9, ...)
+        # will share the same prompts when running with 16 GPUs.
+        physical_world_size = self.trainer.world_size
         global_rank = self.trainer.global_rank
+        logical_world_size = min(physical_world_size, 8)
+        logical_rank = global_rank % 8
 
         # ---- 1. Choose distinct prompt indices (with wrap-around) ----
         indices = []
         for offset in range(num_dinstinct_prompts):
-            idx = (self.curr_prompt_counter + (offset * world_size) + global_rank) % self.training_prompts_dataset_len
+            idx = (
+                self.curr_prompt_counter
+                + (offset * logical_world_size)
+                + logical_rank
+            ) % self.training_prompts_dataset_len
             indices.append(idx)
-        self.curr_prompt_counter += (num_dinstinct_prompts * world_size)
+        self.curr_prompt_counter += (num_dinstinct_prompts * logical_world_size)
         self.curr_prompt_counter %= self.training_prompts_dataset_len
         # Remember which dataset rows were used, for reward computation later
         self._last_prompt_indices = indices

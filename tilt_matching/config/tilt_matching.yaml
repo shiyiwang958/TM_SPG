@@ -7,14 +7,14 @@ tm:
   buffer_print_max_chars: 600
   control_variate: 1.0
   grad_accum_steps: 16
-  h: 5.0
+  h: 1.0
   loss_type: itm
   num_batch_prompts: 2
   num_buffer_prompts: 64
   num_buffer_refresh: 16
   num_completions_per_prompt: 2
   rescale_logits: false
-  rwd_shift: -0.47
+  rwd_shift: 0.0
   steps_per_h: 256 # this is the number of optimizer steps per h
 
 #-----------------Optimizer Config-----------------
@@ -55,7 +55,7 @@ peft_task_type: CAUSAL_LM
 checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/1229
 checkpoint_freq: 5.0  # in units of h
 metrics_log_every: 4
-resume_path: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/1229/checkpoint-a-5.000.ckpt
+resume_path: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/1/checkpoint-a-3.000.ckpt
 # leave empty if not resuming
 wandb:
   entity: "yuyuanchen-harvard-university"
