@@ -17,7 +17,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModel
-from peft import PeftModel
+from peft import PeftModel, LoraConfig, get_peft_model, set_peft_model_state_dict
 
 from generate import generate
 from gsm8k import GSM8KDataset
@@ -244,6 +244,7 @@ if __name__ == "__main__":
     if os.path.exists(filename):
         print(f"File {filename} already exists, exiting")
         cleanup_ddp()
+        
         import sys
         sys.exit(0)
     elif os.path.exists(filename_0):
@@ -260,10 +261,27 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
 
     if args.checkpoint_path:
-        # Attach PEFT weights if provided and sync across ranks
-        model = PeftModel.from_pretrained(model, args.checkpoint_path, torch_dtype=torch.bfloat16).to(
-            local_rank
+        # Attach PEFT weights if provided and sync across ranks.
+        ckpt = torch.load(args.checkpoint_path, map_location="cpu", weights_only=False)
+        hparams = ckpt.get("hyper_parameters", {})
+        lora_cfg = LoraConfig(
+            r=hparams.get("lora_r", 128),
+            lora_alpha=hparams.get("lora_alpha", 64),
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "gate_proj"],
+            task_type=hparams.get("peft_task_type", "CAUSAL_LM"),
+            lora_dropout=hparams.get("lora_dropout", 0.05),
         )
+
+        # Only wrap the teacher adapter for inference.
+        peft_model = get_peft_model(model, lora_cfg, adapter_name="teacher")
+
+        sd = ckpt.get("state_dict", ckpt)
+        teacher_state = {k[len("base_adapter."):]: v.to(peft_model.device) for k, v in sd.items() if k.startswith("base_adapter.")}
+
+        set_peft_model_state_dict(peft_model, teacher_state, adapter_name="teacher")
+        peft_model.set_adapter("teacher")
+        model = peft_model.to(local_rank)
+    
 
         if dist.get_world_size() > 1:
             dist.barrier()  # Make sure all processes are ready
