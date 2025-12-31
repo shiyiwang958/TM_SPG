@@ -493,7 +493,7 @@ class TiltMatchingModule(pl.LightningModule):
         print(f"saving checkpoint at a = {self.a:.4f}")
         checkpoint["tilt"] = {"a": self.a, "h": self.h}
         checkpoint["prompt_counter"] = self.curr_prompt_counter
-        checkpoint["grad_accum_counter"] = getattr(self, "_grad_accum_counter", 0)
+        # checkpoint["grad_accum_counter"] = getattr(self, "_grad_accum_counter", 0)
         
     def on_load_checkpoint(self, checkpoint: dict):
         tilt = checkpoint.get("tilt", None)
@@ -517,23 +517,15 @@ class TiltMatchingModule(pl.LightningModule):
             Shape: [num_dinstinct_prompts * num_completions_per_prompts, prompt_length]
         """
         # Get DDP info (defaults to 1 if not distributed)
-        # We only want 8 unique prompt groups. Ranks separated by 8 (0/8, 1/9, ...)
-        # will share the same prompts when running with 16 GPUs.
-        physical_world_size = self.trainer.world_size
+        world_size = self.trainer.world_size
         global_rank = self.trainer.global_rank
-        logical_world_size = min(physical_world_size, self.hparams.world_size)
-        logical_rank = global_rank % self.hparams.world_size
 
         # ---- 1. Choose distinct prompt indices (with wrap-around) ----
         indices = []
         for offset in range(num_dinstinct_prompts):
-            idx = (
-                self.curr_prompt_counter
-                + (offset * logical_world_size)
-                + logical_rank
-            ) % self.training_prompts_dataset_len
+            idx = (self.curr_prompt_counter + (offset * world_size) + global_rank) % self.training_prompts_dataset_len
             indices.append(idx)
-        self.curr_prompt_counter += (num_dinstinct_prompts * logical_world_size)
+        self.curr_prompt_counter += (num_dinstinct_prompts * world_size)
         self.curr_prompt_counter %= self.training_prompts_dataset_len
         # Remember which dataset rows were used, for reward computation later
         self._last_prompt_indices = indices

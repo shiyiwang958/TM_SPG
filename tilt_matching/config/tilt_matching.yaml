@@ -1,24 +1,20 @@
 #-----------------Tilt Matching Training Config-----------------
 tm:
   a_end: 100.0
-  buffer_chunk_size: 32
+  buffer_chunk_size: 64
   buffer_refresh_steps: 32
   buffer_print_samples: 4   # 0 disables printing
   buffer_print_max_chars: 600
   control_variate: 10.0
   grad_accum_steps: 16
-  h: 1.0
+  h: 5.0
   loss_type: itm
   num_batch_prompts: 2
   num_buffer_prompts: 64
   num_buffer_refresh: 16
   num_completions_per_prompt: 2
   rescale_logits: false
-<<<<<<< HEAD
   rwd_shift: 0.0
-=======
-  rwd_shift: -0.3
->>>>>>> fbcf110 (commit before merge)
   steps_per_h: 256 # this is the number of optimizer steps per h
 
 #-----------------Optimizer Config-----------------
@@ -79,4 +75,3 @@ nodes: 2
 devices: 4  # 8? 4?
 debug_loss_spike_threshold: 60
 debug_loss_spike_topk: 3
-world_size: 16  # set to 8 if need two gpus to read the same prompts.
