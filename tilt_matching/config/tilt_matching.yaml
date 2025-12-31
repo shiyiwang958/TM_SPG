@@ -1,11 +1,11 @@
 #-----------------Tilt Matching Training Config-----------------
 tm:
   a_end: 100.0
-  buffer_chunk_size: 64
+  buffer_chunk_size: 32
   buffer_refresh_steps: 32
   buffer_print_samples: 4   # 0 disables printing
   buffer_print_max_chars: 600
-  control_variate: 1.0
+  control_variate: 10.0
   grad_accum_steps: 16
   h: 1.0
   loss_type: itm
@@ -14,7 +14,11 @@ tm:
   num_buffer_refresh: 16
   num_completions_per_prompt: 2
   rescale_logits: false
+<<<<<<< HEAD
   rwd_shift: 0.0
+=======
+  rwd_shift: -0.3
+>>>>>>> fbcf110 (commit before merge)
   steps_per_h: 256 # this is the number of optimizer steps per h
 
 #-----------------Optimizer Config-----------------
@@ -52,15 +56,19 @@ lora_dropout: 0.05
 peft_task_type: CAUSAL_LM
 
 #-----------------Logging and Checkpointing Config-----------------
-checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/1229
+checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/1230
 checkpoint_freq: 5.0  # in units of h
 metrics_log_every: 4
+<<<<<<< HEAD
 resume_path: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/1/checkpoint-a-3.000.ckpt
+=======
+resume_path: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/1229/checkpoint-a-10.000.ckpt
+>>>>>>> fbcf110 (commit before merge)
 # leave empty if not resuming
 wandb:
   entity: "yuyuanchen-harvard-university"
   project: "LLaDA_TM"
-  name: "temp0.3_h=5_no_rescale_cv=2"
+  name: "temp0.3_h=5_phase3"
 
 #-----------------Other Training Config-----------------
 dataset: sudoku_new

@@ -143,6 +143,7 @@ class TiltMatchingModule(pl.LightningModule):
 
     def on_train_start(self):
         super().on_train_start()
+        self._grad_accum_counter = 0
         # Set up optimizer and LR
         self.tm_opt = self.optimizers()
         for g in self.tm_opt.param_groups:
@@ -499,7 +500,7 @@ class TiltMatchingModule(pl.LightningModule):
         self.a = tilt.get("a", 0.0)
         # self.h = tilt.get("h", 2.5e-3)
         self.curr_prompt_counter = checkpoint.get("prompt_counter", 0)
-        self._grad_accum_counter = checkpoint.get("grad_accum_counter", 0)
+        # self._grad_accum_counter = checkpoint.get("grad_accum_counter", 0)
 
         # hparams = checkpoint.get("hparams", None)
         # self.__dict__["hparams"] = hparams
@@ -776,6 +777,7 @@ class TiltMatchingModule(pl.LightningModule):
 
         # Store as shape [num_buffer_updates, num_completions_per_prompt, num_funcs]
         new_rewards_block = rewards_per_func.view(num_buffer_updates, -1, num_funcs)
+        print(f"[EVAL] average reward = {new_rewards_block.mean()}")
         if self.buffer_rewards is None:
             self.buffer_rewards = new_rewards_block
         else:
