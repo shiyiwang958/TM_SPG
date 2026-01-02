@@ -464,4 +464,4 @@ def aggregate_results(directory="."):
 
 
 if __name__ == "__main__":
-    aggregate_results(directory="eval_results/eval_results_gsm8k_llada")
+    aggregate_results(directory="tilt_results/sudoku_tilt")

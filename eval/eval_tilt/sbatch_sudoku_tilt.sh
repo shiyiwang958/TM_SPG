@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=eval_sudoku
-#SBATCH --partition=kempner_h100
+#SBATCH --partition=kempner
 #SBATCH --account=kempner_albergo_lab
 #SBATCH --output=../logs_eval/eval_sudoku_%j.out
 #SBATCH --nodes=1
@@ -8,7 +8,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:4
 #SBATCH --mem=64G
-#SBATCH --time=6:00:00
+#SBATCH --time=4:00:00
 #SBATCH --mail-type=END,FAIL,BEGIN
 #SBATCH --mail-user=fwang@math.harvard.edu
 
@@ -33,8 +33,7 @@ echo "Using random main_process_port: $MASTER_PORT"
 
 # Arrays of tasks and generation lengths
 TASKS=("sudoku")
-GEN_LENGTHS=(128 256 512)
-SAVE_DIR=/fsx-checkpoints
+GEN_LENGTHS=(256)
 
 # no checkpoints to loop over
 
@@ -57,7 +56,7 @@ for task in "${TASKS[@]}"; do
     if [ "$gen_length" -eq 512 ]; then
       batch_size=4
     else
-      batch_size=8
+      batch_size=4
     fi
       
     echo "Running evaluation on $task with gen_length=$gen_length, batch_size=$batch_size"
@@ -70,9 +69,9 @@ for task in "${TASKS[@]}"; do
       --batch_size $batch_size \
       --gen_length $gen_length \
       --few_shot 3 \
-      --output_dir "tilt_results/soduku_tilt" \
+      --output_dir "tilt_results/sudoku_tilt" \
       --model_path "/n/netscratch/albergo_lab/Everyone/frank/hf_models/LLaDA-8B-Instruct" \
-      --checkpoint_path "${SAVE_DIR}/spg/sudoku_new_3shot_base_spg_mix_beta1.0/checkpoint"
+      --checkpoint_path "/n/netscratch/albergo_lab/Everyone/frank/llada_tm/test_ckpt/checkpoint-a-8.000.ckpt"
       # TODO: change to your checkpoint path
   done
 done
