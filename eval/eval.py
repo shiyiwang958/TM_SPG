@@ -213,6 +213,7 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--remasking", type=str, default="low_confidence")
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--num_prompts_gsm", type=int, default=-1)
     args = parser.parse_args()
 
     if args.seed is not None:
@@ -221,7 +222,7 @@ if __name__ == "__main__":
 
     args.diffusion_steps = args.gen_length // 2
     # How many eval examples to consume per dataset (-1 means full split)
-    num_evals = {"gsm8k": -1, "math": -1, "countdown": 256, "sudoku": 256}
+    num_evals = {"gsm8k": args.num_prompts_gsm, "math": -1, "countdown": 256, "sudoku": 256}
 
     if len(args.checkpoint_path):
         # Encode checkpoint identity in output filenames

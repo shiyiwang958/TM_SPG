@@ -12,6 +12,7 @@ import bitsandbytes as bnb
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
+import torch.distributed as dist
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from peft import LoraConfig, get_peft_model, PeftModelForCausalLM, get_peft_model_state_dict, set_peft_model_state_dict
@@ -58,6 +59,10 @@ class TiltMatchingModule(pl.LightningModule):
         self.mask_id = 126336
         self.checkpoint_freq = self.hparams.checkpoint_freq
         self.cv = self.hparams.tm.control_variate
+        # Control-variate (c) online estimation buffers (accumulated over grad_accum micro-steps)
+        self._cv_num_accum = None  # sum of w*<pi_theta-delta, delta-pi_a> over masked positions
+        self._cv_den_accum = None  # sum of ||delta-pi_a||^2 over masked positions
+        self._cv_ema_beta = float(getattr(self.hparams.tm, "control_variate_ema", 0.05))
         self.buffer = None
         self.buffer_rewards = None
         self._rebuild_buffer_next_phase = False
@@ -163,13 +168,6 @@ class TiltMatchingModule(pl.LightningModule):
             eps=self.hparams.adam_epsilon,
             weight_decay=self.hparams.weight_decay,
         )
-        # opt = bnb.optim.PagedAdamW32bit(
-        #     params,
-        #     lr=self.hparams.learning_rate,
-        #     betas=(self.hparams.adam_beta1, self.hparams.adam_beta2),
-        #     eps=self.hparams.adam_epsilon,
-        #     weight_decay=self.hparams.weight_decay,
-        # )
         return opt
     
     def on_train_batch_start(self, batch, batch_idx):
@@ -253,6 +251,10 @@ class TiltMatchingModule(pl.LightningModule):
             total_prompts_needed = self.hparams.tm.num_batch_prompts * accum
             self._accum_prompts_idx = torch.randperm(self.buffer.shape[0], device=self.device)[:total_prompts_needed]
             self._reset_micro_log_accum()
+            # Reset control-variate accumulation for this global step
+            self._cv_num_accum = torch.zeros((), device=self.device)
+            self._cv_den_accum = torch.zeros((), device=self.device)
+            print(f"[DEBUG] initialized cv accum at global step {self.global_step}")
 
         loss, micro_log_dict = self._tm_step()
         self._accumulate_micro_log_dict(micro_log_dict)
@@ -282,6 +284,21 @@ class TiltMatchingModule(pl.LightningModule):
         grad_norm_after = clip_grad_norm_(params, float("inf")).item()
         grad_clipped = float(grad_norm_before > self.hparams.max_grad_norm + 1e-6)
 
+        # ---- Update control variate once per global step (after grad accumulation, synced across GPUs) ----
+        # Aggregate across all GPUs
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(self._cv_num_accum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(self._cv_den_accum, op=dist.ReduceOp.SUM)
+        else:
+            print("[WARNING] dist not available or not initialized for cv aggregation")
+
+        # Compute c_batch and EMA update (identical on all ranks)
+        c_batch = (-self._cv_num_accum / self._cv_den_accum.clamp_min(1e-12))
+
+        cv_old = torch.tensor(float(self.cv), device=self.device)
+        cv_new = (1.0 - self._cv_ema_beta) * cv_old + self._cv_ema_beta * c_batch
+        self.cv = float(cv_new.item())
+
         opt.step()
         opt.zero_grad(set_to_none=True)
 
@@ -297,6 +314,7 @@ class TiltMatchingModule(pl.LightningModule):
         self.dict_for_logs["grads/grad_norm_before"] = grad_norm_before
         self.dict_for_logs["grads/grad_norm_after"] = grad_norm_after
         self.dict_for_logs["grads/grad_clipped"] = grad_clipped
+        self.dict_for_logs["train/cv"] = self.cv
 
         # At each h phase boundary, update a and the teacher adapter; save ckpt if necessary
         if self.global_step % self.steps_per_h == 0:
@@ -364,92 +382,37 @@ class TiltMatchingModule(pl.LightningModule):
             old_logits  /= temp
             curr_logits /= temp
         old_probs = F.softmax(old_logits, dim=-1) # [B, gen_length, V]
+        with torch.no_grad():
+            curr_probs_ng = F.softmax(curr_logits, dim=-1)  # [B, gen_length, V]
         
         loss_type = self.hparams.tm.loss_type
         # shift reward for minimizing gradient variance for loss computation
         hr = self.h * (rwd + self.hparams.tm.rwd_shift) # [B,]
+
+        # learnable control variate accumulation
+        with torch.no_grad():
+            w = torch.exp(hr).view(-1, 1)  # [B,1]
+
+            # A = delta - pi_a, B = pi_theta - delta
+            A = x1_equals_v - old_probs       # [B,L,V]
+            Bv = curr_probs_ng - x1_equals_v  # [B,L,V]
+
+            dot = (Bv * A).sum(dim=-1)  # [B,L]
+            den = (A * A).sum(dim=-1)   # [B,L]
+
+            self._cv_num_accum += (w * dot)[mask_indices.bool()].sum()
+            self._cv_den_accum += den[mask_indices.bool()].sum()
+                
         if loss_type == "itm":
             target = self.cv * old_probs + x1_equals_v * (1 - self.cv + torch.expm1(hr)).view(-1, 1, 1) # [B, gen_length, V]
         elif loss_type == "etm":
             target = (1 - hr) * old_probs + x1_equals_v * hr.view(-1, 1, 1) # [B, gen_length, V]
         elif loss_type == "sg-itm":
-            curr_probs = F.softmax(curr_logits, dim=-1) # [B, gen_length, V]
-            target = self.cv * old_probs + x1_equals_v * (1 - self.cv + torch.expm1(hr)).view(-1, 1, 1) - torch.expm1(hr) * curr_probs.detach()
+            target = self.cv * old_probs + x1_equals_v * (1 - self.cv + torch.expm1(hr)).view(-1, 1, 1) - torch.expm1(hr) * curr_probs_ng.detach()
         else:
             raise ValueError(f"Invalid loss_type: {loss_type}")
         per_sample_losses = -(target * F.log_softmax(curr_logits, dim=-1)).sum(dim=-1) # [B, gen_length]
         loss = per_sample_losses[mask_indices.bool()].mean()
-
-        # ---- DEBUG: investigate loss spikes ----
-        # debug_thresh = getattr(self.hparams, "debug_loss_spike_threshold", None)
-        # debug_topk = int(getattr(self.hparams, "debug_loss_spike_topk", 3))       # how many samples to print
-
-        # if debug_thresh is not None:
-        #     loss_val = float(loss.detach().cpu())
-        #     if (not torch.isfinite(loss)) or (loss_val > float(debug_thresh)):
-        #         if getattr(self.trainer, "global_rank", 0) == 0:
-        #             gen_len = gen_length
-
-        #             # 1) Check finiteness / ranges
-        #             finite_curr = torch.isfinite(curr_logits).all().item()
-        #             finite_old  = torch.isfinite(old_logits).all().item()
-        #             print("\n" + "=" * 80)
-        #             print(f"[LOSS SPIKE] global_step={self.global_step}  micro={self._grad_accum_counter}  loss={loss_val:.4f}")
-        #             print(f"  finite: curr_logits={finite_curr} old_logits={finite_old} mask_any={mask_indices.any().item()}")
-        #             print(f"  curr_logits: min={curr_logits.min().item():.3e} max={curr_logits.max().item():.3e}")
-        #             print(f"  old_logits : min={old_logits.min().item():.3e} max={old_logits.max().item():.3e}")
-
-        #             # 2) How many masked tokens per sample?
-        #             masked_counts = mask_indices.sum(dim=1)  # [B]
-        #             print(f"  masked_counts: min={masked_counts.min().item()} max={masked_counts.max().item()} mean={masked_counts.float().mean().item():.2f}")
-
-        #             # 3) Per-sample mean loss over masked positions (to find the worst offenders)
-        #             masked_counts_clamped = masked_counts.clamp(min=1)
-        #             per_sample_mean = (per_sample_losses * mask_indices).sum(dim=1) / masked_counts_clamped  # [B]
-        #             k = min(debug_topk, per_sample_mean.numel())
-        #             worst_vals, worst_idx = torch.topk(per_sample_mean, k=k)
-
-        #             # 4) Compare teacher vs student NLL on the *true* token at masked positions
-        #             # true token ids on the completion suffix
-        #             true_ids = x1s[:, -gen_len:]  # [B, gen_len]
-        #             logp_curr = F.log_softmax(curr_logits, dim=-1).gather(-1, true_ids.unsqueeze(-1)).squeeze(-1)  # [B, gen_len]
-        #             logp_old  = F.log_softmax(old_logits,  dim=-1).gather(-1, true_ids.unsqueeze(-1)).squeeze(-1)  # [B, gen_len]
-
-        #             for rank_i, i in enumerate(worst_idx.tolist()):
-        #                 # decode completion for this sample
-        #                 completion_text = self.tokenizer.decode(true_ids[i], skip_special_tokens=True)
-
-        #                 # worst token within masked positions
-        #                 masked_pos = mask_indices[i].nonzero(as_tuple=False).squeeze(-1)
-        #                 if masked_pos.numel() > 0:
-        #                     # token with lowest prob under student among masked positions
-        #                     worst_tok_j = masked_pos[torch.argmax(per_sample_losses[i, masked_pos])]
-        #                     # then compute logps at that same position
-        #                     curr_lp = logp_curr[i, worst_tok_j].item()
-        #                     old_lp  = logp_old[i,  worst_tok_j].item()
-        #                     tok_loss = per_sample_losses[i, worst_tok_j].item()
-        #                     print(f"    tok_loss(NLL)={tok_loss:.4f}")
-        #                     print(f"    logp_student={curr_lp:.4f}  logp_teacher={old_lp:.4f}")
-        #                     tok_id  = int(true_ids[i, worst_tok_j].item())
-        #                     tok_str = self.tokenizer.decode([tok_id])
-
-        #                     print("-" * 80)
-        #                     print(f"  [sample {rank_i}] per_sample_mean={worst_vals[rank_i].item():.4f}  masked={int(masked_counts[i].item())}")
-        #                     print(f"    worst_masked_token_pos={int(worst_tok_j.item())} tok_id={tok_id} tok='{tok_str}'")
-        #                     print(f"    logp_student={curr_lp:.4f}  logp_teacher={old_lp:.4f}")
-        #                 else:
-        #                     print("-" * 80)
-        #                     print(f"  [sample {rank_i}] per_sample_mean={worst_vals[rank_i].item():.4f} (no masked positions??)")
-
-        #                 # print completion text (truncate)
-        #                 max_chars = int(getattr(self.hparams, "debug_completion_max_chars", 400))
-        #                 print("    completion_text:", completion_text[:max_chars].replace("\n", "\\n"))
-
-        #             # 5) Reward / hr stats for this batch (often explains ITM blowups if rewards are large)
-        #             print(f"  rwd: min={rwd.min().item():.4f} max={rwd.max().item():.4f} mean={rwd.mean().item():.4f}")
-        #             print(f"  hr=h*rwd: min={(self.h*rwd).min().item():.4f} max={(self.h*rwd).max().item():.4f}")
-        #             print("=" * 80 + "\n")
-
 
         log_dict = {
             f"train/loss": loss,
@@ -460,7 +423,7 @@ class TiltMatchingModule(pl.LightningModule):
             f"train/rwd_min": rwd.min(),
             f"train/rwd_mean": rwd.mean(),
             f"train/rwd_std": rwd.std(),
-            f"train/correct_frac": correct_frac
+            f"train/correct_frac": correct_frac,
         }
         if self.hparams.dataset == "gsm8k":
             rwd_names_lst = ["xml", "soft_format", "strict_format", "int", "correctness"]
@@ -473,6 +436,7 @@ class TiltMatchingModule(pl.LightningModule):
         return loss, log_dict
     
     def on_train_batch_end(self, outputs, batch, batch_idx):
+        # print(f"[DEBUG] Inside on_train_batch_end, this is rank {getattr(self.trainer, 'global_rank', 0)} at global step {self.global_step}")
         if (self._grad_accum_counter % self.hparams.tm.grad_accum_steps) == 0:
             if self.global_step % self.steps_per_h == 0:
                 self._rebuild_buffer_next_phase = True
@@ -480,7 +444,12 @@ class TiltMatchingModule(pl.LightningModule):
             # Partially refresh buffer
             elif self.global_step % self.hparams.tm.buffer_refresh_steps == 0:
                 print(f"[DEBUG] Refreshing {self.hparams.tm.num_buffer_refresh} prompts at global step {self.global_step}")
+                # Force all ranks to start/finish refresh together (avoid some ranks racing ahead into sync_dist logging)
+                if dist.is_available() and dist.is_initialized():
+                    dist.barrier()
                 self._update_buffer(self.model, self.hparams.tm.num_buffer_refresh, self.comps_per_prompt)
+                if dist.is_available() and dist.is_initialized():
+                    dist.barrier()
 
         if not self.dict_for_logs or (self.global_step - 1) % self.hparams.metrics_log_every != 0:
             return
