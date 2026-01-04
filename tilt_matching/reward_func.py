@@ -5,6 +5,7 @@
 
 import numpy as np
 import re
+import os
 from math500_utils import remove_boxed, last_boxed_only_string, is_equiv, boxed_in_answer
 
 
@@ -20,28 +21,121 @@ def extract_hash_answer(text: str) -> str | None:
     return text.split("####")[1].strip()
 
 
+# def correctness_reward_func(prompts, completions, answer, step=None, run_name=None, **kwargs) -> list[float]:
+#     responses = [completion[0]["content"] for completion in completions]
+#     q = prompts[0][-1]["content"]
+#     extracted_responses = [extract_xml_answer(r) for r in responses]
+
+#     RED = "\033[91m"
+#     GREEN = "\033[92m"
+#     YELLOW = "\033[93m"
+#     BLUE = "\033[94m"
+#     RESET = "\033[0m"
+
+#     print(
+#         "-" * 20,
+#         f"\n{RED}Prompt:{RESET}\n{q}\n",
+#         "-" * 20,
+#         f"\n{GREEN}Ground Truth:{RESET}\n{answer[0]}\n",
+#         "-" * 20,
+#         f"\n{BLUE}Response:{RESET}\n{responses[0]}\n",
+#         "-" * 20,
+#         f"\n{YELLOW}Extracted:{RESET}\n{extracted_responses[0]}\n",
+#     )
+#     return [2.0 if r == a else 0.0 for r, a in zip(extracted_responses, answer)]
+
 def correctness_reward_func(prompts, completions, answer, step=None, run_name=None, **kwargs) -> list[float]:
+    """
+    Same reward as the original implementation:
+      reward = 2.0 iff extract_xml_answer(response) == answer[i], else 0.0
+
+    Printing (GSM8K):
+      - configurable number via kwargs["buffer_print_samples"] (0 disables)
+      - prints roughly half reward==2 if possible
+      - prints question, reasoning (if present), ground-truth answer, extracted answer, score, full completion
+      - rank-0 only if kwargs["rank"] is provided (recommended)
+    """
+    # keep original response extraction behavior (assumes TRL-style list-of-dicts)
     responses = [completion[0]["content"] for completion in completions]
-    q = prompts[0][-1]["content"]
-    extracted_responses = [extract_xml_answer(r) for r in responses]
+    extracted_responses = [extract_xml_answer(r) for r in responses]  # reuses existing helper :contentReference[oaicite:3]{index=3}
 
-    RED = "\033[91m"
-    GREEN = "\033[92m"
-    YELLOW = "\033[93m"
-    BLUE = "\033[94m"
-    RESET = "\033[0m"
+    # EXACT SAME REWARD AS BEFORE (do not normalize anything)
+    scores = [2.0 if r == a else 0.0 for r, a in zip(extracted_responses, answer)]
 
-    print(
-        "-" * 20,
-        f"\n{RED}Prompt:{RESET}\n{q}\n",
-        "-" * 20,
-        f"\n{GREEN}Ground Truth:{RESET}\n{answer[0]}\n",
-        "-" * 20,
-        f"\n{BLUE}Response:{RESET}\n{responses[0]}\n",
-        "-" * 20,
-        f"\n{YELLOW}Extracted:{RESET}\n{extracted_responses[0]}\n",
-    )
-    return [2.0 if r == a else 0.0 for r, a in zip(extracted_responses, answer)]
+    # ---- DEBUG printing: choose ~half from reward==2, remainder from anywhere (no duplicates) ----
+    num_print = int(kwargs.get("buffer_print_samples", 0) or 0)
+    rank = int(kwargs.get("rank", 0) or 0)  # pass this in from the caller to avoid DDP spam
+    if num_print > 0 and rank == 0:
+        r = np.asarray(scores, dtype=np.float32)
+        max_idxs = np.nonzero(np.isclose(r, 2.0, atol=1e-6, rtol=0.0))[0]
+        all_idxs = np.arange(r.shape[0])
+
+        k_total = min(num_print, int(r.shape[0]))
+        k_max = min(k_total // 2, int(max_idxs.shape[0]))
+        k_any = k_total - k_max
+
+        chosen_parts = []
+        if k_max > 0:
+            perm = np.random.permutation(max_idxs.shape[0])[:k_max]
+            chosen_parts.append(max_idxs[perm])
+
+        if k_any > 0:
+            if chosen_parts:
+                already = np.zeros(r.shape[0], dtype=bool)
+                already[chosen_parts[0]] = True
+                pool = all_idxs[~already]
+            else:
+                pool = all_idxs
+
+            if pool.shape[0] > 0:
+                perm = np.random.permutation(pool.shape[0])[: min(k_any, int(pool.shape[0]))]
+                chosen_parts.append(pool[perm])
+
+        chosen = np.concatenate(chosen_parts, axis=0) if chosen_parts else np.array([], dtype=np.int64)
+
+        print(
+            f"[DEBUG] correctness_reward_func (GSM8K): printing {int(chosen.shape[0])} samples "
+            f"(requested={k_total}, reward==2 available={int(max_idxs.shape[0])})",
+            flush=True,
+        )
+
+        questions = kwargs.get("question", None)  # GSM8K data_keys include 'question'
+        for idx in chosen.tolist():
+            # Question: prefer dataset field; fall back to prompt
+            if questions is not None and idx < len(questions):
+                q = questions[idx]
+            else:
+                try:
+                    q = prompts[idx][-1]["content"]
+                except Exception:
+                    q = "<missing>"
+
+            completion_raw = responses[idx]
+            completion_pretty = completion_raw.replace("\\n", "\n")
+
+            # Reasoning (optional)
+            m = re.findall(r"<reasoning>(.*?)</reasoning>", completion_raw, re.DOTALL)
+            reasoning = m[-1].strip() if m else None
+            if reasoning is not None:
+                reasoning = reasoning.replace("\\n", "\n")
+
+            gt = answer[idx] if idx < len(answer) else None
+            extracted = extracted_responses[idx] if idx < len(extracted_responses) else None
+            score = float(scores[idx])
+
+            print("--------------------------------", flush=True)
+            print(f"Question: {q}", flush=True)
+            if reasoning is not None:
+                print("\nReasoning:\n", flush=True)
+                print(reasoning, flush=True)
+            print(f"\nExtracted answer: {extracted}", flush=True)
+            print(f"Ground_truth: {gt}", flush=True)
+            print(f"Score: {score:.4f}", flush=True)
+            print("\nCompletion:\n", flush=True)
+            print(completion_pretty, flush=True)
+
+    return scores
+
 
 
 def int_reward_func(completions, **kwargs) -> list[float]:

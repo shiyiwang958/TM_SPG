@@ -75,6 +75,13 @@ XML_COT_FORMAT = """
 
 def get_gsm8k_questions(split="train") -> Dataset:
     data = load_dataset("openai/gsm8k", "main")[split]
+
+    # Remove a few questions that are too long (we set max_prompt_length to be 200 tokens)
+    data = data.add_column("_idx", list(range(len(data))))
+    data = data.filter(lambda x: x["_idx"] not in [399, 636, 839, 1202, 1647, 1764, 2161, 2345, 3331, 4670, 5918])
+    # also remove 1376, 1527, 1542, 3436, 3625, 4560, 5744 if need max_prompt_length=190
+    data = data.remove_columns(["_idx"])
+
     return data.map(
         lambda x: {
             "prompt": [
