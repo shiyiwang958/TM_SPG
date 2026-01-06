@@ -6,11 +6,11 @@ tm:
   buffer_print_samples: 4   # 0 disables printing
   buffer_print_max_chars: 600
   control_variate: 5.0
-  grad_accum_steps: 16
+  grad_accum_steps: 8
   h: 5.0
   loss_type: itm
   num_batch_prompts: 2
-  num_buffer_prompts: 64
+  num_buffer_prompts: 32
   num_buffer_refresh: 16
   num_completions_per_prompt: 2
   rescale_logits: false
@@ -55,7 +55,7 @@ peft_task_type: CAUSAL_LM
 checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/1230
 checkpoint_freq: 5.0  # in units of h
 metrics_log_every: 4
-resume_path: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/1229/checkpoint-a-10.000.ckpt
+resume_path: # /n/netscratch/albergo_lab/Everyone/frank/llada_tm/1229/checkpoint-a-10.000.ckpt
 # leave empty if not resuming
 wandb:
   entity: "yuyuanchen-harvard-university"

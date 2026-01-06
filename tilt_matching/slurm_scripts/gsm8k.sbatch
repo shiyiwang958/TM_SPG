@@ -5,9 +5,8 @@
 #SBATCH --nodes=2
 #SBATCH --gpus-per-node=4
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=8
 #SBATCH --mem=50GB
-#SBATCH --time=3:58:00
+#SBATCH --time=4:58:00
 #SBATCH --mail-type=END,FAIL,BEGIN
 #SBATCH --mail-user=yuyuanchen@math.harvard.edu
 
@@ -97,7 +96,7 @@ srun --ntasks-per-node=1 --gpus-per-task=4 \
     tilt_train.py \
     --config-path /n/home06/yuyuan0/TM_SPG/tilt_matching/config \
     --config-name tilt_matching.yaml \
-    tm.buffer_chunk_size=24 \
+    tm.buffer_chunk_size=12 \
     tm.num_batch_prompts=2 \
-    tm.grad_accum_steps=16 \
-    tm.num_completions_per_prompt=2
+    tm.grad_accum_steps=8 \
+    tm.num_completions_per_prompt=3

@@ -372,8 +372,10 @@ class TiltMatchingModule(pl.LightningModule):
 
         # Get model predictions and compute loss
         temp = self.hparams.sampling_temperature
+        self.model.eval()
         with torch.no_grad(), self._use_adapter("teacher"):
             old_logits = self._new_forward(self.model, xts, gen_length) # [B, gen_length, V]
+        self.model.train()
         V = old_logits.shape[-1]
         x1_equals_v = F.one_hot(x1s.long()[:, -gen_length:], num_classes = V) # [B, gen_length, V]
         with self._use_adapter("student"):
@@ -512,21 +514,18 @@ class TiltMatchingModule(pl.LightningModule):
         self._last_prompt_indices = indices
 
         # ---- 2. Extract structured prompts from the dataset ----
-        # For get_sudoku_questions_new, each element looks like:
-        #   {"prompt": [{"role": "user", "content": "..."}], "puzzle": ..., "solution": ...}
         structured_prompts = [self.training_prompts_dataset[i]["prompt"] for i in indices]
 
         # ---- 3. Convert structured prompts to plain text and tokenize ----
         prompts_text = []
         for sp in structured_prompts:
-            if isinstance(sp, str):
-                text = sp # already a plain string
-            elif isinstance(sp, list):
+            if isinstance(sp, list):
                 # Typical case for Sudoku / GSM8K / math: [{"role": "...", "content": "..."}]
                 text = self.tokenizer.apply_chat_template(sp, tokenize=False, add_generation_prompt=True)
             else:
                 raise TypeError(f"Unsupported prompt type {type(sp)} in training_prompts_dataset")
             prompts_text.append(text)
+            print(text)
 
         input_ids = self.tokenizer(
             text=prompts_text,
@@ -537,6 +536,20 @@ class TiltMatchingModule(pl.LightningModule):
             padding_side="left",
             add_special_tokens=False,
         )["input_ids"].to(self.device)
+
+        # # Determining the best max_prompt_length:
+        # sentinel = 126081
+        # starts_ok = (input_ids[:, 0] == sentinel)
+        # neq = (input_ids != sentinel)
+        # has_any_neq = neq.any(dim=1)  
+        # first_neq_pos = neq.int().argmax(dim=1)
+        # A = torch.where(has_any_neq, first_neq_pos, torch.full_like(first_neq_pos, input_ids.size(1)))
+        # false_idx = torch.nonzero(~starts_ok, as_tuple=True)[0]  # 1D [N]
+        # print(false_idx.tolist())
+        # for threshold in [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]:
+        #     idx = torch.nonzero(A < threshold, as_tuple=True)[0]  # [N] indices into A
+        #     print(f"Longer than {self.hparams.max_prompt_length - threshold}:")
+        #     print(idx.tolist())
 
         return input_ids.repeat_interleave(num_completions_per_prompts, dim=0)
 
@@ -555,12 +568,13 @@ class TiltMatchingModule(pl.LightningModule):
           buffer shape: [num_buffer_prompts, num_completions_per_prompt, prompt_len + completion_len]
           buffer_rewards shape: [num_buffer_prompts, num_completions_per_prompt, num_reward_funcs]
         """
-        build_or_refresh = "building" if num_buffer_updates == self.num_buffer_prompts else "refreshing"
-        
         device = self.device
-
         prev_adapter = model.active_adapter
+        prev_training = model.training  # True if model was in train() mode
         model.set_adapter("teacher")
+        model.eval()
+
+        build_or_refresh = "building" if num_buffer_updates == self.num_buffer_prompts else "refreshing"
         print(f"{build_or_refresh} sample buffer ...")
         buffer_start_time = datetime.now()
 
@@ -593,6 +607,7 @@ class TiltMatchingModule(pl.LightningModule):
         for start in range(0, total_batch, chunk_size):
             end = min(start + chunk_size, total_batch)
             with torch.no_grad():
+                model.eval()
                 chunk_completion_ids = self._generate(
                     model=model,
                     prompt=prompt_ids[start:end],
@@ -756,7 +771,7 @@ class TiltMatchingModule(pl.LightningModule):
 
         # Store as shape [num_buffer_updates, num_completions_per_prompt, num_funcs]
         new_rewards_block = rewards_per_func.view(num_buffer_updates, -1, num_funcs)
-        print(f"[EVAL] average reward = {new_rewards_block.mean()}")
+        # print(f"[EVAL] average reward = {new_rewards_block.mean()}")
         if self.buffer_rewards is None:
             self.buffer_rewards = new_rewards_block
         else:
@@ -766,7 +781,9 @@ class TiltMatchingModule(pl.LightningModule):
         buffer_build_time = (buffer_end_time - buffer_start_time).total_seconds()
         print(f"Finished {build_or_refresh} reward buffer, took {buffer_build_time}")
 
-        # restore adapter
+        # restore adapter and training state
+        if prev_training:
+            model.train()
         model.set_adapter(prev_adapter)
     
     def _init_tm_scheduler(self):

@@ -30,6 +30,15 @@ def set_random_seed(seed: int = 42):
 
 
 # Constants for prompts
+GSM_SYSTEM_PROMPT = """You are a math expert. You will be given a question to solve. Solve it step by step. Wrap the final answer in a \\boxed{}. 
+Respond in the following format:
+<reasoning>
+Your reasoning here
+</reasoning>
+<answer>
+\\boxed{...}
+</answer>"""
+
 SYSTEM_PROMPT = """
 Respond in the following format:
 <reasoning>
@@ -63,29 +72,19 @@ short_example_1 = "Question:\nSolve the following Sudoku puzzle: 301400202000413
 short_example_2 = "Question:\nSolve the following Sudoku puzzle: 0000100420013142\nAnswer:\n<reasoning>\nInterpret puzzle as 4 rows of 4:\nR1: 0 0 0 0\nR2: 1 0 0 4\nR3: 2 0 0 1\nR4: 3 1 4 2\n\nFill easy singles:\nCol1 missing 4 → R1C1=4.\nCol4 missing 3 → R1C4=3.\nBox A (R1-2,C1-2) missing {2,3} and R1 now needs {1,2} → R1C2=2, R2C2=3.\nR1C3=1.\nR2 now missing 2 → R2C3=2.\nCol2 missing 4 → R3C2=4, then R3C3=3.\n\nFinal grid:\nR1: 4 2 1 3\nR2: 1 3 2 4\nR3: 2 4 3 1\nR4: 3 1 4 2\n</reasoning>\n<answer>\n4213132424313142\n</answer>"
 short_example_3 = "Question:\nSolve the following Sudoku puzzle: 2001403002001420\nAnswer:\n<reasoning>\nInterpret puzzle as 4 rows of 4:\nR1: 2 0 0 1\nR2: 4 0 3 0\nR3: 0 2 0 0\nR4: 1 4 2 0\n\nFill easy singles:\nR1 missing {3,4}; Col2 can't be 1 so R1C2=3 → R1C3=4.\nR4 missing 3 → R4C4=3.\nCol4 missing {2,4}; R2 must take 2 → R2C4=2 → R2C2=1.\nCol1 missing 3 → R3C1=3.\nCol3 missing 1 → R3C3=1 → R3C4=4.\n\nFinal grid:\nR1: 2 3 4 1\nR2: 4 1 3 2\nR3: 3 2 1 4\nR4: 1 4 2 3\n</reasoning>\n<answer>\n2341413232141423\n</answer>"
 
-XML_COT_FORMAT = """
-<reasoning>
-{reasoning}
-</reasoning>
-<answer>
-{answer}
-</answer>
-"""
-
 
 def get_gsm8k_questions(split="train") -> Dataset:
     data = load_dataset("openai/gsm8k", "main")[split]
 
     # Remove a few questions that are too long (we set max_prompt_length to be 200 tokens)
     data = data.add_column("_idx", list(range(len(data))))
-    data = data.filter(lambda x: x["_idx"] not in [399, 636, 839, 1202, 1647, 1764, 2161, 2345, 3331, 4670, 5918])
-    # also remove 1376, 1527, 1542, 3436, 3625, 4560, 5744 if need max_prompt_length=190
+    data = data.filter(lambda x: x["_idx"] not in [399, 636, 839, 1202, 1647, 1764, 2161, 2345, 3331, 4670, 5918, 1376, 1527, 1542, 3436, 3625, 4560, 5744])
     data = data.remove_columns(["_idx"])
 
     return data.map(
         lambda x: {
             "prompt": [
-                {"role": "user", "content": SYSTEM_PROMPT + "\n\n" + x["question"]},
+                {"role": "user", "content": GSM_SYSTEM_PROMPT + "\n\n" + x["question"]},
             ],
             "answer": extract_hash_answer(x["answer"]),
         }

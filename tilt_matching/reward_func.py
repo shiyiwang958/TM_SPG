@@ -14,6 +14,21 @@ def extract_xml_answer(text: str) -> str:
     answer = answer.split("</answer>")[0]
     return answer.strip()
 
+def _debox_if_present(s: str) -> str:
+    """
+    If s contains a \\boxed{...}, extract its contents; otherwise return s.strip().
+    Uses math500_utils helpers already imported at the top of this file.
+    """
+    if s is None:
+        return ""
+    s = s.strip()
+    try:
+        boxed = last_boxed_only_string(s)
+        if boxed:
+            return remove_boxed(boxed).strip()
+    except Exception:
+        pass
+    return s
 
 def extract_hash_answer(text: str) -> str | None:
     if "####" not in text:
@@ -57,7 +72,9 @@ def correctness_reward_func(prompts, completions, answer, step=None, run_name=No
     """
     # keep original response extraction behavior (assumes TRL-style list-of-dicts)
     responses = [completion[0]["content"] for completion in completions]
-    extracted_responses = [extract_xml_answer(r) for r in responses]  # reuses existing helper :contentReference[oaicite:3]{index=3}
+    extracted_responses = [_debox_if_present(extract_xml_answer(r)) for r in responses]
+    answer_norm = [_debox_if_present(a) for a in answer]
+    # extracted_responses = [extract_xml_answer(r) for r in responses]
 
     # EXACT SAME REWARD AS BEFORE (do not normalize anything)
     scores = [2.0 if r == a else 0.0 for r, a in zip(extracted_responses, answer)]
@@ -99,7 +116,7 @@ def correctness_reward_func(prompts, completions, answer, step=None, run_name=No
             flush=True,
         )
 
-        questions = kwargs.get("question", None)  # GSM8K data_keys include 'question'
+        questions = kwargs.get("question", None)
         for idx in chosen.tolist():
             # Question: prefer dataset field; fall back to prompt
             if questions is not None and idx < len(questions):
@@ -140,8 +157,8 @@ def correctness_reward_func(prompts, completions, answer, step=None, run_name=No
 
 def int_reward_func(completions, **kwargs) -> list[float]:
     responses = [completion[0]["content"] for completion in completions]
-    extracted_responses = [extract_xml_answer(r) for r in responses]
-    return [0.5 if r.isdigit() else 0.0 for r in extracted_responses]
+    extracted_responses = [_debox_if_present(extract_xml_answer(r)) for r in responses]
+    return [0.5 if re.fullmatch(r"-?\d+", r) else 0.0 for r in extracted_responses]
 
 
 def strict_format_reward_func(completions, **kwargs) -> list[float]:
