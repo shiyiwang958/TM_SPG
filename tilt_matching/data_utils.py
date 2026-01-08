@@ -164,9 +164,10 @@ def get_math_questions(split="train") -> Dataset:
                 {
                     "role": "user",
                     "content": f"{SYSTEM_PROMPT}\n\nYou are a math expert. You will be given a question to solve. Solve it step by step. Wrap the final answer in a \\boxed{{}}. \n\n{x['problem']}",
+                    # "content": GSM_SYSTEM_PROMPT + "\n\n" + x["question"]
                 },
             ],
             "answer": x["solution"],
         }
-    )  # type: ignore
-    return data  # type: ignore
+    )
+    return data

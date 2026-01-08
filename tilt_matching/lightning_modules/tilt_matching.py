@@ -63,6 +63,7 @@ class TiltMatchingModule(pl.LightningModule):
         self._cv_num_accum = None  # sum of w*<pi_theta-delta, delta-pi_a> over masked positions
         self._cv_den_accum = None  # sum of ||delta-pi_a||^2 over masked positions
         self._cv_ema_beta = float(getattr(self.hparams.tm, "control_variate_ema", 0.05))
+        self.rwd_shift = float(getattr(self.hparams.tm, "rwd_shift", 0.0))
         self.buffer = None
         self.buffer_rewards = None
         self._rebuild_buffer_next_phase = False
@@ -389,7 +390,7 @@ class TiltMatchingModule(pl.LightningModule):
         
         loss_type = self.hparams.tm.loss_type
         # shift reward for minimizing gradient variance for loss computation
-        hr = self.h * (rwd + self.hparams.tm.rwd_shift) # [B,]
+        hr = self.h * (rwd + self.rwd_shift) # [B,]
 
         # learnable control variate accumulation
         with torch.no_grad():
@@ -525,7 +526,7 @@ class TiltMatchingModule(pl.LightningModule):
             else:
                 raise TypeError(f"Unsupported prompt type {type(sp)} in training_prompts_dataset")
             prompts_text.append(text)
-            print(text)
+            # print(text)
 
         input_ids = self.tokenizer(
             text=prompts_text,
@@ -771,9 +772,11 @@ class TiltMatchingModule(pl.LightningModule):
 
         # Store as shape [num_buffer_updates, num_completions_per_prompt, num_funcs]
         new_rewards_block = rewards_per_func.view(num_buffer_updates, -1, num_funcs)
-        # print(f"[EVAL] average reward = {new_rewards_block.mean()}")
+        avg_rwd = float(new_rewards_block.mean() * new_rewards_block.shape[-1])
+        print(f"[EVAL] average reward = {avg_rwd:.3f}")
         if self.buffer_rewards is None:
             self.buffer_rewards = new_rewards_block
+            # self.rwd_shift = - avg_rwd
         else:
             self.buffer_rewards[update_rows, :, :] = new_rewards_block
 
@@ -785,6 +788,9 @@ class TiltMatchingModule(pl.LightningModule):
         if prev_training:
             model.train()
         model.set_adapter(prev_adapter)
+
+        if self.a >= 0.2 and self.global_step % self.hparams.tm.steps_per_h > 2:
+            self.trainer.should_stop = True
     
     def _init_tm_scheduler(self):
         """Initialize a per-h-phase, linear LR scheduler with warmup.

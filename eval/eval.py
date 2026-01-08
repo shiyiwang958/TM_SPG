@@ -71,7 +71,7 @@ def evaluate(
     remasking="low_confidence",
 ):
     # Loop over evaluation dataloader and capture generations/metrics
-    # model.eval()
+    model.eval()
     total_processed = torch.tensor(0, device=model.device)
     wall_times = []
     all_generations = []

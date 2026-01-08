@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=eval_gsm8k
 #SBATCH --account=kempner_albergo_lab
-#SBATCH --partition=kempner_h100
+#SBATCH --partition=kempner
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=4
 #SBATCH --mem=50GB
-#SBATCH --time=0:20:00
+#SBATCH --time=0:27:00
 #SBATCH --mail-type=END,FAIL,BEGIN
 #SBATCH --mail-user=yuyuanchen@math.harvard.edu
 
@@ -26,12 +26,12 @@ srun --ntasks-per-node=1 --gpus-per-task=4 \
     --nproc_per_node=4 \
     eval.py \
     --dataset "gsm8k" \
-    --batch_size 8 \
+    --batch_size 4 \
     --gen_length 256 \
     --output_dir "$OUTPUT_DIR" \
     --model_path "/n/netscratch/albergo_lab/Everyone/frank/hf_models/LLaDA-8B-Instruct" \
-    --temperature 1.0 \
+    --temperature 0.0 \
     --seed 42 \
     --diffusion_steps 128 \
-    --num_prompts_gsm 128 \
-    --checkpoint_path "/n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k/checkpoint-a-1.500.ckpt"
+    --num_prompts_gsm 256 \
+    --checkpoint_path "/n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_new/checkpoint-a-8.000.ckpt"

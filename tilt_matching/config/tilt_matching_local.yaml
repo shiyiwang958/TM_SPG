@@ -8,15 +8,15 @@ tm:
   control_variate: 30
   control_variate_ema: 0.05
   grad_accum_steps: 1
-  h: 2.0
+  h: 5.0
   loss_type: itm
   num_batch_prompts: 1
-  num_buffer_prompts: 1
+  num_buffer_prompts: 8
   num_buffer_refresh: 1
   num_completions_per_prompt: 1
   rescale_logits: false
   rwd_shift: 0.0
-  steps_per_h: 256 # this is the number of optimizer steps per h
+  steps_per_h: 2 # this is the number of optimizer steps per h
 
 #-----------------Optimizer Config-----------------
 adam_beta1: 0.9
@@ -53,10 +53,10 @@ lora_dropout: 0.05
 peft_task_type: CAUSAL_LM
 
 #-----------------Logging and Checkpointing Config-----------------
-checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k
+checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_new
 checkpoint_freq: 5.0  # in units of h
 metrics_log_every: 4
-resume_path: 
+resume_path: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_new/checkpoint-a-3.000.ckpt
 # leave empty if not resuming
 # wandb:
 #   entity: "yuyuanchen-harvard-university"

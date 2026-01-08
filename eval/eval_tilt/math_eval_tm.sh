@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=eval_sudoku
+#SBATCH --job-name=eval_math
 #SBATCH --account=albergo_lab
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
@@ -14,7 +14,7 @@ source /n/sw/Anaconda2-2019.10/etc/profile.d/conda.sh
 conda activate /n/home06/yuyuan0/conda/envs/spg
 
 cd /n/home06/yuyuan0/TM_SPG/eval
-OUTPUT_DIR="/n/home06/yuyuan0/TM_SPG/eval/eval_tilt/output_sudoku_${SLURM_JOB_ID}"
+OUTPUT_DIR="/n/home06/yuyuan0/TM_SPG/eval/eval_tilt/output_math500_${SLURM_JOB_ID}"
 mkdir -p "$OUTPUT_DIR"
 
 export NCCL_SOCKET_FAMILY=AF_INET
@@ -25,12 +25,12 @@ srun --ntasks-per-node=1 --gpus-per-task=4 \
     --standalone \
     --nproc_per_node=4 \
     eval.py \
-    --dataset "sudoku" \
-    --batch_size 4 \
+    --dataset "math" \
+    --batch_size 8 \
     --gen_length 256 \
     --output_dir "$OUTPUT_DIR" \
     --model_path "/n/netscratch/albergo_lab/Everyone/frank/hf_models/LLaDA-8B-Instruct" \
     --temperature 0.0 \
     --seed 42 \
     --diffusion_steps 128 \
-    --few_shot 3
+    --checkpoint_path "/n/netscratch/albergo_lab/Everyone/frank/llada_tm/math/checkpoint-a-1.500.ckpt"
