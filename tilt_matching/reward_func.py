@@ -73,7 +73,6 @@ def correctness_reward_func(prompts, completions, answer, step=None, run_name=No
     # keep original response extraction behavior (assumes TRL-style list-of-dicts)
     responses = [completion[0]["content"] for completion in completions]
     extracted_responses = [_debox_if_present(extract_xml_answer(r)) for r in responses]
-    answer_norm = [_debox_if_present(a) for a in answer]
     # extracted_responses = [extract_xml_answer(r) for r in responses]
 
     # EXACT SAME REWARD AS BEFORE (do not normalize anything)
@@ -158,6 +157,7 @@ def correctness_reward_func(prompts, completions, answer, step=None, run_name=No
 def int_reward_func(completions, **kwargs) -> list[float]:
     responses = [completion[0]["content"] for completion in completions]
     extracted_responses = [_debox_if_present(extract_xml_answer(r)) for r in responses]
+    # extracted_responses = [extract_xml_answer(r) for r in responses]
     return [0.5 if re.fullmatch(r"-?\d+", r) else 0.0 for r in extracted_responses]
 
 

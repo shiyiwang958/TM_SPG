@@ -3,7 +3,7 @@ import logging
 import math
 import os
 from datetime import datetime
-from collections import OrderedDict, namedtuple
+from collections import OrderedDict, namedtuple, Counter
 from contextlib import contextmanager
 import itertools
 import wandb
@@ -71,6 +71,9 @@ class TiltMatchingModule(pl.LightningModule):
         self.comps_per_prompt = self.hparams.tm.num_completions_per_prompt
         self.buffer_update_counter = 0
         self._grad_accum_counter = 0
+        # --- Per h-phase total-reward distribution stats (accumulated across _update_buffer calls) ---
+        self._phase_total_reward_counts = Counter()  # maps total_reward_value -> count
+        self._phase_total_reward_n = 0               # total number of samples counted this phase
         self.dict_for_logs = {}
         # micro-step metric accumulation
         self._micro_log_sums = {}
@@ -255,7 +258,6 @@ class TiltMatchingModule(pl.LightningModule):
             # Reset control-variate accumulation for this global step
             self._cv_num_accum = torch.zeros((), device=self.device)
             self._cv_den_accum = torch.zeros((), device=self.device)
-            print(f"[DEBUG] initialized cv accum at global step {self.global_step}")
 
         loss, micro_log_dict = self._tm_step()
         self._accumulate_micro_log_dict(micro_log_dict)
@@ -287,18 +289,18 @@ class TiltMatchingModule(pl.LightningModule):
 
         # ---- Update control variate once per global step (after grad accumulation, synced across GPUs) ----
         # Aggregate across all GPUs
-        if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(self._cv_num_accum, op=dist.ReduceOp.SUM)
-            dist.all_reduce(self._cv_den_accum, op=dist.ReduceOp.SUM)
-        else:
-            print("[WARNING] dist not available or not initialized for cv aggregation")
+        # if dist.is_available() and dist.is_initialized():
+        #     dist.all_reduce(self._cv_num_accum, op=dist.ReduceOp.SUM)
+        #     dist.all_reduce(self._cv_den_accum, op=dist.ReduceOp.SUM)
+        # else:
+        #     print("[WARNING] dist not available or not initialized for cv aggregation")
 
         # Compute c_batch and EMA update (identical on all ranks)
-        c_batch = (-self._cv_num_accum / self._cv_den_accum.clamp_min(1e-12))
+        # c_batch = (-self._cv_num_accum / self._cv_den_accum.clamp_min(1e-12))
 
-        cv_old = torch.tensor(float(self.cv), device=self.device)
-        cv_new = (1.0 - self._cv_ema_beta) * cv_old + self._cv_ema_beta * c_batch
-        self.cv = float(cv_new.item())
+        # cv_old = torch.tensor(float(self.cv), device=self.device)
+        # cv_new = (1.0 - self._cv_ema_beta) * cv_old + self._cv_ema_beta * c_batch
+        # self.cv = float(cv_new.item())
 
         opt.step()
         opt.zero_grad(set_to_none=True)
@@ -317,8 +319,23 @@ class TiltMatchingModule(pl.LightningModule):
         self.dict_for_logs["grads/grad_clipped"] = grad_clipped
         self.dict_for_logs["train/cv"] = self.cv
 
-        # At each h phase boundary, update a and the teacher adapter; save ckpt if necessary
         if self.global_step % self.steps_per_h == 0:
+            # ---- END-OF-PHASE: print distribution of total rewards observed during this phase ----
+            if self._phase_total_reward_n > 0:
+                items = sorted(self._phase_total_reward_counts.items(), key=lambda kv: kv[0])
+                parts = []
+                for r, c in items:
+                    pct = 100.0 * c / self._phase_total_reward_n
+                    parts.append(f"{r:g}: {pct:.2f}% ({c}/{self._phase_total_reward_n})")
+                print(
+                    f"[REWARD DIST] End of h-phase at a={self.a:.4f}, for gpu {getattr(self.trainer, 'global_rank', 0)}, "
+                    f"samples={self._phase_total_reward_n} -> " + ", ".join(parts),
+                    flush=True,
+                )
+            # Reset stats for the next h-phase
+            self._phase_total_reward_counts.clear()
+            self._phase_total_reward_n = 0
+            # ---- Update tilt parameter a and teacher adapter ----
             self.a += self.h
             if self.a + self.h > self.a_end:
                 self.h = self.a_end - self.a
@@ -403,8 +420,8 @@ class TiltMatchingModule(pl.LightningModule):
             dot = (Bv * A).sum(dim=-1)  # [B,L]
             den = (A * A).sum(dim=-1)   # [B,L]
 
-            self._cv_num_accum += (w * dot)[mask_indices.bool()].sum()
-            self._cv_den_accum += den[mask_indices.bool()].sum()
+            # self._cv_num_accum += (w * dot)[mask_indices.bool()].sum()
+            # self._cv_den_accum += den[mask_indices.bool()].sum()
                 
         if loss_type == "itm":
             target = self.cv * old_probs + x1_equals_v * (1 - self.cv + torch.expm1(hr)).view(-1, 1, 1) # [B, gen_length, V]
@@ -439,7 +456,6 @@ class TiltMatchingModule(pl.LightningModule):
         return loss, log_dict
     
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        # print(f"[DEBUG] Inside on_train_batch_end, this is rank {getattr(self.trainer, 'global_rank', 0)} at global step {self.global_step}")
         if (self._grad_accum_counter % self.hparams.tm.grad_accum_steps) == 0:
             if self.global_step % self.steps_per_h == 0:
                 self._rebuild_buffer_next_phase = True
@@ -772,6 +788,24 @@ class TiltMatchingModule(pl.LightningModule):
 
         # Store as shape [num_buffer_updates, num_completions_per_prompt, num_funcs]
         new_rewards_block = rewards_per_func.view(num_buffer_updates, -1, num_funcs)
+        # --- Accumulate per-phase distribution of TOTAL reward values ---
+        # total reward per sample: [num_buffer_updates, num_completions_per_prompt]
+        total_rewards_block = new_rewards_block.sum(dim=-1)
+
+        # Flatten to [num_buffer_updates * num_completions_per_prompt]
+        totals_flat = total_rewards_block.reshape(-1)
+
+        # Count unique total-reward values for this update call
+        # (move only the small unique+count vectors to CPU)
+        uniq, cnt = torch.unique(totals_flat, sorted=True, return_counts=True)
+        uniq = uniq.detach()
+        cnt = cnt.detach()
+        for u, c in zip(uniq.tolist(), cnt.tolist()):
+            # Use float keys; if your totals are integers, they'll still print nicely.
+            self._phase_total_reward_counts[float(u)] += int(c)
+
+        self._phase_total_reward_n += int(totals_flat.numel())
+
         avg_rwd = float(new_rewards_block.mean() * new_rewards_block.shape[-1])
         print(f"[EVAL] average reward = {avg_rwd:.3f}")
         if self.buffer_rewards is None:
@@ -789,8 +823,8 @@ class TiltMatchingModule(pl.LightningModule):
             model.train()
         model.set_adapter(prev_adapter)
 
-        if self.a >= 0.2 and self.global_step % self.hparams.tm.steps_per_h > 2:
-            self.trainer.should_stop = True
+        # if self.a >= 0.95 and self.global_step % self.hparams.tm.steps_per_h > 2:
+        #     self.trainer.should_stop = True
     
     def _init_tm_scheduler(self):
         """Initialize a per-h-phase, linear LR scheduler with warmup.

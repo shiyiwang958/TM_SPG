@@ -5,7 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=4
 #SBATCH --mem=50GB
-#SBATCH --time=0:27:00
+#SBATCH --time=0:60:00
 #SBATCH --mail-type=END,FAIL,BEGIN
 #SBATCH --mail-user=yuyuanchen@math.harvard.edu
 
@@ -33,5 +33,4 @@ srun --ntasks-per-node=1 --gpus-per-task=4 \
     --temperature 0.0 \
     --seed 42 \
     --diffusion_steps 128 \
-    --num_prompts_gsm 256 \
-    --checkpoint_path "/n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_new/checkpoint-a-8.000.ckpt"
+    --checkpoint_path "/n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_small_h/checkpoint-a-1.500.ckpt"

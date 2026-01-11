@@ -1,22 +1,21 @@
 #-----------------Tilt Matching Training Config-----------------
 tm:
   a_end: 100.0
-  buffer_chunk_size: 96
-  buffer_refresh_steps: 32
-  buffer_print_samples: 32   # 0 disables printing
-  # buffer_print_max_chars: 600
-  control_variate: 30
-  control_variate_ema: 0.05
+  buffer_chunk_size: 4
+  buffer_refresh_steps: 12
+  buffer_print_samples: 4   # 0 disables printing
+  control_variate: 1.0
+  control_variate_ema: 0.02
   grad_accum_steps: 1
-  h: 5.0
+  h: 0.3
   loss_type: itm
   num_batch_prompts: 1
-  num_buffer_prompts: 8
+  num_buffer_prompts: 1
   num_buffer_refresh: 1
-  num_completions_per_prompt: 1
+  num_completions_per_prompt: 4
   rescale_logits: false
   rwd_shift: 0.0
-  steps_per_h: 2 # this is the number of optimizer steps per h
+  steps_per_h: 6 # this is the number of optimizer steps per h
 
 #-----------------Optimizer Config-----------------
 adam_beta1: 0.9
@@ -56,7 +55,7 @@ peft_task_type: CAUSAL_LM
 checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_new
 checkpoint_freq: 5.0  # in units of h
 metrics_log_every: 4
-resume_path: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_new/checkpoint-a-3.000.ckpt
+resume_path: #/n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_new/checkpoint-a-3.000.ckpt
 # leave empty if not resuming
 # wandb:
 #   entity: "yuyuanchen-harvard-university"
