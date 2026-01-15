@@ -19,7 +19,7 @@ from peft import LoraConfig, get_peft_model, PeftModelForCausalLM, get_peft_mode
 
 
 class TiltMatchingModule(pl.LightningModule):
-    def __init__(self, base_model, tokenizer, training_prompts_dataset, reward_funcs, **cfg):
+    def __init__(self, base_model, tokenizer, training_prompts_dataset, test_prompts_dataset, reward_funcs, **cfg):
         super().__init__()
         self.automatic_optimization = False
         self.save_hyperparameters(ignore=["base_model", "tokenizer", "training_prompts_dataset", "reward_funcs"], logger=False)
@@ -47,7 +47,8 @@ class TiltMatchingModule(pl.LightningModule):
 
         self.curr_prompt_counter = 0
         self.training_prompts_dataset = training_prompts_dataset
-        self.training_prompts_dataset_len = len(training_prompts_dataset)
+        self.training_prompts_dataset_len = len(self.training_prompts_dataset)
+        self.test_prompts_dataset = test_prompts_dataset
         print(f"[DEBUG] Training prompts dataset length: {self.training_prompts_dataset_len}")
         self.reward_funcs = reward_funcs
         self.reward_weights = None
@@ -70,6 +71,8 @@ class TiltMatchingModule(pl.LightningModule):
         self.num_buffer_prompts = self.hparams.tm.num_buffer_prompts
         self.comps_per_prompt = self.hparams.tm.num_completions_per_prompt
         self.buffer_update_counter = 0
+        self.ckpt_counter = 0
+        self._recent_buffer_rwd = []
         self._grad_accum_counter = 0
         # --- Per h-phase total-reward distribution stats (accumulated across _update_buffer calls) ---
         self._phase_total_reward_counts = Counter()  # maps total_reward_value -> count
@@ -159,9 +162,6 @@ class TiltMatchingModule(pl.LightningModule):
         for g in self.tm_opt.param_groups:
             g["lr"] = self.lr
         self._init_tm_scheduler()
-
-        self._update_buffer(self.model, self.num_buffer_prompts, self.comps_per_prompt)
-        print(f"[DEBUG] Buffer initialized with shape {self.buffer.shape}")
     
     def configure_optimizers(self):
         params = [p for p in self.model.parameters() if p.requires_grad]
@@ -175,6 +175,9 @@ class TiltMatchingModule(pl.LightningModule):
         return opt
     
     def on_train_batch_start(self, batch, batch_idx):
+        if self.global_step == 0 and self._grad_accum_counter == 0:
+            self._update_buffer(self.model, self.num_buffer_prompts, self.comps_per_prompt)
+            print(f"[DEBUG] Buffer initialized with shape {self.buffer.shape}")
         # If we scheduled a full buffer rebuild at the end of the previous h-phase,
         # do it now (i.e., at the start of the new h-phase), after checkpointing.
         if getattr(self, "_rebuild_buffer_next_phase", False):
@@ -229,6 +232,38 @@ class TiltMatchingModule(pl.LightningModule):
         out.update(self._micro_log_mins)
         out.update(self._micro_log_maxs)
         return out
+    
+    def save_checkpoint_now(self, name: str = None) -> str:
+        """
+        Explicit checkpoint save you can call whenever you want.
+
+        - Writes only on global rank 0
+        - Barriers so other ranks don't race ahead
+        """
+
+        # Make sure all ranks line up here
+        if hasattr(self.trainer, "strategy") and self.trainer.strategy is not None:
+            self.trainer.strategy.barrier()
+
+        if not self.trainer.is_global_zero:
+            # Non-zero ranks never write files
+            return ""
+
+        ckpt_dir = getattr(self.hparams, "checkpoint_dir", None)
+        if ckpt_dir is None:
+            raise RuntimeError("cfg.checkpoint_dir was not found in hparams; can't pick a save directory.")
+
+        if name is None:
+            name = f"manual-a-{self.a:.3f}-gs{int(self.global_step)}-micro{int(getattr(self, '_grad_accum_counter', 0))}"
+
+        path = os.path.join(ckpt_dir, f"{name}.ckpt")
+        self.trainer.save_checkpoint(path)
+
+        if hasattr(self.trainer, "strategy") and self.trainer.strategy is not None:
+            self.trainer.strategy.barrier()
+
+        return path
+
 
     def training_step(self, batch, batch_idx):
         """
@@ -289,18 +324,18 @@ class TiltMatchingModule(pl.LightningModule):
 
         # ---- Update control variate once per global step (after grad accumulation, synced across GPUs) ----
         # Aggregate across all GPUs
-        # if dist.is_available() and dist.is_initialized():
-        #     dist.all_reduce(self._cv_num_accum, op=dist.ReduceOp.SUM)
-        #     dist.all_reduce(self._cv_den_accum, op=dist.ReduceOp.SUM)
-        # else:
-        #     print("[WARNING] dist not available or not initialized for cv aggregation")
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(self._cv_num_accum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(self._cv_den_accum, op=dist.ReduceOp.SUM)
+        else:
+            print("[WARNING] dist not available or not initialized for cv aggregation")
 
         # Compute c_batch and EMA update (identical on all ranks)
-        # c_batch = (-self._cv_num_accum / self._cv_den_accum.clamp_min(1e-12))
+        c_batch = (-self._cv_num_accum / self._cv_den_accum.clamp_min(1e-12))
 
-        # cv_old = torch.tensor(float(self.cv), device=self.device)
-        # cv_new = (1.0 - self._cv_ema_beta) * cv_old + self._cv_ema_beta * c_batch
-        # self.cv = float(cv_new.item())
+        cv_old = torch.tensor(float(self.cv), device=self.device)
+        cv_new = (1.0 - self._cv_ema_beta) * cv_old + self._cv_ema_beta * c_batch
+        self.cv = float(cv_new.item())
 
         opt.step()
         opt.zero_grad(set_to_none=True)
@@ -390,10 +425,10 @@ class TiltMatchingModule(pl.LightningModule):
 
         # Get model predictions and compute loss
         temp = self.hparams.sampling_temperature
-        self.model.eval()
+        # self.model.eval()
         with torch.no_grad(), self._use_adapter("teacher"):
             old_logits = self._new_forward(self.model, xts, gen_length) # [B, gen_length, V]
-        self.model.train()
+        # self.model.train()
         V = old_logits.shape[-1]
         x1_equals_v = F.one_hot(x1s.long()[:, -gen_length:], num_classes = V) # [B, gen_length, V]
         with self._use_adapter("student"):
@@ -420,9 +455,12 @@ class TiltMatchingModule(pl.LightningModule):
             dot = (Bv * A).sum(dim=-1)  # [B,L]
             den = (A * A).sum(dim=-1)   # [B,L]
 
-            # self._cv_num_accum += (w * dot)[mask_indices.bool()].sum()
-            # self._cv_den_accum += den[mask_indices.bool()].sum()
+            self._cv_num_accum += (w * dot)[mask_indices.bool()].sum()
+            self._cv_den_accum += den[mask_indices.bool()].sum()
                 
+        prev_cv = self.cv
+        if not self.hparams.tm.learned_cv:
+            self.cv = self.hparams.tm.control_variate
         if loss_type == "itm":
             target = self.cv * old_probs + x1_equals_v * (1 - self.cv + torch.expm1(hr)).view(-1, 1, 1) # [B, gen_length, V]
         elif loss_type == "etm":
@@ -433,6 +471,12 @@ class TiltMatchingModule(pl.LightningModule):
             raise ValueError(f"Invalid loss_type: {loss_type}")
         per_sample_losses = -(target * F.log_softmax(curr_logits, dim=-1)).sum(dim=-1) # [B, gen_length]
         loss = per_sample_losses[mask_indices.bool()].mean()
+        self.cv = prev_cv  # restore
+
+        true_ids = x1s[:, -gen_length:]  # [B, gen_length]
+        p_true = curr_probs_ng.gather(-1, true_ids.unsqueeze(-1)).squeeze(-1)  # [B, gen_length]
+        # residual to one-hot: 1 - p_true, averaged over masked positions
+        residual_onehot = (1.0 - p_true)[mask_indices.bool()].mean()
 
         log_dict = {
             f"train/loss": loss,
@@ -444,6 +488,7 @@ class TiltMatchingModule(pl.LightningModule):
             f"train/rwd_mean": rwd.mean(),
             f"train/rwd_std": rwd.std(),
             f"train/correct_frac": correct_frac,
+            f"train/residual_onehot": residual_onehot,
         }
         if self.hparams.dataset == "gsm8k":
             rwd_names_lst = ["xml", "soft_format", "strict_format", "int", "correctness"]
@@ -457,16 +502,39 @@ class TiltMatchingModule(pl.LightningModule):
     
     def on_train_batch_end(self, outputs, batch, batch_idx):
         if (self._grad_accum_counter % self.hparams.tm.grad_accum_steps) == 0:
+            if (self.global_step + 1) % self.hparams.checkpoint_freq == 0:
+                self.ckpt_counter += 1
+                self.log("ckpt_counter", self.ckpt_counter, on_step=True, on_epoch=False, sync_dist=True)
+            if (self.global_step + 1) % self.hparams.tm.eval_student_every == 0:
+                rwds_eval = self._eval_student(self.hparams.tm.eval_num_prompts) # [N_eval, num_reward_funcs]
+                if self.hparams.dataset == "gsm8k":
+                    correct_frac_eval = torch.isclose(rwds_eval[:, -1], 2.0 * torch.ones_like(rwds_eval[:, -1]), atol=1e-6, rtol=0.0).float().mean()
+                    avg_rwd_eval = rwds_eval.sum(dim=-1).mean() # [N_eval,]
+                    self.dict_for_logs["eval/correct_frac"] = correct_frac_eval
+                    self.dict_for_logs["eval/avg_rwd"] = avg_rwd_eval
+                    seen_rwds = rwds_eval.sum(dim=-1)[: rwds_eval.shape[0] // 2]
+                    self.dict_for_logs["eval/seen_prompts_rwd_mean"] = seen_rwds.mean()
+                    correct_frac_seen = torch.isclose(rwds_eval[: rwds_eval.shape[0] // 2, -1], 2.0 * torch.ones_like(rwds_eval[: rwds_eval.shape[0] // 2, -1]), atol=1e-6, rtol=0.0).float().mean()
+                    self.dict_for_logs["eval/seen_prompts_correct_frac"] = correct_frac_seen
+                    unseen_rwds = rwds_eval.sum(dim=-1)[rwds_eval.shape[0] // 2 :]
+                    self.dict_for_logs["eval/unseen_prompts_rwd_mean"] = unseen_rwds.mean()
+                    correct_frac_unseen = torch.isclose(rwds_eval[rwds_eval.shape[0] // 2 :, -1], 2.0 * torch.ones_like(rwds_eval[rwds_eval.shape[0] // 2 :, -1]), atol=1e-6, rtol=0.0).float().mean()
+                    self.dict_for_logs["eval/unseen_prompts_correct_frac"] = correct_frac_unseen
+                    print(f"[EVAL] At global step {self.global_step}, for gpu {self.global_rank}, student correctness fraction: {correct_frac_eval:.4f}, avg reward: {avg_rwd_eval:.4f}")
+                else:
+                    raise NotImplementedError("Eval only implemented for gsm8k dataset")
+                # self.save_checkpoint_now()
+
             if self.global_step % self.steps_per_h == 0:
                 self._rebuild_buffer_next_phase = True
-                print(f"[DEBUG] Scheduled buffer rebuild for next h-phase at global step {self.global_step}")
             # Partially refresh buffer
             elif self.global_step % self.hparams.tm.buffer_refresh_steps == 0:
-                print(f"[DEBUG] Refreshing {self.hparams.tm.num_buffer_refresh} prompts at global step {self.global_step}")
+                print(f"[DEBUG] gpu {self.global_rank} refreshing {self.hparams.tm.num_buffer_refresh} prompts at global step {self.global_step}")
                 # Force all ranks to start/finish refresh together (avoid some ranks racing ahead into sync_dist logging)
                 if dist.is_available() and dist.is_initialized():
                     dist.barrier()
                 self._update_buffer(self.model, self.hparams.tm.num_buffer_refresh, self.comps_per_prompt)
+                self.dict_for_logs["eval/teacher_buffer_update_rwd_mean"] = self._recent_buffer_rwd[-1]
                 if dist.is_available() and dist.is_initialized():
                     dist.barrier()
 
@@ -589,7 +657,7 @@ class TiltMatchingModule(pl.LightningModule):
         prev_adapter = model.active_adapter
         prev_training = model.training  # True if model was in train() mode
         model.set_adapter("teacher")
-        model.eval()
+        # model.eval()
 
         build_or_refresh = "building" if num_buffer_updates == self.num_buffer_prompts else "refreshing"
         print(f"{build_or_refresh} sample buffer ...")
@@ -624,7 +692,7 @@ class TiltMatchingModule(pl.LightningModule):
         for start in range(0, total_batch, chunk_size):
             end = min(start + chunk_size, total_batch)
             with torch.no_grad():
-                model.eval()
+                # model.eval()
                 chunk_completion_ids = self._generate(
                     model=model,
                     prompt=prompt_ids[start:end],
@@ -808,6 +876,14 @@ class TiltMatchingModule(pl.LightningModule):
 
         avg_rwd = float(new_rewards_block.mean() * new_rewards_block.shape[-1])
         print(f"[EVAL] average reward = {avg_rwd:.3f}")
+        temp_log_dict = {}
+        for i in range(num_completions_per_prompt + 1):
+            rows_ok = (new_rewards_block[:,:,-1] == 2).sum(dim=1) == i
+            temp_log_dict[f"train/buffer_per_prompt_{i}_correct"] = rows_ok.float().mean()
+            # print out the responses with 0 correct for analysis
+            # if i == 0:
+        self.log_dict(temp_log_dict, on_step=True, on_epoch=False, sync_dist=True)
+        self._recent_buffer_rwd.append(avg_rwd)
         if self.buffer_rewards is None:
             self.buffer_rewards = new_rewards_block
             # self.rwd_shift = - avg_rwd
@@ -819,12 +895,9 @@ class TiltMatchingModule(pl.LightningModule):
         print(f"Finished {build_or_refresh} reward buffer, took {buffer_build_time}")
 
         # restore adapter and training state
-        if prev_training:
-            model.train()
+        # if prev_training:
+        #     model.train()
         model.set_adapter(prev_adapter)
-
-        # if self.a >= 0.95 and self.global_step % self.hparams.tm.steps_per_h > 2:
-        #     self.trainer.should_stop = True
     
     def _init_tm_scheduler(self):
         """Initialize a per-h-phase, linear LR scheduler with warmup.
@@ -1410,3 +1483,168 @@ class TiltMatchingModule(pl.LightningModule):
         # x: [B, L]
         hidden = self._llada_hidden_no_logits(model, x, attention_mask=None)
         return self._llada_logits_on_suffix(model, hidden, gen_length)  # [B, gen_len, V]
+    
+    def _prepare_prompts_for_eval(self, num_total_prompts, num_seen_prompts):
+        # Get DDP info (defaults to 1 if not distributed)
+        world_size = self.trainer.world_size
+        global_rank = self.trainer.global_rank
+
+        # ---- 1. Choose distinct prompt indices (with wrap-around) ----
+        seen_indices = []
+        for offset in range(-num_seen_prompts, 0):
+            idx = (self.curr_prompt_counter + (offset * world_size) + global_rank) % self.training_prompts_dataset_len
+            seen_indices.append(idx)
+        unseen_indices = [offset * world_size + global_rank for offset in range(num_total_prompts-num_seen_prompts)]
+        # Remember which dataset rows were used, for reward computation later
+        self._last_eval_indices = (seen_indices, unseen_indices)
+
+        # ---- 2. Extract structured prompts from the dataset ----
+        structured_prompts = []
+        for i in seen_indices:
+            structured_prompts.append(self.training_prompts_dataset[i]["prompt"])
+        for i in unseen_indices:
+            structured_prompts.append(self.test_prompts_dataset[i]["prompt"])
+
+        # ---- 3. Convert structured prompts to plain text and tokenize ----
+        prompts_text = []
+        for sp in structured_prompts:
+            if isinstance(sp, list):
+                # Typical case for Sudoku / GSM8K / math: [{"role": "...", "content": "..."}]
+                text = self.tokenizer.apply_chat_template(sp, tokenize=False, add_generation_prompt=True)
+            else:
+                raise TypeError(f"Unsupported prompt type {type(sp)} in training_prompts_dataset")
+            prompts_text.append(text)
+            # print(text)
+
+        input_ids = self.tokenizer(
+            text=prompts_text,
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=self.hparams.max_prompt_length,
+            padding_side="left",
+            add_special_tokens=False,
+        )["input_ids"].to(self.device)
+
+        return input_ids
+
+    def _eval_student(self, num_buffer_eval):
+        """
+        Partially update the replay buffer of generated sequences and their rewards.
+        - selects `num_buffer_updates` *distinct buffer rows* (along the first
+          dimension of `self.buffer`) starting at `self.buffer_update_counter`
+          (with wrap-around),
+        - generates new completions for fresh prompts for those rows,
+        - recomputes rewards for those new samples,
+        - writes them into `self.buffer` and `self.buffer_rewards`,
+        - and advances `self.buffer_update_counter`.
+
+        Shapes:
+          buffer shape: [num_buffer_prompts, num_completions_per_prompt, prompt_len + completion_len]
+          buffer_rewards shape: [num_buffer_prompts, num_completions_per_prompt, num_reward_funcs]
+        """
+        device = self.device
+        prev_adapter = self.model.active_adapter
+        prev_training = self.model.training  # True if model was in train() mode
+        self.model.set_adapter("student")
+        # self.model.eval()
+
+        print(f"evaluating student ...")
+        eval_start_time = datetime.now()
+
+        # ---- 1. Prepare prompts as token IDs ----
+        prompt_ids = self._prepare_prompts_for_eval(num_buffer_eval, num_buffer_eval // 2)
+        total_batch, prompt_len = prompt_ids.shape
+
+        # ---- 2. Run diffusion generation to get prompt+completion sequences ----
+        chunk_size = max(1, min(self.hparams.tm.buffer_chunk_size, total_batch))
+        gen_length = self.hparams.max_completion_length
+        seq_len = prompt_len + gen_length
+        # pre-allocate
+        prompt_completion_ids = torch.empty(
+            (total_batch, seq_len),
+            device=prompt_ids.device,
+            dtype=prompt_ids.dtype,
+        )
+        for start in range(0, total_batch, chunk_size):
+            end = min(start + chunk_size, total_batch)
+            with torch.no_grad():
+                chunk_completion_ids = self._generate(
+                    model=self.model,
+                    prompt=prompt_ids[start:end],
+                    steps=self.hparams.diffusion_steps,
+                    gen_length=gen_length,
+                    block_length=self.hparams.block_length,
+                    temperature=self.hparams.sampling_temperature,
+                    cfg_scale=self.hparams.cfg_scale,
+                    remasking=self.hparams.remasking_strategy,
+                )  # [end-start, seq_len]
+
+            prompt_completion_ids[start:end].copy_(chunk_completion_ids)
+
+        # ---- 3. Decode completions to text for reward computation ----
+        completion_ids = prompt_completion_ids[:, prompt_len:]  # [total_batch, gen_length]
+        completions_text = self.tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
+
+        # ---- 4. Build reward inputs: prompts, completions, and extra dataset columns ----
+        data_keys = [key for key in self.training_prompts_dataset[0].keys() if key != "prompt"]
+        # For each generated sample we need:
+        #   - a structured prompt (list of chat messages)
+        #   - a structured completion (list with one assistant message)
+        #   - one entry per dataset column (e.g. "answer", "puzzle", "solution", "target", "numbers")
+        prompts_for_rewards = []
+        completions_for_rewards = []
+        reward_kwargs = {key: [] for key in data_keys}
+
+        for row_idx in self._last_eval_indices[0]:
+            row = self.training_prompts_dataset[row_idx]
+            base_prompt = row["prompt"]  # list[{"role": ..., "content": ...}, ...]
+
+            # Structured prompt for this completion
+            prompts_for_rewards.append(base_prompt)
+
+            # Copy all extra fields for this completion
+            for key in data_keys:
+                reward_kwargs[key].append(row[key])
+        for row_idx in self._last_eval_indices[1]:
+            row = self.test_prompts_dataset[row_idx]
+            base_prompt = row["prompt"]  # list[{"role": ..., "content": ...}, ...]
+
+            # Structured prompt for this completion
+            prompts_for_rewards.append(base_prompt)
+
+            # Copy all extra fields for this completion
+            for key in data_keys:
+                reward_kwargs[key].append(row[key])
+
+        # Turn plain completions into chat-style completions [{"role": "assistant", "content": "..."}]
+        completions_for_rewards = []
+        for text in completions_text:
+            completions_for_rewards.append([{"role": "assistant", "content": text}])
+
+        # ---- 5. Compute rewards for every sequence in the buffer ----
+        num_funcs = len(self.reward_funcs)
+        rewards_per_func = torch.zeros(total_batch, num_funcs, device=device)
+        reward_kwargs["buffer_print_samples"] = int(getattr(self.hparams.tm, "buffer_print_samples", 0))
+        reward_kwargs["rank"] = int(getattr(self.trainer, "global_rank", 0))
+
+        for j, reward_func in enumerate(self.reward_funcs):
+            # We mirror diffu_grpo_trainer:
+            # reward_func(prompts=..., completions=..., step=..., run_name=..., **reward_kwargs)
+            scores = reward_func(
+                prompts=prompts_for_rewards,
+                completions=completions_for_rewards,
+                **reward_kwargs,
+            )
+            rewards_per_func[:, j] = torch.tensor(scores, device=device, dtype=torch.float32)
+
+        eval_end_time = datetime.now()
+        eval_time = (eval_end_time - eval_start_time).total_seconds()
+        print(f"Finished evaluating student, took {eval_time}")
+
+        # restore adapter and training state
+        # if prev_training:
+        #     self.model.train()
+        self.model.set_adapter(prev_adapter)
+
+        return rewards_per_func # [num_buffer_eval, num_reward_funcs]

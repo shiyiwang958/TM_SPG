@@ -166,6 +166,7 @@ def train(cfg: DictConfig):
         wandb_logger = None
 
     # Load dataset based on configuration
+    test_dataset = None
     if cfg.dataset == "gsm8k":
         dataset = get_gsm8k_questions("train")
         reward_functions = [
@@ -175,6 +176,7 @@ def train(cfg: DictConfig):
             int_reward_func,
             correctness_reward_func,
         ]
+        test_dataset = get_gsm8k_questions("test")
     elif cfg.dataset == "countdown":
         dataset = get_countdown_questions("train")
         reward_functions = [countdown_reward_func]
@@ -237,6 +239,7 @@ def train(cfg: DictConfig):
         base_model=base_model,
         tokenizer=tokenizer,
         training_prompts_dataset=train_set,
+        test_prompts_dataset=test_dataset,
         reward_funcs=reward_functions,
         **cfg,
     )
@@ -264,15 +267,15 @@ def train(cfg: DictConfig):
         # Lightning still requires a finite epoch cap; set a very large number
         max_epochs = 10**12,
     )
-    ckpt_steps = int(cfg.tm.steps_per_h * math.floor(cfg.checkpoint_freq / cfg.tm.h))
 
+    ckpt_steps = cfg.checkpoint_freq
     checkpoint_callback = ModelCheckpoint(
         save_last = True,
         dirpath = cfg.checkpoint_dir,
         save_top_k = -1,
         every_n_train_steps = ckpt_steps,
         save_on_train_epoch_end = False,
-        filename = "checkpoint-a-{ckpt_a:.3f}",
+        filename = "checkpoint-a-{ckpt_a:.3f}-{ckpt_counter}",
         auto_insert_metric_name=False,
         save_on_exception=True,
     )

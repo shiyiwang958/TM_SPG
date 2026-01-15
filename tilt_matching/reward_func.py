@@ -70,20 +70,74 @@ def correctness_reward_func(prompts, completions, answer, step=None, run_name=No
       - prints question, reasoning (if present), ground-truth answer, extracted answer, score, full completion
       - rank-0 only if kwargs["rank"] is provided (recommended)
     """
-    # keep original response extraction behavior (assumes TRL-style list-of-dicts)
     responses = [completion[0]["content"] for completion in completions]
-    extracted_responses = [_debox_if_present(extract_xml_answer(r)) for r in responses]
-    # extracted_responses = [extract_xml_answer(r) for r in responses]
+    # extracted_responses = [_debox_if_present(extract_xml_answer(r)) for r in responses]
+    # scores = []
+    # for r, a in zip(extracted_responses, answer):
+    #     if r == a:
+    #         scores.append(2.0)
+    #         continue
+    #     try:
+    #         r_float = float(r)
+    #         a_float = float(a)
+    #         if r_float == a_float:
+    #             scores.append(2.0)
+    #             continue
+    #     except:
+    #         pass
+    #     scores.append(0.0)
 
-    # EXACT SAME REWARD AS BEFORE (do not normalize anything)
-    scores = [2.0 if r == a else 0.0 for r, a in zip(extracted_responses, answer)]
+    extracted_responses = []
+    scores = []
+    
+    for raw_generation, ground_truth in zip(responses, answer):
+        parsed_answer = None
+        boxed_matches = re.findall(r"\\boxed{(.*?)}", raw_generation)
+        if boxed_matches:
+            for boxed_content in boxed_matches:
+                boxed_content = boxed_content.strip()
+                if boxed_content and boxed_content != "..." and not re.match(r"^\.+$", boxed_content):
+                    try:
+                        parsed_answer = float(boxed_content)
+                        break
+                    except ValueError:
+                        numbers = re.findall(r"-?\d+\.?\d*", boxed_content)
+                        if numbers:
+                            try:
+                                parsed_answer = float(numbers[0])
+                                break
+                            except ValueError:
+                                pass
 
-    # ---- DEBUG printing: choose ~half from reward==2, remainder from anywhere (no duplicates) ----
+        if parsed_answer is None:
+            answer_match = re.search(r"<answer>(.*?)</answer>", raw_generation, re.DOTALL)
+            if answer_match:
+                answer_text = answer_match.group(1).strip()
+                if answer_text:
+                    try:
+                        parsed_answer = float(answer_text)
+                    except ValueError:
+                        numbers = re.findall(r"-?\d+\.?\d*", answer_text)
+                        if numbers:
+                            try:
+                                parsed_answer = float(numbers[-1])
+                            except ValueError:
+                                pass
+
+        is_correct = parsed_answer is not None and parsed_answer == float(ground_truth.replace(",", ""))
+        extracted_responses.append(parsed_answer if parsed_answer is not None else "<no valid answer>")
+        if is_correct:
+            scores.append(2.0)
+        else:
+            scores.append(0.0)
+
+
+    # ---- DEBUG printing: choose ~half from reward==0, remainder from anywhere (no duplicates) ----
     num_print = int(kwargs.get("buffer_print_samples", 0) or 0)
     rank = int(kwargs.get("rank", 0) or 0)  # pass this in from the caller to avoid DDP spam
     if num_print > 0 and rank == 0:
         r = np.asarray(scores, dtype=np.float32)
-        max_idxs = np.nonzero(np.isclose(r, 2.0, atol=1e-6, rtol=0.0))[0]
+        max_idxs = np.nonzero(np.isclose(r, 0.0, atol=1e-6, rtol=0.0))[0]
         all_idxs = np.arange(r.shape[0])
 
         k_total = min(num_print, int(r.shape[0]))
