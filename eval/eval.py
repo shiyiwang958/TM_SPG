@@ -205,7 +205,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_path", type=str, default="")
     parser.add_argument("--gen_length", type=int, default=128)
     parser.add_argument("--block_length", type=int, default=32)
-    parser.add_argument("--diffusion_steps", type=int, default=64)
+    parser.add_argument("--diffusion_steps", type=int, default=128)
     parser.add_argument("--add_reasoning", action="store_true")
     parser.add_argument("--dont_save", action="store_true")
     parser.add_argument("--output_dir", type=str, default="results/")

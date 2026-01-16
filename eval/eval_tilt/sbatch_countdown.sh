@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=eval_sudoku
+#SBATCH --job-name=eval_countdown
 #SBATCH --partition=kempner
 #SBATCH --account=kempner_albergo_lab
-#SBATCH --output=../logs_eval/eval_sudoku_%j.out
+#SBATCH --output=../logs_eval/eval_countdown_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:2
 #SBATCH --mem=64G
-#SBATCH --time=4:00:00
+#SBATCH --time=1:00:00
 #SBATCH --mail-type=END,FAIL,BEGIN
 #SBATCH --mail-user=fwang@math.harvard.edu
 
@@ -25,15 +25,15 @@ which torchrun || echo "torchrun not found in PATH"
 
 # Configuration variables
 # GPU_IDS will be automatically set by SLURM, but we'll use all available GPUs
-GPU_IDS=(0 1 2 3)
+GPU_IDS=(0 1)
 
 # Generate a random port number between 10000 and 65535
 MASTER_PORT=$((RANDOM % 55536 + 10000))
 echo "Using random main_process_port: $MASTER_PORT"
 
 # Arrays of tasks and generation lengths
-TASKS=("sudoku")
-GEN_LENGTHS=(256)
+TASKS=("countdown")
+GEN_LENGTHS=(256) # 128 is too short
 
 # no checkpoints to loop over
 
@@ -61,17 +61,17 @@ for task in "${TASKS[@]}"; do
       
     echo "Running evaluation on $task with gen_length=$gen_length, batch_size=$batch_size"
     
-    CUDA_VISIBLE_DEVICES=$GPU_LIST torchrun \
+    torchrun \
       --nproc_per_node $NUM_GPUS \
       --master_port $MASTER_PORT \
       eval.py \
       --dataset $task \
       --batch_size $batch_size \
       --gen_length $gen_length \
-      --few_shot 3 \
-      --output_dir "tilt_results/sudoku_tilt" \
+      --few_shot 0 \
+      --output_dir "tilt_results/countdown_0.2" \
       --model_path "/n/netscratch/albergo_lab/Everyone/frank/hf_models/LLaDA-8B-Instruct" \
-      --checkpoint_path "/n/netscratch/albergo_lab/Everyone/frank/llada_tm/test_ckpt/checkpoint-a-8.000.ckpt"
+      --checkpoint_path "/n/netscratch/albergo_lab/Everyone/frank/llada_tm/countdown_0.2/checkpoint-a-2.400.ckpt"
       # TODO: change to your checkpoint path
   done
 done

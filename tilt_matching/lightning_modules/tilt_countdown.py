@@ -17,7 +17,7 @@ from torch.optim import AdamW
 from peft import LoraConfig, get_peft_model, PeftModelForCausalLM, get_peft_model_state_dict, set_peft_model_state_dict
 
 
-class TiltMatchingModule(pl.LightningModule):
+class TiltCountdownModule(pl.LightningModule):
     def __init__(self, base_model, tokenizer, training_prompts_dataset, reward_funcs, **cfg):
         super().__init__()
         self.automatic_optimization = False
@@ -65,6 +65,7 @@ class TiltMatchingModule(pl.LightningModule):
         self.buffer_update_counter = 0
         self._grad_accum_counter = 0
         self.dict_for_logs = {}
+        self.method = self.hparams.tm.method
         # micro-step metric accumulation
         self._micro_log_sums = {}
         self._micro_log_counts = {}
@@ -221,7 +222,11 @@ class TiltMatchingModule(pl.LightningModule):
         out = {}
         for k, s in self._micro_log_sums.items():
             c = self._micro_log_counts.get(k, 1)
-            out[k] = s / float(c)
+            # Keep total sums for *_sum / *_count metrics; average everything else.
+            if k.endswith(("_sum", "_count")):
+                out[k] = s
+            else:
+                out[k] = s / float(c)
         out.update(self._micro_log_mins)
         out.update(self._micro_log_maxs)
         return out
@@ -242,6 +247,7 @@ class TiltMatchingModule(pl.LightningModule):
             batch: Dummy batch (not used).
             batch_idx: Index of the batch (not used).
         """
+        step_start_time = datetime.now()
         opt = self.tm_opt
         accum = self.hparams.tm.grad_accum_steps
 
@@ -290,6 +296,13 @@ class TiltMatchingModule(pl.LightningModule):
         # Build averaged metrics (over micro-steps) for this optimizer/global step
         self.dict_for_logs = self._finalize_micro_log_dict()
 
+        # Reconstruct correct fraction across the full accumulation window
+        if "train/correct_sum" in self.dict_for_logs and "train/correct_count" in self.dict_for_logs:
+            denom = self.dict_for_logs.pop("train/correct_count", 0.0)
+            num = self.dict_for_logs.pop("train/correct_sum", 0.0)
+            if denom > 0:
+                self.dict_for_logs["train/correct_frac"] = num / denom
+
         # Log current learning rate and grad norms
         self.dict_for_logs["train/lr"] = opt.param_groups[0]["lr"]
         self.dict_for_logs["grads/grad_norm_before"] = grad_norm_before
@@ -319,6 +332,9 @@ class TiltMatchingModule(pl.LightningModule):
             self._init_tm_scheduler()
 
         self.log("ckpt_a", self.a, on_step=True, on_epoch=False, sync_dist=True)
+        step_end_time = datetime.now()
+        time_per_step = (step_end_time - step_start_time).total_seconds()   
+        print(f"Step taken: {time_per_step:.3f} seconds")
         return loss
 
     def _tm_step(self):
@@ -328,9 +344,10 @@ class TiltMatchingModule(pl.LightningModule):
         gen_length = self.hparams.max_completion_length
 
         # Draw a batch from the buffer
-        start_idx = (self._grad_accum_counter % self.hparams.tm.grad_accum_steps) * num_batch_prompts
+        start_idx = ((self._grad_accum_counter % self.hparams.tm.grad_accum_steps) * num_batch_prompts) % self.buffer.shape[0]
         end_idx = start_idx + num_batch_prompts
-        prompts_idx = self._accum_prompts_idx[start_idx:end_idx]
+        idx = (torch.arange(start_idx, end_idx, device=self.device) % self._accum_prompts_idx.shape[0])
+        prompts_idx = self._accum_prompts_idx[idx]
         x1s = self.buffer[prompts_idx].reshape(B, L)           # [B, L]
         rwds = self.buffer_rewards[prompts_idx].reshape(B, -1) # [B, num_reward_funcs]
 
@@ -340,8 +357,10 @@ class TiltMatchingModule(pl.LightningModule):
         else:
             weights = self.reward_weights.to(device=self.device, dtype=rwds.dtype)
         rwd = torch.nansum(rwds * weights.unsqueeze(0), dim=1) # [B,]
-        # % of totally correct samples
-        correct_frac = torch.isclose(rwd, self.hparams.max_rwd * torch.ones_like(rwd), atol=1e-6, rtol=0.0).float().mean()
+        # Count totally correct samples so we can aggregate across micro-steps
+        correct_mask = torch.isclose(rwd, self.hparams.max_rwd * torch.ones_like(rwd), atol=1e-5, rtol=0.0)
+        correct_sum = correct_mask.sum().float()
+        correct_count = torch.tensor(float(correct_mask.numel()), device=self.device)
         
         # Create x_t's by masking the x_1's
         num_to_mask = torch.randint(low=1, high=gen_length+1, size=(x1s.shape[0],), device=self.device)
@@ -350,10 +369,12 @@ class TiltMatchingModule(pl.LightningModule):
         # Get model predictions and compute loss
         temp = self.hparams.sampling_temperature
         with torch.no_grad(), self._use_adapter("teacher"):
+            self.model.eval()
             old_logits = self._new_forward(self.model, xts, gen_length) # [B, gen_length, V]
         V = old_logits.shape[-1]
         x1_equals_v = F.one_hot(x1s.long()[:, -gen_length:], num_classes = V) # [B, gen_length, V]
         with self._use_adapter("student"):
+            self.model.train()   
             curr_logits = self._new_forward(self.model, xts, gen_length) # [B, gen_length, V]
         if temp > 0.0 and self.hparams.tm.rescale_logits:
             old_logits  /= temp
@@ -375,75 +396,75 @@ class TiltMatchingModule(pl.LightningModule):
         per_sample_losses = -(target * F.log_softmax(curr_logits, dim=-1)).sum(dim=-1) # [B, gen_length]
         loss = per_sample_losses[mask_indices.bool()].mean()
 
-        # ---- DEBUG: investigate loss spikes ----
-        debug_thresh = getattr(self.hparams, "debug_loss_spike_threshold", None)
-        debug_topk = int(getattr(self.hparams, "debug_loss_spike_topk", 3))       # how many samples to print
+        # # ---- DEBUG: investigate loss spikes ----
+        # debug_thresh = getattr(self.hparams, "debug_loss_spike_threshold", None)
+        # debug_topk = int(getattr(self.hparams, "debug_loss_spike_topk", 3))       # how many samples to print
 
-        if debug_thresh is not None:
-            loss_val = float(loss.detach().cpu())
-            if (not torch.isfinite(loss)) or (loss_val > float(debug_thresh)):
-                if getattr(self.trainer, "global_rank", 0) == 0:
-                    gen_len = gen_length
+        # if debug_thresh is not None:
+        #     loss_val = float(loss.detach().cpu())
+        #     if (not torch.isfinite(loss)) or (loss_val > float(debug_thresh)):
+        #         if getattr(self.trainer, "global_rank", 0) == 0:
+        #             gen_len = gen_length
 
-                    # 1) Check finiteness / ranges
-                    finite_curr = torch.isfinite(curr_logits).all().item()
-                    finite_old  = torch.isfinite(old_logits).all().item()
-                    print("\n" + "=" * 80)
-                    print(f"[LOSS SPIKE] global_step={self.global_step}  micro={self._grad_accum_counter}  loss={loss_val:.4f}")
-                    print(f"  finite: curr_logits={finite_curr} old_logits={finite_old} mask_any={mask_indices.any().item()}")
-                    print(f"  curr_logits: min={curr_logits.min().item():.3e} max={curr_logits.max().item():.3e}")
-                    print(f"  old_logits : min={old_logits.min().item():.3e} max={old_logits.max().item():.3e}")
+        #             # 1) Check finiteness / ranges
+        #             finite_curr = torch.isfinite(curr_logits).all().item()
+        #             finite_old  = torch.isfinite(old_logits).all().item()
+        #             print("\n" + "=" * 80)
+        #             print(f"[LOSS SPIKE] global_step={self.global_step}  micro={self._grad_accum_counter}  loss={loss_val:.4f}")
+        #             print(f"  finite: curr_logits={finite_curr} old_logits={finite_old} mask_any={mask_indices.any().item()}")
+        #             print(f"  curr_logits: min={curr_logits.min().item():.3e} max={curr_logits.max().item():.3e}")
+        #             print(f"  old_logits : min={old_logits.min().item():.3e} max={old_logits.max().item():.3e}")
 
-                    # 2) How many masked tokens per sample?
-                    masked_counts = mask_indices.sum(dim=1)  # [B]
-                    print(f"  masked_counts: min={masked_counts.min().item()} max={masked_counts.max().item()} mean={masked_counts.float().mean().item():.2f}")
+        #             # 2) How many masked tokens per sample?
+        #             masked_counts = mask_indices.sum(dim=1)  # [B]
+        #             print(f"  masked_counts: min={masked_counts.min().item()} max={masked_counts.max().item()} mean={masked_counts.float().mean().item():.2f}")
 
-                    # 3) Per-sample mean loss over masked positions (to find the worst offenders)
-                    masked_counts_clamped = masked_counts.clamp(min=1)
-                    per_sample_mean = (per_sample_losses * mask_indices).sum(dim=1) / masked_counts_clamped  # [B]
-                    k = min(debug_topk, per_sample_mean.numel())
-                    worst_vals, worst_idx = torch.topk(per_sample_mean, k=k)
+        #             # 3) Per-sample mean loss over masked positions (to find the worst offenders)
+        #             masked_counts_clamped = masked_counts.clamp(min=1)
+        #             per_sample_mean = (per_sample_losses * mask_indices).sum(dim=1) / masked_counts_clamped  # [B]
+        #             k = min(debug_topk, per_sample_mean.numel())
+        #             worst_vals, worst_idx = torch.topk(per_sample_mean, k=k)
 
-                    # 4) Compare teacher vs student NLL on the *true* token at masked positions
-                    # true token ids on the completion suffix
-                    true_ids = x1s[:, -gen_len:]  # [B, gen_len]
-                    logp_curr = F.log_softmax(curr_logits, dim=-1).gather(-1, true_ids.unsqueeze(-1)).squeeze(-1)  # [B, gen_len]
-                    logp_old  = F.log_softmax(old_logits,  dim=-1).gather(-1, true_ids.unsqueeze(-1)).squeeze(-1)  # [B, gen_len]
+        #             # 4) Compare teacher vs student NLL on the *true* token at masked positions
+        #             # true token ids on the completion suffix
+        #             true_ids = x1s[:, -gen_len:]  # [B, gen_len]
+        #             logp_curr = F.log_softmax(curr_logits, dim=-1).gather(-1, true_ids.unsqueeze(-1)).squeeze(-1)  # [B, gen_len]
+        #             logp_old  = F.log_softmax(old_logits,  dim=-1).gather(-1, true_ids.unsqueeze(-1)).squeeze(-1)  # [B, gen_len]
 
-                    for rank_i, i in enumerate(worst_idx.tolist()):
-                        # decode completion for this sample
-                        completion_text = self.tokenizer.decode(true_ids[i], skip_special_tokens=True)
+        #             for rank_i, i in enumerate(worst_idx.tolist()):
+        #                 # decode completion for this sample
+        #                 completion_text = self.tokenizer.decode(true_ids[i], skip_special_tokens=True)
 
-                        # worst token within masked positions
-                        masked_pos = mask_indices[i].nonzero(as_tuple=False).squeeze(-1)
-                        if masked_pos.numel() > 0:
-                            # token with lowest prob under student among masked positions
-                            worst_tok_j = masked_pos[torch.argmax(per_sample_losses[i, masked_pos])]
-                            # then compute logps at that same position
-                            curr_lp = logp_curr[i, worst_tok_j].item()
-                            old_lp  = logp_old[i,  worst_tok_j].item()
-                            tok_loss = per_sample_losses[i, worst_tok_j].item()
-                            print(f"    tok_loss(NLL)={tok_loss:.4f}")
-                            print(f"    logp_student={curr_lp:.4f}  logp_teacher={old_lp:.4f}")
-                            tok_id  = int(true_ids[i, worst_tok_j].item())
-                            tok_str = self.tokenizer.decode([tok_id])
+        #                 # worst token within masked positions
+        #                 masked_pos = mask_indices[i].nonzero(as_tuple=False).squeeze(-1)
+        #                 if masked_pos.numel() > 0:
+        #                     # token with lowest prob under student among masked positions
+        #                     worst_tok_j = masked_pos[torch.argmax(per_sample_losses[i, masked_pos])]
+        #                     # then compute logps at that same position
+        #                     curr_lp = logp_curr[i, worst_tok_j].item()
+        #                     old_lp  = logp_old[i,  worst_tok_j].item()
+        #                     tok_loss = per_sample_losses[i, worst_tok_j].item()
+        #                     print(f"    tok_loss(NLL)={tok_loss:.4f}")
+        #                     print(f"    logp_student={curr_lp:.4f}  logp_teacher={old_lp:.4f}")
+        #                     tok_id  = int(true_ids[i, worst_tok_j].item())
+        #                     tok_str = self.tokenizer.decode([tok_id])
 
-                            print("-" * 80)
-                            print(f"  [sample {rank_i}] per_sample_mean={worst_vals[rank_i].item():.4f}  masked={int(masked_counts[i].item())}")
-                            print(f"    worst_masked_token_pos={int(worst_tok_j.item())} tok_id={tok_id} tok='{tok_str}'")
-                            print(f"    logp_student={curr_lp:.4f}  logp_teacher={old_lp:.4f}")
-                        else:
-                            print("-" * 80)
-                            print(f"  [sample {rank_i}] per_sample_mean={worst_vals[rank_i].item():.4f} (no masked positions??)")
+        #                     print("-" * 80)
+        #                     print(f"  [sample {rank_i}] per_sample_mean={worst_vals[rank_i].item():.4f}  masked={int(masked_counts[i].item())}")
+        #                     print(f"    worst_masked_token_pos={int(worst_tok_j.item())} tok_id={tok_id} tok='{tok_str}'")
+        #                     print(f"    logp_student={curr_lp:.4f}  logp_teacher={old_lp:.4f}")
+        #                 else:
+        #                     print("-" * 80)
+        #                     print(f"  [sample {rank_i}] per_sample_mean={worst_vals[rank_i].item():.4f} (no masked positions??)")
 
-                        # print completion text (truncate)
-                        max_chars = int(getattr(self.hparams, "debug_completion_max_chars", 400))
-                        print("    completion_text:", completion_text[:max_chars].replace("\n", "\\n"))
+        #                 # print completion text (truncate)
+        #                 max_chars = int(getattr(self.hparams, "debug_completion_max_chars", 400))
+        #                 print("    completion_text:", completion_text[:max_chars].replace("\n", "\\n"))
 
-                    # 5) Reward / hr stats for this batch (often explains ITM blowups if rewards are large)
-                    print(f"  rwd: min={rwd.min().item():.4f} max={rwd.max().item():.4f} mean={rwd.mean().item():.4f}")
-                    print(f"  hr=h*rwd: min={(self.h*rwd).min().item():.4f} max={(self.h*rwd).max().item():.4f}")
-                    print("=" * 80 + "\n")
+        #             # 5) Reward / hr stats for this batch (often explains ITM blowups if rewards are large)
+        #             print(f"  rwd: min={rwd.min().item():.4f} max={rwd.max().item():.4f} mean={rwd.mean().item():.4f}")
+        #             print(f"  hr=h*rwd: min={(self.h*rwd).min().item():.4f} max={(self.h*rwd).max().item():.4f}")
+        #             print("=" * 80 + "\n")
 
 
         log_dict = {
@@ -455,11 +476,18 @@ class TiltMatchingModule(pl.LightningModule):
             f"train/rwd_min": rwd.min(),
             f"train/rwd_mean": rwd.mean(),
             f"train/rwd_std": rwd.std(),
+            f"train/correct_sum": correct_sum,
+            f"train/correct_count": correct_count,
         }
         
         return loss, log_dict
     
     def on_train_batch_end(self, outputs, batch, batch_idx):
+        # if self.method == "onpolicy":
+        #     if self.global_step % self.hparams.tm.buffer_refresh_steps == 0:
+        #         print(f"[DEBUG] Refreshing {self.hparams.tm.num_buffer_refresh} prompts at global step {self.global_step}")
+        #         self._update_buffer(self.model, self.hparams.tm.num_buffer_refresh, self.comps_per_prompt)
+        # elif self.method == "offpolicy":
         if (self._grad_accum_counter % self.hparams.tm.grad_accum_steps) == 0:
             if self.global_step % self.steps_per_h == 0:
                 self._rebuild_buffer_next_phase = True
@@ -518,10 +546,10 @@ class TiltMatchingModule(pl.LightningModule):
         # Get DDP info (defaults to 1 if not distributed)
         # We only want 8 unique prompt groups. Ranks separated by 8 (0/8, 1/9, ...)
         # will share the same prompts when running with 16 GPUs.
-        physical_world_size = self.trainer.world_size
-        global_rank = self.trainer.global_rank
-        logical_world_size = min(physical_world_size, self.hparams.world_size)
-        logical_rank = global_rank % self.hparams.world_size
+        global_world_size = getattr(self.trainer, "world_size", 1)
+        global_rank = getattr(self.trainer, "global_rank", 0)
+        logical_world_size = min(global_world_size, self.hparams.world_size)
+        logical_rank = global_rank % logical_world_size
 
         # ---- 1. Choose distinct prompt indices (with wrap-around) ----
         indices = []
@@ -538,8 +566,8 @@ class TiltMatchingModule(pl.LightningModule):
         self._last_prompt_indices = indices
 
         # ---- 2. Extract structured prompts from the dataset ----
-        # For get_sudoku_questions_new, each element looks like:
-        #   {"prompt": [{"role": "user", "content": "..."}], "puzzle": ..., "solution": ...}
+        # For get_countdown_questions, each element looks like:
+        #   {"prompt": [{"role": "user", "content": "..."}], "target": ..., "numbers": ...}
         structured_prompts = [self.training_prompts_dataset[i]["prompt"] for i in indices]
 
         # ---- 3. Convert structured prompts to plain text and tokenize ----
@@ -564,6 +592,10 @@ class TiltMatchingModule(pl.LightningModule):
             add_special_tokens=False,
         )["input_ids"].to(self.device)
 
+        # # Debug prompt length
+        # prompt_input = self.tokenizer.batch_decode(input_ids, skip_special_tokens=False)
+        # print(f"Prompts are: {prompt_input[:2]} ...")
+
         return input_ids.repeat_interleave(num_completions_per_prompts, dim=0)
 
     def _update_buffer(self, model, num_buffer_updates, num_completions_per_prompt):
@@ -587,6 +619,7 @@ class TiltMatchingModule(pl.LightningModule):
 
         prev_adapter = model.active_adapter
         model.set_adapter("teacher")
+        model.eval()
         print(f"{build_or_refresh} sample buffer ...")
         buffer_start_time = datetime.now()
 
@@ -648,7 +681,7 @@ class TiltMatchingModule(pl.LightningModule):
         # For each generated sample we need:
         #   - a structured prompt (list of chat messages)
         #   - a structured completion (list with one assistant message)
-        #   - one entry per dataset column (e.g. "answer", "puzzle", "solution", "target", "numbers")
+        #   - one entry per dataset column (e.g. "answer", "target", "numbers")
         prompts_for_rewards = []
         completions_for_rewards = []
         reward_kwargs = {key: [] for key in data_keys}
@@ -684,94 +717,45 @@ class TiltMatchingModule(pl.LightningModule):
             )
             rewards_per_func[:, j] = torch.tensor(scores, device=device, dtype=torch.float32)
         
-        # ---- DEBUG: print a few generated samples (half with reward==1) ----
-        num_print = int(getattr(self.hparams.tm, "buffer_print_samples", 0))  # 0 disables printing
-        if num_print > 0 and getattr(self.trainer, "global_rank", 0) == 0:
-            # rewards_per_func: [total_batch, num_funcs]  -> use first func
-            r = rewards_per_func[:, 0]
-
-            # Indices with reward==1 (allow tiny numeric tolerance)
-            is_max = torch.isclose(r, torch.ones_like(r), atol=1e-6, rtol=0.0)
-            max_idxs = torch.nonzero(is_max, as_tuple=False).squeeze(-1)
-            all_idxs = torch.arange(r.shape[0], device=r.device)
-
-            # Choose ~half from max-reward, remainder from anywhere (no duplicates)
-            k_total = min(num_print, int(r.shape[0]))
-            k_max = min(k_total // 2, int(max_idxs.numel()))
-            k_any = k_total - k_max
-
-            chosen = []
-            if k_max > 0:
-                perm = torch.randperm(max_idxs.numel(), device=r.device)[:k_max]
-                chosen_max = max_idxs[perm]
-                chosen.append(chosen_max)
-
-            if k_any > 0:
-                if len(chosen) > 0:
-                    already = torch.zeros_like(all_idxs, dtype=torch.bool)
-                    already[chosen[0]] = True
-                    pool = all_idxs[~already]
-                else:
-                    pool = all_idxs
-
-                if pool.numel() > 0:
-                    perm = torch.randperm(pool.numel(), device=r.device)[: min(k_any, int(pool.numel()))]
-                    chosen_any = pool[perm]
-                    chosen.append(chosen_any)
-
-            if len(chosen) > 0:
-                chosen = torch.cat(chosen, dim=0)
-            else:
-                chosen = torch.empty(0, dtype=torch.long, device=r.device)
-
-            # Print
-            print(
-                f"[DEBUG] Buffer {build_or_refresh}: printing {int(chosen.numel())} samples "
-                f"(requested={k_total}, reward==1 available={int(max_idxs.numel())})",
-                flush=True,
-            )
-
-            max_chars = int(getattr(self.hparams.tm, "buffer_print_max_chars", 600))
-
-            def _extract_answer_digits(s: str):
-                # same idea as extract_answer_sudoku() in reward_func.py
-                m = re.findall(r"<answer>(.*?)</answer>", s, re.DOTALL)
-                if not m:
-                    return None
-                return "".join(ch for ch in m[-1].strip() if ch.isdigit())
-
-            for t, idx in enumerate(chosen.tolist()):
-                # Pull the puzzle / ground truth directly (you only want puzzle as the "prompt")
-                puzzle = reward_kwargs.get("puzzle", [None])[idx]
-                ground_truth = reward_kwargs.get("solution", [None])[idx]
-
-                # Completion: keep the whole thing, but make it human-readable:
-                # the model often emits literal "\n" sequences, so convert them to real newlines for printing
-                completion_raw = completions_text[idx]
-                completion_pretty = completion_raw.replace("\\n", "\n")
-
-                extracted = _extract_answer_digits(completion_raw)
-                score = float(rewards_per_func[idx, 0].detach().cpu().item())
-
-                print(f"--------------------------------", flush=True)
-                if puzzle is not None:
-                    print(f"Puzzle: {puzzle} (length: {len(puzzle)})", flush=True)
-                else:
-                    print("Puzzle: <missing>", flush=True)
-
-                print(
-                    f"Extracted solution: {extracted}  (length: {len(extracted) if extracted else 0})",
-                    flush=True,
-                )
-                if ground_truth is not None:
-                    print(f"Ground_truth: {ground_truth}", flush=True)
-                else:
-                    print("Ground_truth: <missing>", flush=True)
-
-                print(f"Score: {score:.4f}", flush=True)
-
-                print("\nCompletion:\n", flush=True)
-                print(completion_pretty[:max_chars], flush=True)
+        #DEBUG: for a given prompt, with prob 0.1 print all the generated completions and their rewards
+        do_print = torch.rand(num_buffer_updates, device=device) < 0.15
+        for i in range(num_buffer_updates):
+            if not do_print[i]:
+                continue
+            
+            # Get the prompt index in the dataset
+            row_idx = self._last_prompt_indices[i]
+            row = self.training_prompts_dataset[row_idx]
+            
+            # Extract target and numbers for this prompt
+            target = row.get("target", None)
+            numbers = row.get("numbers", None)
+            
+            print(f"\n{'='*80}")
+            print(f"Target: {target} | Numbers: {numbers}")
+            print(f"{'='*80}\n")
+            
+            # Print all completions for this prompt
+            for comp_idx in range(num_completions_per_prompt):
+                global_idx = i * num_completions_per_prompt + comp_idx
+                completion_text = completions_text[global_idx]
+                
+                # Extract the equation/answer from completion
+                equation = None
+                answer_pattern = r"<answer>(.*?)</answer>"
+                matches = re.findall(answer_pattern, completion_text, re.DOTALL)
+                if matches:
+                    equation = matches[-1].strip()
+                
+                # Get the reward for this completion
+                reward_val = rewards_per_func[global_idx, 0].item() if num_funcs > 0 else 0.0
+                
+                print(f"  Completion {comp_idx + 1}/{num_completions_per_prompt}:")
+                print(f"  --------------------------------")
+                print(f"  Extracted equation: {equation}")
+                print(f"  Reward: {reward_val:.4f}")
+                print(f"  Full completion: {completion_text}")  # truncate long completions
+                print()
 
 
         # Store as shape [num_buffer_updates, num_completions_per_prompt, num_funcs]
@@ -787,6 +771,7 @@ class TiltMatchingModule(pl.LightningModule):
 
         # restore adapter
         model.set_adapter(prev_adapter)
+        model.train()
     
     def _init_tm_scheduler(self):
         """Initialize a per-h-phase, linear LR scheduler with warmup.
@@ -879,113 +864,6 @@ class TiltMatchingModule(pl.LightningModule):
                 pg["lr"] = float(base_lr)
 
         state["step"] = step + 1
-    
-    def monitor_sudoku(self, num_completions=3):
-        """
-        Have each rank evaluate a single Sudoku whose index matches its global rank.
-        """
-        print("Checking teacher model on fixed sodokus...")
-
-        rank = getattr(self.trainer, "global_rank", 0)
-        world_size = getattr(self.trainer, "world_size", 1)
-        
-        # prepare prompts for this rank's assigned sudoku
-        monitor_start_time = datetime.now()
-        monitored_rows = [self.training_prompts_dataset[rank]]
-        monitored_prompts = [row["prompt"] for row in monitored_rows]
-        monitored_prompt_text = []
-        for sp in monitored_prompts:
-            if isinstance(sp, str):
-                text = sp # already a plain string
-            elif isinstance(sp, list):
-                # Typical case for Sudoku / GSM8K / math: [{"role": "...", "content": "..."}]
-                text = self.tokenizer.apply_chat_template(sp, tokenize=False, add_generation_prompt=True)
-            else:
-                raise TypeError(f"Unsupported prompt type {type(sp)} in training_prompts_dataset")
-            monitored_prompt_text.append(text)
-        
-        input_ids = self.tokenizer(
-            text = monitored_prompt_text,
-            return_tensors = "pt",
-            padding = "max_length",
-            truncation = True,
-            max_length = self.hparams.max_prompt_length,
-            padding_side = "left",
-            add_special_tokens = False,
-        )["input_ids"].to(self.device)
-        prompt_len =input_ids.shape[1]
-
-        input_ids = input_ids.repeat_interleave(num_completions, dim=0)
-        
-        with torch.no_grad(), self._use_adapter("teacher"):
-            monitored_answers = self._generate(
-                model = self.model,
-                prompt = input_ids,
-                steps =  self.hparams.diffusion_steps,
-                gen_length=self.hparams.max_completion_length,
-                block_length=self.hparams.block_length,
-                temperature=self.hparams.sampling_temperature,
-                cfg_scale=self.hparams.cfg_scale,
-                remasking=self.hparams.remasking_strategy,
-            ) # [num_soduku * num_completions, seq_len]
-
-        monitored_answers_text = monitored_answers[:, prompt_len:]
-        monitored_answers_text = self.tokenizer.batch_decode(monitored_answers_text, skip_special_tokens=True)
-        # [num_soduku * num_completions, gen_length]
-
-        # check if each answer is correct
-        reward_func = self.reward_funcs[0] # reward_func = sudoku_reward_func
-
-        data_keys = [key for key in monitored_rows[0].keys() if key != "prompt"]
-        prompts_for_rewards = []
-        reward_kwargs = {key: [] for key in data_keys}
-
-        for row in monitored_rows:
-            base_prompt = row["prompt"]
-            for _ in range(num_completions):
-                prompts_for_rewards.append(base_prompt)
-                for key in data_keys:
-                    reward_kwargs[key].append(row[key])
-
-        completions_for_rewards = []
-        for text in monitored_answers_text:
-            completions_for_rewards.append([{"role": "assistant", "content": text}])
-
-        scores = reward_func(
-            prompts=prompts_for_rewards,
-            completions=completions_for_rewards,
-            **reward_kwargs,
-        )
-        monitor_end_time = datetime.now()
-        print(f"Finished checking. Time taken: {monitor_end_time - monitor_start_time}")
-
-        # Gather completions and scores across ranks to let rank 0 log all results.
-        gathered_answers = self.all_gather(monitored_answers)            # [world, B, seq_len]
-        scores_tensor = torch.tensor(scores, device=self.device, dtype=torch.float32)
-        gathered_scores = self.all_gather(scores_tensor)                # [world, B]
-
-        if rank != 0:
-            return
-
-        answers_flat = gathered_answers.reshape(-1, gathered_answers.shape[-1])
-        scores_flat = gathered_scores.reshape(-1).tolist()
-        decoded = self.tokenizer.batch_decode(answers_flat[:, prompt_len:], skip_special_tokens=True)
-
-        if wandb.run is not None:
-            log_sodoku = {}
-            for r in range(world_size):
-                start = r * num_completions
-                end = start + num_completions
-                table = wandb.Table(columns=["puzzle", "completion", "score"])
-                puzzle_text = self.training_prompts_dataset[r].get("puzzle", "")
-                for idx in range(start, end):
-                    table.add_data(
-                        puzzle_text,
-                        decoded[idx],
-                        float(scores_flat[idx]),
-                    )
-                log_sodoku[f"sudoku_rank_{r}"] = table
-            wandb.log(log_sodoku, step=self.global_step)
 
     
     def _kl_from_logits(self, logits_A, logits_B, mask_indices):

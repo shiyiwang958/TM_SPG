@@ -239,14 +239,16 @@ def parse_countdown_answers(json_path=None, json_data=None):
                 target = int(target_match.group(1))
 
         equation = ""
-        try:
-            equation = remove_boxed(last_boxed_only_string(generated_text))
-        except:
-            # Try to extract from answer tags
-            answer_match = re.search(r"<answer>(.*?)</answer>", generated_text, re.DOTALL)
-            if answer_match:
-                equation = answer_match.group(1).strip()
-            else:
+        
+        # First try to extract from answer tags (new format)
+        answer_match = re.search(r"<answer>\s*(.*?)\s*</answer>", generated_text, re.DOTALL)
+        if answer_match:
+            equation = answer_match.group(1).strip()
+        else:
+            # Fallback to boxed format (old format)
+            try:
+                equation = remove_boxed(last_boxed_only_string(generated_text))
+            except:
                 equation = generated_text
 
         # Replace LaTeX operators with Python operators
@@ -329,6 +331,7 @@ def parse_sudoku_answers(json_path=None, json_data=None):
             r"</answer>\s*(.*?)(?:<\|eot_id\|>|<\|endoftext\|>|$)",
             r".*?(\d{16})\s*</answer>",
             r"\b(\d{16})\b",
+            r"<answer>(.*?)</answer>",
         ]
 
         for pattern in patterns:
@@ -464,4 +467,4 @@ def aggregate_results(directory="."):
 
 
 if __name__ == "__main__":
-    aggregate_results(directory="tilt_results/sudoku_tilt")
+    aggregate_results(directory="tilt_results/countdown_0.1")

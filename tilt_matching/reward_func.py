@@ -115,12 +115,12 @@ def evaluate_equation(equation_str):
         return None
 
 
-def compute_score(solution_str, ground_truth, method="strict", format_score=0.1, score=1.0):
+def compute_score(solution_str, ground_truth, method="strict", format_score=0.1, score=1.0, scaling=False):
     target = ground_truth["target"]
     numbers = ground_truth["numbers"]
 
     equation = extract_solution(solution_str)
-    do_print = np.random.rand() < 0.1
+    do_print = np.random.rand() < 0.0
 
     if do_print:
         print(f"--------------------------------")
@@ -146,9 +146,12 @@ def compute_score(solution_str, ground_truth, method="strict", format_score=0.1,
             return format_score
 
         if abs(result - target) < 1e-5:
-            if do_print:
-                print(f"Correct equation: {equation} = {result}")
-            return score
+            if not scaling:
+                if do_print:
+                    print(f"Correct equation: {equation} = {result}")
+                return score
+            else:
+                return score * check_special_operators(equation)
         else:
             if do_print:
                 print(f"Wrong result: equation = {result}, target = {target}")
@@ -157,6 +160,14 @@ def compute_score(solution_str, ground_truth, method="strict", format_score=0.1,
         if do_print:
             print(f"Error evaluating equation")
         return format_score
+
+def check_special_operators(equation_str, scale_factor=5.0):
+    if "*" in equation_str or "/" in equation_str:
+        return scale_factor
+    elif "(" in equation_str and ")" in equation_str:
+        return scale_factor
+    else: 
+        return 1.0
 
 
 def countdown_reward_func(prompts, completions, run_name=None, step=None, rank=None, **kwargs) -> list[float]:
@@ -172,7 +183,7 @@ def countdown_reward_func(prompts, completions, run_name=None, step=None, rank=N
     scores = []
     for i, response in enumerate(responses):
         ground_truth = {"target": kwargs["target"][i], "numbers": kwargs["numbers"][i]}
-        scores.append(compute_score(response, ground_truth))
+        scores.append(compute_score(response, ground_truth) * 5.0)
 
     return scores
 
@@ -222,7 +233,7 @@ def sudoku_reward_func(prompts, completions, run_name=None, step=None, rank=None
         solution = extract_answer_sudoku(response)
 
         score = 0.0 if solution is None else validate_sudoku_solution(solution, ground_truth, puzzle)
-        scaled_score = (score - 0.8) * 50  # shift and scale to keep max at 1 while lowering min
+        scaled_score = (score - 0.9) * 100  # shift and scale to keep max at 1 while lowering min
         scores.append(scaled_score)
 
         if do_print:

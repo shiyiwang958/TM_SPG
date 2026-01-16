@@ -1,13 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name=tilt_countdown
+#SBATCH --job-name=tilt_sudoku
 #SBATCH --account=kempner_albergo_lab
-#SBATCH --partition=kempner_h100
+#SBATCH --partition=kempner
 #SBATCH --nodes=4
-#SBATCH --gpus-per-node=2
+#SBATCH --gpus-per-node=4
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=100GB
-#SBATCH --time=12:00:00
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64GB
+#SBATCH --time=6:00:00
 #SBATCH --mail-type=END,FAIL,BEGIN
 #SBATCH --mail-user=fwang@math.harvard.edu
 #SBATCH --output=/n/home03/sw958/project_1/SPG/tilt_matching/outputs/output_%j.out
@@ -16,8 +16,8 @@ OUTPUT_DIR="/n/home03/sw958/project_1/SPG/tilt_matching/outputs/output_${SLURM_J
 mkdir -p "$OUTPUT_DIR"
 
 source ~/.bashrc
-mamba deactivate
-mamba activate spg
+conda deactivate
+conda activate spg
 module load cuda/12.4.1-fasrc01
 
 # -------------------------
@@ -26,20 +26,19 @@ module load cuda/12.4.1-fasrc01
 export NCCL_SOCKET_FAMILY=AF_INET
 export GLOO_USE_IPV6=0
 
-# Pick default IPv4 route interface for rendezvous (ethernet)
-DEFAULT_IF=$(ip -o -4 route show to default | awk '{print $5}' | head -n 1)
-if [ -z "${DEFAULT_IF:-}" ]; then
-  echo "ERROR: could not determine default IPv4 interface"
-  ip -o -4 route show
-  exit 2
-fi
-export GLOO_SOCKET_IFNAME="$DEFAULT_IF"
+# NCCL robustness
+export NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_DEBUG=INFO
+export NCCL_IB_TIMEOUT=22
+
+# Rendezvous (TCPStore/GLOO) over Ethernet (em2)
+export GLOO_SOCKET_IFNAME=em2
 
 # NCCL data plane over InfiniBand (ib0)
 export NCCL_SOCKET_IFNAME=ib0
 
 # Choose a fixed port first (avoids "random port blocked" issues)
-export MASTER_PORT=$(( 10000 + SLURM_JOB_ID % 50000 ))
+export MASTER_PORT=29500
 
 export NODE_RANK=$SLURM_NODEID
 export NNODES=$SLURM_JOB_NUM_NODES
@@ -52,9 +51,9 @@ MASTER_FILE="$OUTPUT_DIR/master_addr.txt"
 
 if [ "$SLURM_NODEID" -eq 0 ]; then
   # Pick em2 IPv4 on rank0 as MASTER_ADDR (rendezvous address)
-  MASTER_ADDR=$(ip -o -4 addr show dev "$DEFAULT_IF" | awk '{print $4}' | cut -d/ -f1 | head -n 1 || true)
+  MASTER_ADDR=$(ip -o -4 addr show dev em2 | awk '{print $4}' | cut -d/ -f1 || true)
   if [ -z "${MASTER_ADDR:-}" ]; then
-    echo "ERROR: could not find IPv4 on $DEFAULT_IF for rank0"
+    echo "ERROR: could not find IPv4 on em2 for rank0"
     ip -o -4 addr show
     exit 2
   fi
@@ -91,9 +90,9 @@ mkdir -p "$LOGDIR"
 cd /n/home03/sw958/project_1/SPG/tilt_matching
 
 
-srun --ntasks-per-node=1 --gpus-per-task=2 \
+srun --ntasks-per-node=1 --gpus-per-task=4 \
   python -m torch.distributed.run \
-    --nproc_per_node=2 \
+    --nproc_per_node=4 \
     --nnodes="$NNODES" \
     --node_rank="$NODE_RANK" \
     --rdzv_backend=c10d \
@@ -102,6 +101,6 @@ srun --ntasks-per-node=1 --gpus-per-task=2 \
     --log_dir="$LOGDIR" \
     --redirects 3 \
     --tee 3 \
-    train_countdown_a100.py \
+    train_sudoku.py \
     --config-path /n/home03/sw958/project_1/SPG/tilt_matching/config \
-    --config-name h100_countdown.yaml
+    --config-name a100_sudoku.yaml  

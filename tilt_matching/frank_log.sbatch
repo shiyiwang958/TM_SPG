@@ -5,7 +5,7 @@
 #SBATCH --nodes=4
 #SBATCH --gpus-per-node=2
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=64
+#SBATCH --cpus-per-task=16
 #SBATCH --mem=100GB
 #SBATCH --time=12:00:00
 #SBATCH --mail-type=END,FAIL,BEGIN
@@ -102,6 +102,6 @@ srun --ntasks-per-node=1 --gpus-per-task=2 \
     --log_dir="$LOGDIR" \
     --redirects 3 \
     --tee 3 \
-    train_countdown_a100.py \
+    train_log.py \
     --config-path /n/home03/sw958/project_1/SPG/tilt_matching/config \
-    --config-name h100_countdown.yaml
+    --config-name log_countdown.yaml

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=tilt_sudoku
+#SBATCH --job-name=tilt_countdown
 #SBATCH --account=kempner_albergo_lab
 #SBATCH --partition=kempner
 #SBATCH --nodes=4
@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64GB
-#SBATCH --time=8:00:00
+#SBATCH --time=6:30:00
 #SBATCH --mail-type=END,FAIL,BEGIN
 #SBATCH --mail-user=fwang@math.harvard.edu
 #SBATCH --output=/n/home03/sw958/project_1/SPG/tilt_matching/outputs/output_%j.out
@@ -101,6 +101,6 @@ srun --ntasks-per-node=1 --gpus-per-task=4 \
     --log_dir="$LOGDIR" \
     --redirects 3 \
     --tee 3 \
-    a100_tilt_train.py \
+    train_countdown_a100.py \
     --config-path /n/home03/sw958/project_1/SPG/tilt_matching/config \
-    --config-name a100_tilt_matching.yaml
+    --config-name a100_countdown.yaml
