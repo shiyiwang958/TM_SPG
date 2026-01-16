@@ -11,6 +11,8 @@ from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.utilities import rank_zero_only
 from lightning_modules import TiltMatchingModule
+import copy
+from peft import get_peft_model_state_dict, set_peft_model_state_dict
 
 from reward_func import (
     xmlcount_reward_func,
@@ -244,7 +246,28 @@ def train(cfg: DictConfig):
         **cfg,
     )
 
-    # _debug_attention_once(base_model, tokenizer)
+    init_ckpt = getattr(cfg, "init_ckpt_path", None)
+    if init_ckpt is not None and getattr(cfg, "resume_path", None) is None:
+        ckpt = torch.load(init_ckpt, map_location="cpu", weights_only=False)
+        sd = ckpt.get("state_dict", ckpt)
+
+        # load adapters into the module (loads both student + teacher if present)
+        model.load_state_dict(sd, strict=False)
+
+        # REBASE: teacher := student snapshot
+        with torch.no_grad():
+            student_state = get_peft_model_state_dict(model.model, adapter_name="student")
+            set_peft_model_state_dict(model.model, student_state, adapter_name="teacher")
+            for name, p in model.model.named_parameters():
+                if ".teacher" in name:
+                    p.requires_grad_(False)
+            model.model.set_adapter("student")
+
+        # start at a=h (or whatever you want)
+        model.a = float(getattr(cfg.tm, "a_start", 0.0))
+
+        # important: fresh scheduler at start of this new phase
+        model._tm_sched_state = None
 
     # Configure trainer
     trainer_kwargs = dict(
@@ -297,7 +320,7 @@ def train(cfg: DictConfig):
         trainer.fit(
             model,
             train_dataloaders = dummy_loader,
-            ckpt_path = resume_path #TODO: Later add resume functionality
+            ckpt_path = resume_path
         )
     else:
         trainer.fit(

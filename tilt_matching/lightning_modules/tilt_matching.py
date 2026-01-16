@@ -22,7 +22,7 @@ class TiltMatchingModule(pl.LightningModule):
     def __init__(self, base_model, tokenizer, training_prompts_dataset, test_prompts_dataset, reward_funcs, **cfg):
         super().__init__()
         self.automatic_optimization = False
-        self.save_hyperparameters(ignore=["base_model", "tokenizer", "training_prompts_dataset", "reward_funcs"], logger=False)
+        self.save_hyperparameters(ignore=["base_model", "tokenizer", "training_prompts_dataset", "test_prompts_dataset", "reward_funcs"], logger=False)
         self.tokenizer = tokenizer
 
         peft_config = LoraConfig(
@@ -156,12 +156,34 @@ class TiltMatchingModule(pl.LightningModule):
 
     def on_train_start(self):
         super().on_train_start()
-        self._grad_accum_counter = 0
-        # Set up optimizer and LR
+
         self.tm_opt = self.optimizers()
-        for g in self.tm_opt.param_groups:
-            g["lr"] = self.lr
-        self._init_tm_scheduler()
+
+        resuming = bool(getattr(self, "_resuming_from_ckpt", False))
+
+        if not resuming:
+            # fresh run behavior
+            self._grad_accum_counter = 0
+            for g in self.tm_opt.param_groups:
+                g["lr"] = self.lr
+            self._init_tm_scheduler()
+            return
+
+        # ----- resume behavior -----
+        # DO NOT reset _grad_accum_counter
+        # DO NOT overwrite optimizer lr (Lightning already restored it)
+
+        # If scheduler state wasn't in the ckpt (older ckpts), reconstruct it without changing LR:
+        if self._tm_sched_state is None:
+            saved_lrs = [pg["lr"] for pg in self.tm_opt.param_groups]
+            self._init_tm_scheduler()  # this would set lrs=0; fix below
+            for pg, lr in zip(self.tm_opt.param_groups, saved_lrs):
+                pg["lr"] = lr
+
+            # best-effort: infer position inside h-phase from global_step
+            phase_step = int(self.global_step % self.steps_per_h)
+            if self._tm_sched_state is not None:
+                self._tm_sched_state["step"] = phase_step
     
     def configure_optimizers(self):
         params = [p for p in self.model.parameters() if p.requires_grad]
@@ -281,6 +303,8 @@ class TiltMatchingModule(pl.LightningModule):
             batch: Dummy batch (not used).
             batch_idx: Index of the batch (not used).
         """
+        if dist.is_initialized():
+            assert dist.get_world_size() == 8, f"world_size={dist.get_world_size()} (expected 8)"
         opt = self.tm_opt
         accum = self.hparams.tm.grad_accum_steps
 
@@ -561,18 +585,18 @@ class TiltMatchingModule(pl.LightningModule):
         print(f"saving checkpoint at a = {self.a:.4f}")
         checkpoint["tilt"] = {"a": self.a, "h": self.h}
         checkpoint["prompt_counter"] = self.curr_prompt_counter
-        # checkpoint["grad_accum_counter"] = getattr(self, "_grad_accum_counter", 0)
+        checkpoint["grad_accum_counter"] = int(getattr(self, "_grad_accum_counter", 0))
+        checkpoint["tm_sched_state"] = copy.deepcopy(getattr(self, "_tm_sched_state", None))
         
     def on_load_checkpoint(self, checkpoint: dict):
         tilt = checkpoint.get("tilt", None)
         self.a = tilt.get("a", 0.0)
-        # self.h = tilt.get("h", 2.5e-3)
         self.curr_prompt_counter = checkpoint.get("prompt_counter", 0)
-        # self._grad_accum_counter = checkpoint.get("grad_accum_counter", 0)
+        self._grad_accum_counter = int(checkpoint.get("grad_accum_counter", 0))
+        self._tm_sched_state = checkpoint.get("tm_sched_state", None)
+        self.cv = float(checkpoint.get("cv", getattr(self, "cv", 0.0)))
 
-        # hparams = checkpoint.get("hparams", None)
-        # self.__dict__["hparams"] = hparams
-        # self.__dict__["_hparams"] = hparams
+        self._resuming_from_ckpt = True
 
     def _prepare_prompts(self, num_dinstinct_prompts, num_completions_per_prompts):
         """
@@ -759,6 +783,8 @@ class TiltMatchingModule(pl.LightningModule):
                 **reward_kwargs,
             )
             rewards_per_func[:, j] = torch.tensor(scores, device=device, dtype=torch.float32)
+        if self.hparams.dataset == "gsm8k":
+            rewards_per_func.clamp_(-1.0, 2.0)
         
         # # ---- DEBUG: print a few generated samples (half with reward==1) ----
         # print(f"[DEBUG] Printing out a few generated samples ...")

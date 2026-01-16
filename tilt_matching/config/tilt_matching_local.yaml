@@ -1,21 +1,24 @@
 #-----------------Tilt Matching Training Config-----------------
 tm:
   a_end: 100.0
-  buffer_chunk_size: 4
-  buffer_refresh_steps: 12
+  buffer_chunk_size: 2
+  buffer_refresh_steps: 8
   buffer_print_samples: 4   # 0 disables printing
-  control_variate: 1.0
-  control_variate_ema: 0.02
-  grad_accum_steps: 1
-  h: 0.3
+  control_variate: 1.5
+  control_variate_ema: 0.1
+  eval_num_prompts: 2
+  eval_student_every: 2
+  grad_accum_steps: 4
+  h: 2.5
+  learned_cv: false
   loss_type: itm
   num_batch_prompts: 1
-  num_buffer_prompts: 1
-  num_buffer_refresh: 1
-  num_completions_per_prompt: 4
+  num_buffer_prompts: 2
+  num_buffer_refresh: 2
+  num_completions_per_prompt: 1
   rescale_logits: false
-  rwd_shift: 0.0
-  steps_per_h: 6 # this is the number of optimizer steps per h
+  rwd_shift: -2.0
+  steps_per_h: 1800 # this is the number of optimizer steps per h
 
 #-----------------Optimizer Config-----------------
 adam_beta1: 0.9
@@ -23,12 +26,12 @@ adam_beta2: 0.99
 adam_epsilon: 1e-8
 weight_decay: 0.1
 
-max_grad_norm: 1.0
-learning_rate: 3e-6
+max_grad_norm: 1.5
+learning_rate: 1e-5
 lr_decay_ratio: 0.1
-lr_min: 1e-6
+lr_min: 5e-6
 lr_scheduler_type: linear
-lr_warmup_ratio: 0.15
+lr_warmup_ratio: 0.1
 
 #-----------------Diffusion Generation Config-----------------
 block_length: 32
@@ -36,7 +39,7 @@ cfg_scale: 0.0 #TODO: check
 diffusion_steps: 128
 max_completion_length: 256
 max_prompt_length: 240
-remasking_strategy: low_confidence # or random
+remasking_strategy: random # or random
 sampling_temperature: 1.0
 
 #-----------------Model Config-----------------
@@ -52,19 +55,19 @@ lora_dropout: 0.05
 peft_task_type: CAUSAL_LM
 
 #-----------------Logging and Checkpointing Config-----------------
-checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_new
-checkpoint_freq: 5.0  # in units of h
-metrics_log_every: 4
+checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_long_ckpt_test
+checkpoint_freq: 2  # in number of optimizer steps
+metrics_log_every: 2
 resume_path: #/n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_new/checkpoint-a-3.000.ckpt
 # leave empty if not resuming
-# wandb:
-#   entity: "yuyuanchen-harvard-university"
-#   project: "LLaDA_TM"
-#   name: "gsm_phase1"
+wandb:
+  entity: "yuyuanchen-harvard-university"
+  project: "LLaDA_TM"
+  name: "gsm_long_test"
 
 #-----------------Other Training Config-----------------
 dataset: "gsm8k"
-max_rwd: 4.0
+max_rwd: 3.0
 few_shot: 0
 seed: 42
 nodes: 1

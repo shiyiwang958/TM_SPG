@@ -17,7 +17,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModel
-from peft import PeftModel, LoraConfig, get_peft_model, set_peft_model_state_dict
+from peft import PeftModel, LoraConfig, get_peft_model, set_peft_model_state_dict, get_peft_model_state_dict
 
 from generate import generate
 from gsm8k import GSM8KDataset
@@ -214,6 +214,7 @@ if __name__ == "__main__":
     parser.add_argument("--remasking", type=str, default="low_confidence")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--num_prompts_gsm", type=int, default=-1)
+    parser.add_argument("--adapter", type=str, choices=["student", "teacher"], default="teacher")
     args = parser.parse_args()
 
     if args.seed is not None:
@@ -274,16 +275,30 @@ if __name__ == "__main__":
         )
 
         # Only wrap the teacher adapter for inference.
-        peft_model = get_peft_model(model, lora_cfg, adapter_name="teacher")
+        # peft_model = get_peft_model(model, lora_cfg, adapter_name="teacher")
+
+        # sd = ckpt.get("state_dict", ckpt)
+        # teacher_state = {k[len("base_adapter."):]: v.to(peft_model.device) for k, v in sd.items() if k.startswith("base_adapter.")}
+
+        # set_peft_model_state_dict(peft_model, teacher_state, adapter_name="teacher")
+        # peft_model.set_adapter("teacher")
+        adapter = args.adapter
+        prefix = "model_adapter." if adapter == "student" else "base_adapter."
+
+        peft_model = get_peft_model(model, lora_cfg, adapter_name=adapter)
 
         sd = ckpt.get("state_dict", ckpt)
-        teacher_state = {k[len("base_adapter."):]: v.to(peft_model.device) for k, v in sd.items() if k.startswith("base_adapter.")}
+        adapter_state = {
+            k[len(prefix):]: v.to(peft_model.device)
+            for k, v in sd.items()
+            if k.startswith(prefix)
+        }
 
-        set_peft_model_state_dict(peft_model, teacher_state, adapter_name="teacher")
-        peft_model.set_adapter("teacher")
+        set_peft_model_state_dict(peft_model, adapter_state, adapter_name=adapter)
+        peft_model.set_adapter(adapter)
         model = peft_model.to(local_rank)
-    
 
+    
         if dist.get_world_size() > 1:
             dist.barrier()  # Make sure all processes are ready
             for param in model.parameters():

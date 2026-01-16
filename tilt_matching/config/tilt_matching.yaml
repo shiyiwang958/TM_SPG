@@ -1,13 +1,14 @@
 #-----------------Tilt Matching Training Config-----------------
 tm:
   a_end: 100.0
+  a_start: 2.5
   buffer_chunk_size: 50
   buffer_refresh_steps: 12
   buffer_print_samples: 4   # 0 disables printing
-  control_variate: 1.0
+  control_variate: 2.8
   control_variate_ema: 0.04
   eval_num_prompts: 40
-  eval_student_every: 96
+  eval_student_every: 48
   grad_accum_steps: 3
   h: 2.5
   learned_cv: false
@@ -18,7 +19,7 @@ tm:
   num_completions_per_prompt: 5
   rescale_logits: false
   rwd_shift: -2.0
-  steps_per_h: 380 # this is the number of optimizer steps per h
+  steps_per_h: 383 # this is the number of optimizer steps per h
 
 #-----------------Optimizer Config-----------------
 adam_beta1: 0.9
@@ -26,7 +27,7 @@ adam_beta2: 0.99
 adam_epsilon: 1e-8
 weight_decay: 0.1
 
-max_grad_norm: 3.0
+max_grad_norm: 2.0
 learning_rate: 6e-6
 lr_decay_ratio: 0.1
 lr_min: 3e-6
@@ -56,6 +57,7 @@ peft_task_type: CAUSAL_LM
 #-----------------Logging and Checkpointing Config-----------------
 checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_long_noconf
 checkpoint_freq: 48  # in number of optimizer steps
+init_ckpt_path: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_long_noconf/checkpoint-a-2.500-8.0.ckpt
 metrics_log_every: 1
 resume_path: # /n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_small_h/checkpoint-a-0.900.ckpt
 # leave empty if not resuming
