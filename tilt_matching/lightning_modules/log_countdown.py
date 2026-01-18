@@ -8,6 +8,7 @@ from contextlib import contextmanager
 import itertools
 import wandb
 import re
+import json
 import bitsandbytes as bnb
 import torch
 import torch.nn.functional as F
@@ -15,6 +16,15 @@ import pytorch_lightning as pl
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from peft import LoraConfig, get_peft_model, PeftModelForCausalLM, get_peft_model_state_dict, set_peft_model_state_dict
+
+
+CTD_SYSTEM_PROMPT = """Respond in the following format:
+<reasoning>
+...
+</reasoning>
+<answer>
+...
+</answer>"""
 
 
 class TiltLogModule(pl.LightningModule):
@@ -68,6 +78,8 @@ class TiltLogModule(pl.LightningModule):
         self.log_counter = 1
         self.dict_for_logs = {}
         self.log_student_steps = self.hparams.tm.student_log_steps
+        self.student_logs_per_prompt = getattr(self.hparams.tm, "student_logs_per_prompt", 4)
+        self.validation_set = self.load_test_dataset()
         # micro-step metric accumulation
         self._micro_log_sums = {}
         self._micro_log_counts = {}
@@ -80,6 +92,17 @@ class TiltLogModule(pl.LightningModule):
         self.lr_warmup_ratio = getattr(self.hparams, "lr_warmup_ratio", 0)
         self.lr_min = getattr(self.hparams, "lr_min", 0.0)
         self._tm_sched_state = None
+
+    def load_test_dataset(self):
+        self.dataset = []
+        cur_path = os.path.dirname(os.path.abspath(__file__))
+        print(f"cur_path: {cur_path}")
+        with open(f"{cur_path}/../../dataset/countdown_cd3_test.jsonl", "r") as f:
+            for line in f:
+                self.dataset.append(json.loads(line))
+        
+        print(len(self.dataset), "examples loaded")
+        return self.dataset
 
     @contextmanager
     def _use_adapter(self, adapter_name: str):
@@ -336,7 +359,6 @@ class TiltLogModule(pl.LightningModule):
         self.log("ckpt_a", self.a, on_step=True, on_epoch=False, sync_dist=True)
         step_end_time = datetime.now()
         time_per_step = (step_end_time - step_start_time).total_seconds()   
-        print(f"Step taken: {time_per_step:.3f} seconds")
         return loss
 
     def _tm_step(self):
@@ -360,7 +382,8 @@ class TiltLogModule(pl.LightningModule):
             weights = self.reward_weights.to(device=self.device, dtype=rwds.dtype)
         rwd = torch.nansum(rwds * weights.unsqueeze(0), dim=1) # [B,]
         # Count totally correct samples so we can aggregate across micro-steps
-        correct_mask = torch.isclose(rwd, self.hparams.max_rwd * torch.ones_like(rwd), atol=1e-5, rtol=0.0)
+        correct_mask = torch.isclose(rwd, self.hparams.max_rwd * torch.ones_like(rwd), atol=1e-5, rtol=0.0) | \
+                       torch.isclose(rwd, self.hparams.max_rwd * self.hparams.scale_factor * torch.ones_like(rwd), atol=1e-5, rtol=0.0)
         correct_sum = correct_mask.sum().float()
         correct_count = torch.tensor(float(correct_mask.numel()), device=self.device)
         
@@ -427,7 +450,7 @@ class TiltLogModule(pl.LightningModule):
                 self.log_counter += 1
                 self.log("log_counter", self.log_counter, on_step=True, on_epoch=False, sync_dist=True)
                 print(f"logging counter is {self.log_counter}", flush=True)
-                self.logging_student(self.model, self.num_buffer_prompts, self.comps_per_prompt)
+                self.logging_student(self.model, self.num_buffer_prompts, self.student_logs_per_prompt)
 
             if self.global_step % self.steps_per_h == 0:
                 self._rebuild_buffer_next_phase = True
@@ -716,18 +739,11 @@ class TiltLogModule(pl.LightningModule):
 
     def logging_student(self, model, num_buffer_updates, num_completions_per_prompt):
         """
-        Partially update the replay buffer of generated sequences and their rewards.
-        - selects `num_buffer_updates` *distinct buffer rows* (along the first
-          dimension of `self.buffer`) starting at `self.buffer_update_counter`
-          (with wrap-around),
-        - generates new completions for fresh prompts for those rows,
-        - recomputes rewards for those new samples,
-        - writes them into `self.buffer` and `self.buffer_rewards`,
-        - and advances `self.buffer_update_counter`.
-
-        Shapes:
-          buffer shape: [num_buffer_prompts, num_completions_per_prompt, prompt_len + completion_len]
-          buffer_rewards shape: [num_buffer_prompts, num_completions_per_prompt, num_reward_funcs]
+        Evaluate the student model on the validation set.
+        - Distributes validation examples across GPUs
+        - Each GPU evaluates a subset of the validation set
+        - Generates completions and computes rewards
+        - Each prompt is completed only once (num_completions_per_prompt=1)
         """
         device = self.device
 
@@ -737,16 +753,72 @@ class TiltLogModule(pl.LightningModule):
         print(f"Start Logging Student ...")
         buffer_start_time = datetime.now()
 
-        # ---- 1. Prepare prompts as token IDs ----
-        update_rows = list(range(self.num_buffer_prompts))
-        self.buffer_update_counter = 0
-        # We don't persist student_buffer and student_rewards to save memory
-
-        prompt_ids = self._prepare_prompts(num_buffer_updates, num_completions_per_prompt)
+        # ---- 1. Distribute validation set across GPUs ----
+        global_world_size = getattr(self.trainer, "world_size", 1)
+        global_rank = getattr(self.trainer, "global_rank", 0)
+        
+        total_val_examples = len(self.validation_set)
+        examples_per_gpu = total_val_examples // global_world_size
+        start_idx = global_rank * examples_per_gpu
+        
+        # Last GPU takes any remainder
+        if global_rank == global_world_size - 1:
+            end_idx = total_val_examples
+        else:
+            end_idx = start_idx + examples_per_gpu
+        
+        # Get this GPU's subset of validation examples
+        val_subset_indices = list(range(start_idx, end_idx))
+        num_val_prompts = len(val_subset_indices)
+        
+        print(f"[GPU {global_rank}/{global_world_size}] Evaluating {num_val_prompts} validation examples (indices {start_idx} to {end_idx-1})")
+        
+        # ---- 2. Prepare prompts from validation set ----
+        structured_prompts = []
+        targets = []
+        numbers_list = []
+        
+        for idx in val_subset_indices:
+            val_entry = self.validation_set[idx]
+            # Extract target and numbers like in __getitem__
+            target = int(val_entry["output"])
+            numbers_str = val_entry["input"]
+            numbers = [int(num) for num in numbers_str.split(",")]
+            
+            # Create structured prompt matching countdown.py format
+            prompt_text = f"{CTD_SYSTEM_PROMPT}\nUsing only the numbers {numbers}, create an arithmetic expression that evaluates to exactly {target}. You must use all numbers from the list, and each number must be used exactly once. You may use the operations +, -, *, and / as needed. After reasoning, provide only your final expression inside <answer></answer> tags without including an equals sign or the target number. For example, if the numbers are [2, 3, 4] and the target is 5, a valid answer is: <answer>\n2*4-3\n</answer>"
+            structured_prompt = [{"role": "user", "content": prompt_text}]
+            
+            structured_prompts.append(structured_prompt)
+            targets.append(target)
+            numbers_list.append(numbers)
+        
+        # Convert structured prompts to text and tokenize
+        prompts_text = []
+        for sp in structured_prompts:
+            text = self.tokenizer.apply_chat_template(
+                sp,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            prompts_text.append(text)
+        
+        prompt_ids = self.tokenizer(
+            text=prompts_text,
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=self.hparams.max_prompt_length,
+            padding_side="left",
+            add_special_tokens=False,
+        )["input_ids"].to(device)
+        
+        # Repeat each prompt for num_completions_per_prompt completions
+        prompt_ids = prompt_ids.repeat_interleave(num_completions_per_prompt, dim=0)
         total_batch, prompt_len = prompt_ids.shape
 
         # ---- 2. Run diffusion generation to get prompt+completion sequences ----
-        chunk_size = max(1, min(self.hparams.tm.buffer_chunk_size, total_batch)//2)
+        chunk_size = max(1, min(self.hparams.tm.buffer_chunk_size, total_batch)//4)
         gen_length = self.hparams.max_completion_length
         seq_len = prompt_len + gen_length
         # pre-allocate
@@ -766,51 +838,41 @@ class TiltLogModule(pl.LightningModule):
                     block_length=self.hparams.block_length,
                     temperature=self.hparams.sampling_temperature,
                     cfg_scale=self.hparams.cfg_scale,
-                    remasking=self.hparams.remasking_strategy,
+                    remasking='low_confidence',
                 )  # [end-start, seq_len]
 
             prompt_completion_ids[start:end].copy_(chunk_completion_ids)
             del chunk_completion_ids
         
 
-        # ---- 3. Reshape into [num_updates, num_completions, seq_len] and update corresponding rows ----
-        # Note: We don't actually need to store student_buffer, we just need it temporarily for analysis
-        # So we can skip storing it entirely to save memory
-        new_buffer_block = prompt_completion_ids.view(num_buffer_updates, -1, seq_len)
-        # No longer storing in self.student_buffer to save memory
+        # ---- 4. Reshape into [num_val_prompts, num_completions, seq_len] ----
+        new_buffer_block = prompt_completion_ids.view(num_val_prompts, -1, seq_len)
         
-        # ---- 4. Decode completions to text for reward computation ----
+        # ---- 5. Decode completions to text for reward computation ----
         completion_ids = prompt_completion_ids[:, prompt_len:]  # [total_batch, gen_length]
         completions_text = self.tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
 
-        # ---- 5. Build reward inputs: prompts, completions, and extra dataset columns ----
-        data_keys = [key for key in self.training_prompts_dataset[0].keys() if key != "prompt"]
-        # For each generated sample we need:
-        #   - a structured prompt (list of chat messages)
-        #   - a structured completion (list with one assistant message)
-        #   - one entry per dataset column (e.g. "answer", "target", "numbers")
+        # ---- 6. Build reward inputs: prompts, completions, and extra dataset columns ----
+        # For validation, we use the actual targets and numbers from validation_set
         prompts_for_rewards = []
         completions_for_rewards = []
-        reward_kwargs = {key: [] for key in data_keys}
+        reward_kwargs = {"target": [], "numbers": []}
 
-        for row_idx in self._last_prompt_indices:
-            row = self.training_prompts_dataset[row_idx]
-            base_prompt = row["prompt"]  # list[{"role": ..., "content": ...}, ...]
-
+        for i in range(num_val_prompts):
             for _ in range(num_completions_per_prompt):
                 # Structured prompt for this completion
-                prompts_for_rewards.append(base_prompt)
-
-                # Copy all extra fields for this completion
-                for key in data_keys:
-                    reward_kwargs[key].append(row[key])
+                prompts_for_rewards.append(structured_prompts[i])
+                
+                # Add target and numbers for reward computation
+                reward_kwargs["target"].append(targets[i])
+                reward_kwargs["numbers"].append(numbers_list[i])
 
         # Turn plain completions into chat-style completions [{"role": "assistant", "content": "..."}]
         completions_for_rewards = []
         for text in completions_text:
             completions_for_rewards.append([{"role": "assistant", "content": text}])
 
-        # ---- 6. Compute rewards for every sequence in the buffer ----
+        # ---- 7. Compute rewards for every sequence ----
         num_funcs = len(self.reward_funcs)
         rewards_per_func = torch.zeros(total_batch, num_funcs, device=device)
 
@@ -829,22 +891,18 @@ class TiltLogModule(pl.LightningModule):
         del completions_for_rewards
         del reward_kwargs
         
-        #DEBUG: for a given prompt, with prob 0.20 print all the generated completions and their rewards
-        do_print = torch.rand(num_buffer_updates, device=device) < 0.20
-        for i in range(num_buffer_updates):
+        #DEBUG: for a given prompt, with prob 0.20 print the generated completion and reward
+        do_print = torch.rand(num_val_prompts, device=device) < 0.20
+        for i in range(num_val_prompts):
             if not do_print[i]:
                 continue
             
-            # Get the prompt index in the dataset
-            row_idx = self._last_prompt_indices[i]
-            row = self.training_prompts_dataset[row_idx]
-            
-            # Extract target and numbers for this prompt
-            target = row.get("target", None)
-            numbers = row.get("numbers", None)
+            # Get the validation data for this prompt
+            target = targets[i]
+            numbers = numbers_list[i]
             
             print(f"\n{'='*80}", flush=True)
-            print(f"Model = STUDENT", flush=True)
+            print(f"Model = STUDENT | Validation Example {val_subset_indices[i]}", flush=True)
             print(f"Target: {target} | Numbers: {numbers}", flush=True)
             print(f"{'='*80}\n", flush=True)
             
@@ -868,19 +926,17 @@ class TiltLogModule(pl.LightningModule):
                 print()
 
 
-        # Store as shape [num_buffer_updates, num_completions_per_prompt, num_funcs]
-        # We use the reshaped view directly for analysis and don't keep a reference
-        new_rewards_block = rewards_per_func.view(num_buffer_updates, -1, num_funcs)
-        # No longer storing in self.student_rewards to save memory
+        # Store as shape [num_val_prompts, num_completions_per_prompt, num_funcs]
+        new_rewards_block = rewards_per_func.view(num_val_prompts, -1, num_funcs)
 
         # Count how many entries have max reward, and how many have the format correct
         num_correct = (new_rewards_block >= self.hparams.max_rwd - 1e-5).sum().item()
-        frac_num_correct = num_correct / (num_buffer_updates * num_completions_per_prompt)  
-        print(f"[Student] Number of correct completions with max reward: {frac_num_correct:.2f}")
+        frac_num_correct = num_correct / (num_val_prompts * num_completions_per_prompt)  
+        print(f"[Student Validation] Number of correct completions with max reward: {frac_num_correct:.2f}")
 
         format_correct = (new_rewards_block >= self.hparams.format_rwd - 1e-5).sum().item()
-        frac_format_correct = format_correct / (num_buffer_updates * num_completions_per_prompt) - frac_num_correct
-        print(f"[Student] Number of correct completions with format reward: {frac_format_correct:.2f}")
+        frac_format_correct = format_correct / (num_val_prompts * num_completions_per_prompt) - frac_num_correct
+        print(f"[Student Validation] Number of correct completions with format reward: {frac_format_correct:.2f}")
 
         # Extract the number of correct equations that uses parenthesis ( )
         # and the number of correct equations that uses mutiplication *
@@ -891,7 +947,7 @@ class TiltLogModule(pl.LightningModule):
         num_div = 0
         num_add_subtract = 0
 
-        for i in range(num_buffer_updates):
+        for i in range(num_val_prompts):
             for j in range(num_completions_per_prompt):
                 global_idx = i * num_completions_per_prompt + j
 
@@ -912,17 +968,17 @@ class TiltLogModule(pl.LightningModule):
         
         num_add_subtract = num_correct - (num_paren + num_mult + num_div)
         
-        frac_num_paren = num_paren / (num_buffer_updates * num_completions_per_prompt)
-        frac_num_mult = num_mult / (num_buffer_updates * num_completions_per_prompt)
-        frac_num_div = num_div / (num_buffer_updates * num_completions_per_prompt)
-        frac_num_add_subtract = num_add_subtract / (num_buffer_updates * num_completions_per_prompt)
+        frac_num_paren = num_paren / (num_val_prompts * num_completions_per_prompt)
+        frac_num_mult = num_mult / (num_val_prompts * num_completions_per_prompt)
+        frac_num_div = num_div / (num_val_prompts * num_completions_per_prompt)
+        frac_num_add_subtract = num_add_subtract / (num_val_prompts * num_completions_per_prompt)
 
-        print(f"[Student] Number of correct equations with parenthesis: {frac_num_paren:.2f}")
-        print(f"[Student] Number of correct equations with multiplication: {frac_num_mult:.2f}")
-        print(f"[Student] Number of correct equations with division: {frac_num_div:.2f}")
-        print(f"[Student] Number of correct equations without special operators: {frac_num_add_subtract:.2f}")
+        print(f"[Student Validation] Number of correct equations with parenthesis: {frac_num_paren:.2f}")
+        print(f"[Student Validation] Number of correct equations with multiplication: {frac_num_mult:.2f}")
+        print(f"[Student Validation] Number of correct equations with division: {frac_num_div:.2f}")
+        print(f"[Student Validation] Number of correct equations without special operators: {frac_num_add_subtract:.2f}")
 
-        # log the 6 fracs to wandb
+        # log the 6 fracs to wandb (sync_dist=True will average across all GPUs)
         self.log("frac_num_correct", frac_num_correct, on_step=True, on_epoch=False, sync_dist=True)
         self.log("frac_format_correct", frac_format_correct, on_step=True, on_epoch=False, sync_dist=True)
         self.log("frac_num_paren", frac_num_paren, on_step=True, on_epoch=False, sync_dist=True)
@@ -933,14 +989,6 @@ class TiltLogModule(pl.LightningModule):
         buffer_end_time = datetime.now()
         buffer_build_time = (buffer_end_time - buffer_start_time).total_seconds()
         print(f"Logging Student finished, took {buffer_build_time}")
-
-        # Clean up all tensors to free GPU memory
-        del prompt_completion_ids
-        del completion_ids
-        del completions_text
-        del new_buffer_block
-        del new_rewards_block
-        del rewards_per_func
 
         # restore adapter
         model.set_adapter(prev_adapter)
