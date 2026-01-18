@@ -1,11 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=eval_sudoku
 #SBATCH --account=albergo_lab
-#SBATCH --partition=gpu
+#SBATCH --partition=gpu_requeue
+#SBATCH --constraint=[h100|h200]
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=4
+#SBATCH --gpus-per-node=2
 #SBATCH --mem=50GB
-#SBATCH --time=0:20:00
+#SBATCH --time=0:15:00
 #SBATCH --mail-type=END,FAIL,BEGIN
 #SBATCH --mail-user=yuyuanchen@math.harvard.edu
 
@@ -20,17 +21,18 @@ mkdir -p "$OUTPUT_DIR"
 export NCCL_SOCKET_FAMILY=AF_INET
 export NCCL_DEBUG=INFO
 
-srun --ntasks-per-node=1 --gpus-per-task=4 \
+srun --ntasks-per-node=1 --gpus-per-task=2 \
   torchrun \
     --standalone \
-    --nproc_per_node=4 \
+    --nproc_per_node=2 \
     eval.py \
     --dataset "sudoku" \
     --batch_size 4 \
     --gen_length 256 \
     --output_dir "$OUTPUT_DIR" \
     --model_path "/n/netscratch/albergo_lab/Everyone/frank/hf_models/LLaDA-8B-Instruct" \
-    --temperature 0.0 \
+    --temperature 0.3 \
+    --remasking "random" \
     --seed 42 \
     --diffusion_steps 128 \
     --few_shot 3

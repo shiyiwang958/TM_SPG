@@ -2,11 +2,11 @@
 #SBATCH --job-name=eval_gsm8k
 #SBATCH --account=albergo_lab
 #SBATCH --partition=gpu_requeue
-#SBATCH --constraint=[h100|h200]
+#SBATCH --constraint=[h200|h100]
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=1
+#SBATCH --gpus-per-node=2
 #SBATCH --mem=50GB
-#SBATCH --time=0:17:00
+#SBATCH --time=0:58:00
 #SBATCH --mail-type=END,FAIL,BEGIN
 #SBATCH --mail-user=yuyuanchen@math.harvard.edu
 
@@ -21,10 +21,10 @@ mkdir -p "$OUTPUT_DIR"
 export NCCL_SOCKET_FAMILY=AF_INET
 export NCCL_DEBUG=INFO
 
-srun --ntasks-per-node=1 --gpus-per-task=1 \
+srun --ntasks-per-node=1 --gpus-per-task=2 \
   torchrun \
     --standalone \
-    --nproc_per_node=1 \
+    --nproc_per_node=2 \
     eval.py \
     --dataset "gsm8k" \
     --batch_size 8 \
@@ -35,6 +35,6 @@ srun --ntasks-per-node=1 --gpus-per-task=1 \
     --seed 42 \
     --diffusion_steps 128 \
     --remasking "low_confidence" \
-    --num_prompts_gsm 256 \
+    --num_prompts_gsm -1 \
     --adapter "student" \
-    --checkpoint_path "/n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_long_noconf/checkpoint-a-2.500-2.0.ckpt"
+    --checkpoint_path "/n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_long_noconf/checkpoint-a-11.000-4.0.ckpt"

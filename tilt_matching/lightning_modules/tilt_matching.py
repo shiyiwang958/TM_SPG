@@ -161,6 +161,7 @@ class TiltMatchingModule(pl.LightningModule):
 
         resuming = bool(getattr(self, "_resuming_from_ckpt", False))
 
+        self._grad_accum_counter = 0
         if not resuming:
             # fresh run behavior
             self._grad_accum_counter = 0
@@ -170,7 +171,6 @@ class TiltMatchingModule(pl.LightningModule):
             return
 
         # ----- resume behavior -----
-        # DO NOT reset _grad_accum_counter
         # DO NOT overwrite optimizer lr (Lightning already restored it)
 
         # If scheduler state wasn't in the ckpt (older ckpts), reconstruct it without changing LR:
@@ -197,9 +197,10 @@ class TiltMatchingModule(pl.LightningModule):
         return opt
     
     def on_train_batch_start(self, batch, batch_idx):
-        if self.global_step == 0 and self._grad_accum_counter == 0:
+        if self.buffer is None:
             self._update_buffer(self.model, self.num_buffer_prompts, self.comps_per_prompt)
             print(f"[DEBUG] Buffer initialized with shape {self.buffer.shape}")
+            print(self.curr_prompt_counter)
         # If we scheduled a full buffer rebuild at the end of the previous h-phase,
         # do it now (i.e., at the start of the new h-phase), after checkpointing.
         if getattr(self, "_rebuild_buffer_next_phase", False):
@@ -303,8 +304,8 @@ class TiltMatchingModule(pl.LightningModule):
             batch: Dummy batch (not used).
             batch_idx: Index of the batch (not used).
         """
-        if dist.is_initialized():
-            assert dist.get_world_size() == 8, f"world_size={dist.get_world_size()} (expected 8)"
+        # if dist.is_initialized():
+        #     assert dist.get_world_size() == 8, f"world_size={dist.get_world_size()} (expected 8)"
         opt = self.tm_opt
         accum = self.hparams.tm.grad_accum_steps
 
@@ -458,8 +459,8 @@ class TiltMatchingModule(pl.LightningModule):
         with self._use_adapter("student"):
             curr_logits = self._new_forward(self.model, xts, gen_length) # [B, gen_length, V]
         if temp > 0.0 and self.hparams.tm.rescale_logits:
-            old_logits  /= temp
-            curr_logits /= temp
+            old_logits /= temp
+            # curr_logits /= temp
         old_probs = F.softmax(old_logits, dim=-1) # [B, gen_length, V]
         with torch.no_grad():
             curr_probs_ng = F.softmax(curr_logits, dim=-1)  # [B, gen_length, V]
@@ -502,11 +503,15 @@ class TiltMatchingModule(pl.LightningModule):
         # residual to one-hot: 1 - p_true, averaged over masked positions
         residual_onehot = (1.0 - p_true)[mask_indices.bool()].mean()
 
+        if temp > 0.0 and self.hparams.tm.rescale_logits:
+            old_logits_for_logging = old_logits * temp
+        else:
+            old_logits_for_logging = old_logits
         log_dict = {
             f"train/loss": loss,
             f"train/a": self.a,
             f"train/h": self.h,
-            f"train/drift_gap_kl": self._kl_from_logits(old_logits, curr_logits, mask_indices),
+            f"train/drift_gap_kl": self._kl_from_logits(old_logits_for_logging, curr_logits, mask_indices),
             f"train/rwd_max": rwd.max(),
             f"train/rwd_min": rwd.min(),
             f"train/rwd_mean": rwd.mean(),
@@ -536,14 +541,14 @@ class TiltMatchingModule(pl.LightningModule):
                     avg_rwd_eval = rwds_eval.sum(dim=-1).mean() # [N_eval,]
                     self.dict_for_logs["eval/correct_frac"] = correct_frac_eval
                     self.dict_for_logs["eval/avg_rwd"] = avg_rwd_eval
-                    seen_rwds = rwds_eval.sum(dim=-1)[: rwds_eval.shape[0] // 2]
-                    self.dict_for_logs["eval/seen_prompts_rwd_mean"] = seen_rwds.mean()
-                    correct_frac_seen = torch.isclose(rwds_eval[: rwds_eval.shape[0] // 2, -1], 2.0 * torch.ones_like(rwds_eval[: rwds_eval.shape[0] // 2, -1]), atol=1e-6, rtol=0.0).float().mean()
-                    self.dict_for_logs["eval/seen_prompts_correct_frac"] = correct_frac_seen
-                    unseen_rwds = rwds_eval.sum(dim=-1)[rwds_eval.shape[0] // 2 :]
-                    self.dict_for_logs["eval/unseen_prompts_rwd_mean"] = unseen_rwds.mean()
-                    correct_frac_unseen = torch.isclose(rwds_eval[rwds_eval.shape[0] // 2 :, -1], 2.0 * torch.ones_like(rwds_eval[rwds_eval.shape[0] // 2 :, -1]), atol=1e-6, rtol=0.0).float().mean()
-                    self.dict_for_logs["eval/unseen_prompts_correct_frac"] = correct_frac_unseen
+                    # seen_rwds = rwds_eval.sum(dim=-1)[: rwds_eval.shape[0] // 2]
+                    # self.dict_for_logs["eval/seen_prompts_rwd_mean"] = seen_rwds.mean()
+                    # correct_frac_seen = torch.isclose(rwds_eval[: rwds_eval.shape[0] // 2, -1], 2.0 * torch.ones_like(rwds_eval[: rwds_eval.shape[0] // 2, -1]), atol=1e-6, rtol=0.0).float().mean()
+                    # self.dict_for_logs["eval/seen_prompts_correct_frac"] = correct_frac_seen
+                    # unseen_rwds = rwds_eval.sum(dim=-1)[rwds_eval.shape[0] // 2 :]
+                    # self.dict_for_logs["eval/unseen_prompts_rwd_mean"] = unseen_rwds.mean()
+                    # correct_frac_unseen = torch.isclose(rwds_eval[rwds_eval.shape[0] // 2 :, -1], 2.0 * torch.ones_like(rwds_eval[rwds_eval.shape[0] // 2 :, -1]), atol=1e-6, rtol=0.0).float().mean()
+                    # self.dict_for_logs["eval/unseen_prompts_correct_frac"] = correct_frac_unseen
                     print(f"[EVAL] At global step {self.global_step}, for gpu {self.global_rank}, student correctness fraction: {correct_frac_eval:.4f}, avg reward: {avg_rwd_eval:.4f}")
                 else:
                     raise NotImplementedError("Eval only implemented for gsm8k dataset")
@@ -1573,13 +1578,13 @@ class TiltMatchingModule(pl.LightningModule):
         prev_adapter = self.model.active_adapter
         prev_training = self.model.training  # True if model was in train() mode
         self.model.set_adapter("student")
-        # self.model.eval()
+        self.model.eval()
 
         print(f"evaluating student ...")
         eval_start_time = datetime.now()
 
         # ---- 1. Prepare prompts as token IDs ----
-        prompt_ids = self._prepare_prompts_for_eval(num_buffer_eval, num_buffer_eval // 2)
+        prompt_ids = self._prepare_prompts_for_eval(num_buffer_eval, 0)
         total_batch, prompt_len = prompt_ids.shape
 
         # ---- 2. Run diffusion generation to get prompt+completion sequences ----
@@ -1601,9 +1606,9 @@ class TiltMatchingModule(pl.LightningModule):
                     steps=self.hparams.diffusion_steps,
                     gen_length=gen_length,
                     block_length=self.hparams.block_length,
-                    temperature=self.hparams.sampling_temperature,
+                    temperature=0.0,
                     cfg_scale=self.hparams.cfg_scale,
-                    remasking=self.hparams.remasking_strategy,
+                    remasking="low_confidence"
                 )  # [end-start, seq_len]
 
             prompt_completion_ids[start:end].copy_(chunk_completion_ids)
@@ -1669,8 +1674,8 @@ class TiltMatchingModule(pl.LightningModule):
         print(f"Finished evaluating student, took {eval_time}")
 
         # restore adapter and training state
-        # if prev_training:
-        #     self.model.train()
+        if prev_training:
+            self.model.train()
         self.model.set_adapter(prev_adapter)
 
         return rewards_per_func # [num_buffer_eval, num_reward_funcs]

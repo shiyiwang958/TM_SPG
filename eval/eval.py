@@ -223,7 +223,7 @@ if __name__ == "__main__":
 
     args.diffusion_steps = args.gen_length // 2
     # How many eval examples to consume per dataset (-1 means full split)
-    num_evals = {"gsm8k": args.num_prompts_gsm, "math": -1, "countdown": 256, "sudoku": 64}
+    num_evals = {"gsm8k": args.num_prompts_gsm, "math": -1, "countdown": 256, "sudoku": 256}
 
     if len(args.checkpoint_path):
         # Encode checkpoint identity in output filenames
