@@ -3,7 +3,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from datasets import load_dataset, Dataset
+from datasets import load_dataset, Dataset, Value
 import pandas as pd
 from reward_func import extract_hash_answer
 
@@ -76,7 +76,7 @@ short_example_3 = "Question:\nSolve the following Sudoku puzzle: 200140300200142
 def get_gsm8k_questions(split="train") -> Dataset:
     data = load_dataset("openai/gsm8k", "main")[split]
 
-    # Remove a few questions that are too long (we set max_prompt_length to be 200 tokens)
+    # Remove a few questions that are too long (we set max_prompt_length to be 240 tokens)
     data = data.add_column("_idx", list(range(len(data))))
     data = data.filter(lambda x: x["_idx"] not in [399, 636, 839, 1202, 1647, 1764, 2161, 2345, 3331, 4670, 5918, 1376, 1527, 1542, 3436, 3625, 4560, 5744])
     data = data.remove_columns(["_idx"])
@@ -156,8 +156,31 @@ def get_sudoku_questions_new(few_shot=0) -> Dataset:
         }
     )
 
+TYPE_TO_ID = {
+    "Algebra": 0,
+    "Intermediate Algebra": 1,
+    "Prealgebra": 2,
+    "Geometry": 3,
+    "Number Theory": 4,
+    "Counting & Probability": 5,
+    "Precalculus": 6,
+}
+
+ID_TO_TYPE = {
+    0: "Algebra",
+    1: "Intermediate Algebra",
+    2: "Prealgebra",
+    3: "Geometry",
+    4: "Number Theory",
+    5: "Counting & Probability",
+    6: "Precalculus",
+}
+
 def get_math_questions(split="train") -> Dataset:
     data = load_dataset("ankner/math-500", split=split)  # type: ignore
+    def to_int(level: str) -> int:
+        x = level.strip().removeprefix("Level ").strip()
+        return 6 if x == "?" else int(x)
     data = data.map(
         lambda x: {  # type: ignore
             "prompt": [
@@ -168,6 +191,141 @@ def get_math_questions(split="train") -> Dataset:
                 },
             ],
             "answer": x["solution"],
-        }
+            "level": to_int(x["level"]),
+            "type": TYPE_TO_ID[x["type"]],
+        },
+        remove_columns=["solution", "problem"]
     )
+    # Remove a few questions that are too long (we set max_prompt_length to be 200 tokens)
+    data = data.add_column("_idx", list(range(len(data))))
+    data = data.filter(lambda x: x["_idx"] not in [47, 67, 106, 261, 299, 324, 374, 513, 520, 543, 544, 579, 586, 598, 645, 720, 951, 963, 1016, 1023, 1170, 1210, 1211, 1308, 1507, 1518, 1531, 1562, 1581, 1587, 1636, 1665, 1723, 1773, 1818, 1839, 1862, 1933, 2008, 2011, 2029, 2046, 2049, 2132, 2171, 2185, 2268, 2278, 2286, 2388, 2412, 2434, 2500, 2644, 2663, 2680, 2681, 2737, 2842, 2899, 2919, 2938, 2963, 2965, 3103, 3148, 3243, 3385, 3441, 3464, 3471, 3477, 3488, 3491, 3538, 3555, 3557, 3566, 3656, 3773, 3813, 3925, 3930, 3945, 4014, 4059, 4079, 4106, 4112, 4156, 4197, 4221, 4231, 4271, 4273, 4290, 4323, 4332, 4340, 4361, 4401, 4424, 4512, 4555, 4583, 4588, 4590, 4599, 4784, 4788, 4800, 4801, 4807, 4828, 4880, 4886, 4928, 4959, 4991, 4999, 5004, 5011, 5025, 5093, 5191, 5198, 5201, 5257, 5260, 5292, 5419, 5436, 5452, 5459, 5476, 5495, 5513, 5562, 5595, 5617, 5777, 5823, 5868, 5878, 5893, 5961, 5998, 5999, 6062, 6081, 6155, 6192, 6203, 6229, 6254, 6257, 6274, 6311, 6449, 6486, 6501, 6554, 6556, 6574, 6620, 6646, 6669, 6707, 6712, 6787, 6825, 6859, 6869, 6908, 6920, 7150, 7220, 7230, 7269, 7286, 7347, 7379, 7399, 7431, 7469, 7478, 7547, 7567])
+    data = data.remove_columns(["_idx"])
     return data
+
+
+"""
+    Train set:
+    Longer than 600:
+    num prompts of length between 600 and 620: 0
+    Longer than 580:
+    num prompts of length between 580 and 600: 71
+    Longer than 560:
+    num prompts of length between 560 and 580: 5
+    Longer than 540:
+    num prompts of length between 540 and 560: 4
+    Longer than 520:
+    num prompts of length between 520 and 540: 10
+    Longer than 500:
+    num prompts of length between 500 and 520: 13
+    Longer than 480:
+    num prompts of length between 480 and 500: 11
+    Longer than 460:
+    num prompts of length between 460 and 480: 12
+    Longer than 440:
+    num prompts of length between 440 and 460: 18
+    Longer than 420:
+    num prompts of length between 420 and 440: 23
+    Longer than 400:
+    num prompts of length between 400 and 420: 20
+    Longer than 380:
+    num prompts of length between 380 and 400: 38
+    Longer than 360:
+    num prompts of length between 360 and 380: 41
+    Longer than 340:
+    num prompts of length between 340 and 360: 49
+    Longer than 320:
+    num prompts of length between 320 and 340: 65
+    Longer than 300:
+    num prompts of length between 300 and 320: 57
+    Longer than 280:
+    num prompts of length between 280 and 300: 59
+    Longer than 260:
+    num prompts of length between 260 and 280: 79
+    Longer than 240:
+    num prompts of length between 240 and 260: 105
+    Longer than 220:
+    num prompts of length between 220 and 240: 117
+    Longer than 200:
+    num prompts of length between 200 and 220: 173
+    Longer than 180:
+    num prompts of length between 180 and 200: 234
+    Longer than 160:
+    num prompts of length between 160 and 180: 477
+    Longer than 140:
+    num prompts of length between 140 and 160: 891
+    Longer than 120:
+    num prompts of length between 120 and 140: 1704
+    Longer than 100:
+    num prompts of length between 100 and 120: 2371
+    Longer than 80:
+    num prompts of length between 80 and 100: 953
+    Longer than 60:
+    num prompts of length between 60 and 80: 0
+    Longer than 40:
+    num prompts of length between 40 and 60: 0
+    Longer than 20:
+    num prompts of length between 20 and 40: 0
+"""
+"""
+Eval set:
+Longer than 600:
+num prompts of length between 600 and 620: 0
+Longer than 580:
+num prompts of length between 580 and 600: 1
+Longer than 560:
+num prompts of length between 560 and 580: 0
+Longer than 540:
+num prompts of length between 540 and 560: 0
+Longer than 520:
+num prompts of length between 520 and 540: 0
+Longer than 500:
+num prompts of length between 500 and 520: 2
+Longer than 480:
+num prompts of length between 480 and 500: 0
+Longer than 460:
+num prompts of length between 460 and 480: 1
+Longer than 440:
+num prompts of length between 440 and 460: 5
+Longer than 420:
+num prompts of length between 420 and 440: 3
+Longer than 400:
+num prompts of length between 400 and 420: 0
+Longer than 380:
+num prompts of length between 380 and 400: 2
+Longer than 360:
+num prompts of length between 360 and 380: 2
+Longer than 340:
+num prompts of length between 340 and 360: 4
+Longer than 320:
+num prompts of length between 320 and 340: 4
+Longer than 300:
+num prompts of length between 300 and 320: 2
+Longer than 280:
+num prompts of length between 280 and 300: 3
+Longer than 260:
+num prompts of length between 260 and 280: 5
+Longer than 240:
+num prompts of length between 240 and 260: 10
+Longer than 220:
+num prompts of length between 220 and 240: 6
+Longer than 200:
+num prompts of length between 200 and 220: 9
+Longer than 180:
+num prompts of length between 180 and 200: 18
+Longer than 160:
+num prompts of length between 160 and 180: 38
+Longer than 140:
+num prompts of length between 140 and 160: 75
+Longer than 120:
+num prompts of length between 120 and 140: 134
+Longer than 100:
+num prompts of length between 100 and 120: 201
+Longer than 80:
+num prompts of length between 80 and 100: 75
+Longer than 60:
+num prompts of length between 60 and 80: 0
+Longer than 40:
+num prompts of length between 40 and 60: 0
+Longer than 20:
+num prompts of length between 20 and 40: 0
+"""

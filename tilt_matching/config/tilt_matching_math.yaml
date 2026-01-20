@@ -1,0 +1,77 @@
+#-----------------Tilt Matching Training Config-----------------
+tm:
+  a_end: 100.0
+  a_start: 0.0
+  buffer_chunk_size: 40
+  buffer_refresh_steps: 2 # 16
+  buffer_print_samples: 4   # 0 disables printing
+  control_variate: 1.0
+  control_variate_ema: 0.05
+  eval_num_prompts: 32
+  eval_student_every: 48
+  grad_accum_steps: 1 #5
+  h: 0.5
+  learned_cv: false
+  loss_type: itm
+  num_batch_prompts: 1 # 4
+  num_buffer_prompts: 4 #60
+  num_buffer_refresh: 1 #20
+  num_completions_per_prompt: 2 # 4
+  rescale_logits: false
+  rwd_shift: 0.0
+  steps_per_h: 480 # this is the number of optimizer steps per h
+  student_ema_beta: 0.95
+  student_ema_start_step: 1
+  use_student_ema: true
+
+#-----------------Optimizer Config-----------------
+adam_beta1: 0.9
+adam_beta2: 0.99
+adam_epsilon: 1e-8
+weight_decay: 0.1
+
+max_grad_norm: 2.0
+learning_rate: 4e-6
+lr_decay_ratio: 0.1
+lr_min: 2e-6
+lr_scheduler_type: linear
+lr_warmup_ratio: 0.0
+
+#-----------------Diffusion Generation Config-----------------
+block_length: 32
+cfg_scale: 0.0
+diffusion_steps: 128
+max_completion_length: 256
+max_prompt_length: 399
+remasking_strategy: random # or low_confidence
+sampling_temperature: 1.0
+
+#-----------------Model Config-----------------
+use_peft: true
+torch_dtype: bfloat16
+load_in_4bit: true
+base_model_path: /n/netscratch/albergo_lab/Everyone/frank/hf_models/LLaDA-8B-Instruct
+
+lora_r: 128
+lora_alpha: 64
+lora_dropout: 0.05
+peft_task_type: CAUSAL_LM
+
+#-----------------Logging and Checkpointing Config-----------------
+checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/math
+checkpoint_freq: 48  # in number of optimizer steps
+init_ckpt_path: # /n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_long_noconf/checkpoint-a-5.000-7.0.ckpt
+metrics_log_every: 1
+resume_path: # /n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_noconf_smallh_temp1_medLR/checkpoint-a-2.500-30.0.ckpt
+# leave empty if not resuming
+wandb:
+  entity: "yuyuanchen-harvard-university"
+  project: "LLaDA_TM"
+  name: "test"
+
+#-----------------Other Training Config-----------------
+dataset: "math"
+few_shot: 0
+seed: 42
+nodes: 1
+devices: 1  # 8? 4?

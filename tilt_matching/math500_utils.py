@@ -26,7 +26,9 @@ def boxed_in_answer(prompts, completions, answer, step=None, **kwargs):
         except:
             reward += 0.0
 
-        reward += 1.0 if "\boxed" in r else 0.5
+        # reward += 1.0 if "\\boxed" in r else 0.5
+        if "\\boxed" in r:
+            reward += 0.5
         rewards.append(reward)
     return rewards
 

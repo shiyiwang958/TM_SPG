@@ -190,10 +190,12 @@ def train(cfg: DictConfig):
         reward_functions = [sudoku_reward_func]
     elif cfg.dataset == "math":
         dataset = get_math_questions("train")
+        # The columns are: 'level' (int), 'type' (int), 'prompt', 'answer'
         reward_functions = [
             correctness_reward_func_math,
             boxed_and_answer_tags_format_reward,
         ]
+        test_dataset = get_math_questions("test")
 
     # Shuffle dataset with fixed seed for reproducibility
     dataset = dataset.shuffle(seed=cfg.seed)
@@ -330,7 +332,7 @@ def train(cfg: DictConfig):
 
 
 #-------------------------------- Train ------------------------------------
-@hydra.main(config_path = "config", config_name = "tilt_matching_local.yaml")
+@hydra.main(config_path = "config", config_name = "tilt_matching_math.yaml")
 def main(cfg: DictConfig):
     train(cfg)
 

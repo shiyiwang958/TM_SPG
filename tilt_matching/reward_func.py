@@ -402,7 +402,7 @@ def sudoku_reward_func(prompts, completions, run_name=None, step=None, rank=None
 def correctness_reward_func_math(
     prompts, completions, answer, step=None, run_name=None, **kwargs
 ) -> list[float]:
-    boxed_in_answer_rewards = boxed_in_answer(prompts, completions, answer, step=step)
+    # boxed_in_answer_rewards = boxed_in_answer(prompts, completions, answer, step=step)
     responses = [completion[0]["content"] for completion in completions]
     q = prompts[0][-1]["content"]
     extracted_responses = []
