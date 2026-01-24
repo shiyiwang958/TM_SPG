@@ -46,6 +46,9 @@ class TiltMatchingModule(pl.LightningModule):
         self.model = peft_wrapped
 
         self.curr_prompt_counter = 0
+        self.curr_easy_prompt_counter = 0
+        self.curr_hard_prompt_counter = 0
+        self.math_easy_split_idx = getattr(self.hparams, "math_split_idx", None)
         self.training_prompts_dataset = training_prompts_dataset
         self.training_prompts_dataset_len = len(self.training_prompts_dataset)
         self.test_prompts_dataset = test_prompts_dataset
@@ -71,7 +74,11 @@ class TiltMatchingModule(pl.LightningModule):
         self.buffer_rewards = None
         self.level_and_type = None
         self._rebuild_buffer_next_phase = False
-        self.num_buffer_prompts = self.hparams.tm.num_buffer_prompts
+        self.num_buffer_prompts_base = int(self.hparams.tm.num_buffer_prompts)
+        if self.hparams.dataset == "math":
+            self.num_buffer_prompts = self.num_buffer_prompts_base + ((self.num_buffer_prompts_base + 1) // 2)
+        else:
+            self.num_buffer_prompts = self.num_buffer_prompts_base
         self.comps_per_prompt = self.hparams.tm.num_completions_per_prompt
         self.buffer_update_counter = 0
         self.ckpt_counter = 0
@@ -318,13 +325,13 @@ class TiltMatchingModule(pl.LightningModule):
             self.log_dict(self.dict_for_logs, on_step=True, on_epoch=False, sync_dist=True)
             self._do_first_eval = False
         if self.buffer is None:
-            self._update_buffer(self.model, self.num_buffer_prompts, self.comps_per_prompt)
+            self._update_buffer(self.model, self.num_buffer_prompts_base, self.comps_per_prompt)
             print(f"[DEBUG] Buffer initialized with shape {self.buffer.shape}")
-            print(self.curr_prompt_counter)
+            print(f"[DEBUG] current prompt counter is: {self.curr_prompt_counter}")
         # If we scheduled a full buffer rebuild at the end of the previous h-phase,
         # do it now (i.e., at the start of the new h-phase), after checkpointing.
         if getattr(self, "_rebuild_buffer_next_phase", False):
-            self._update_buffer(self.model, self.num_buffer_prompts, self.comps_per_prompt)
+            self._update_buffer(self.model, self.num_buffer_prompts_base, self.comps_per_prompt)
             print(f"[DEBUG] Buffer built at start of new h-phase (global step {self.global_step}) with shape {self.buffer.shape}")
             self._rebuild_buffer_next_phase = False
         # print("on_train_batch_start complete")
@@ -571,6 +578,12 @@ class TiltMatchingModule(pl.LightningModule):
         # Aggregate rewards from multiple functions
         if self.reward_weights is None:
             weights = torch.ones(rwds.shape[1], device=self.device, dtype=rwds.dtype)
+            # if self.hparams.dataset == "gsm8k":
+            #     assert rwds.shape[1] == 5, f"Expected 5 reward functions for gsm8k, got {rwds.shape[1]}"
+            #     weights = torch.tensor([0.25, 0.0, 0.0, 0.25, 1.0], device=self.device, dtype=rwds.dtype)
+            if self.hparams.dataset == "math":
+                assert rwds.shape[1] == 2, f"Expected 2 reward functions for gsm8k, got {rwds.shape[1]}"
+                weights = torch.tensor([1.0, 0.25], device=self.device, dtype=rwds.dtype)
         else:
             weights = self.reward_weights.to(device=self.device, dtype=rwds.dtype)
         rwd = torch.nansum(rwds * weights.unsqueeze(0), dim=1) # [B,]
@@ -763,7 +776,7 @@ class TiltMatchingModule(pl.LightningModule):
                     eval_num_prompts = self.hparams.tm.eval_num_prompts
                     if self.hparams.dataset == "gsm8k" and self.a >= 6:
                         eval_num_prompts = 160
-                    elif self.hparams.dataset == "math" and self.a >= 2:
+                    elif self.hparams.dataset == "math" and self.a >= 4:
                         eval_num_prompts = 55
                     rwds_eval = self._eval_student(eval_num_prompts) # [N_eval, num_reward_funcs]
                 if self.hparams.dataset == "gsm8k":
@@ -833,6 +846,9 @@ class TiltMatchingModule(pl.LightningModule):
         checkpoint["tm_sched_state"] = copy.deepcopy(getattr(self, "_tm_sched_state", None))
         checkpoint["step_counter"] = self._step_counter + 1
         checkpoint["ckpt_counter"] = self.ckpt_counter
+        checkpoint["easy_prompt_counter"] = int(getattr(self, "curr_easy_prompt_counter", 0))
+        checkpoint["hard_prompt_counter"] = int(getattr(self, "curr_hard_prompt_counter", 0))
+
         if self.student_ema_enabled and (self._student_ema_state is not None):
             checkpoint["student_ema_state"] = {k: v.detach().to("cpu") for k, v in self._student_ema_state.items()}
 
@@ -847,53 +863,186 @@ class TiltMatchingModule(pl.LightningModule):
         self._step_counter = checkpoint.get("step_counter", 0)
         self._resuming_from_ckpt = True
         self.ckpt_counter = checkpoint.get("ckpt_counter", 0)
+        self.curr_easy_prompt_counter = int(checkpoint.get("easy_prompt_counter", 0))
+        self.curr_hard_prompt_counter = int(checkpoint.get("hard_prompt_counter", 0))
         ema = checkpoint.get("student_ema_state", None)
         if ema is not None:
             # Keep on CPU for now; move to device in on_train_start
             self._student_ema_loaded_cpu = OrderedDict((k, v) for k, v in ema.items())
             self._student_ema_state = None
 
-    def _prepare_prompts(self, num_distinct_prompts, num_completions_per_prompts):
-        """
-        Select `num_distinct_prompts` prompts from `self.training_prompts_dataset`,
-        starting at `self.curr_prompt_counter`, repeat each prompt for
-        `num_completions_per_prompts` times, and return a tensor of token IDs
-        ready to be passed to `self._generate`.
+    # def _prepare_prompts(self, num_distinct_prompts, num_completions_per_prompts):
+    #     """
+    #     Select `num_distinct_prompts` prompts from `self.training_prompts_dataset`,
+    #     starting at `self.curr_prompt_counter`, repeat each prompt for
+    #     `num_completions_per_prompts` times, and return a tensor of token IDs
+    #     ready to be passed to `self._generate`.
 
-        Returns: input_ids: torch.Tensor
-            Shape: [num_distinct_prompts * num_completions_per_prompts, prompt_length]
+    #     Returns: input_ids: torch.Tensor
+    #         Shape: [num_distinct_prompts * num_completions_per_prompts, prompt_length]
+    #     """
+    #     # Get DDP info (defaults to 1 if not distributed)
+    #     world_size = self.trainer.world_size
+    #     global_rank = self.trainer.global_rank
+
+    #     # ---- 1. Choose distinct prompt indices (with wrap-around) ----
+    #     indices = []
+    #     # if self.hparams.dataset == "math":
+    #     #     for offset in range(num_distinct_prompts // 2):
+    #     #         #TODO: CHECK CURR_PROMPT_COUNTER
+    #     #         idx_easy = (self.easy_prompt_counter + (offset * world_size * 2) + global_rank) % self.hparams.math_split_index
+    #     #         idx_hard = (self.hard_prompt_counter + (offset * world_size * 2) + global_rank) % (self.training_prompts_dataset_len - self.hparams.math_split_index)
+    #     #         indices.append(idx_easy)
+    #     #         indices.append(idx_hard + self.hparams.math_split_index)
+    #     #         indices.append(idx_hard + self.hparams.math_split_index)
+    #     #         self.easy_prompt_counter = (self.easy_prompt_counter + num_distinct_prompts // 2 * world_size) % self.hparams.math_split_index
+    #     #         self.hard_prompt_counter = (self.hard_prompt_counter + num_distinct_prompts // 2 * world_size) % (self.training_prompts_dataset_len - self.hparams.math_split_index)
+    #     # else:
+    #     for offset in range(num_distinct_prompts):
+    #         idx = (self.curr_prompt_counter + (offset * world_size) + global_rank) % self.training_prompts_dataset_len
+    #         indices.append(idx)
+    #     self.curr_prompt_counter += (num_distinct_prompts * world_size)
+    #     self.curr_prompt_counter %= self.training_prompts_dataset_len
+    #     # Remember which dataset rows were used, for reward computation later
+    #     self._last_prompt_indices = indices
+
+    #     # ---- 2. Extract structured prompts from the dataset ----
+    #     structured_prompts = [self.training_prompts_dataset[i]["prompt"] for i in indices]
+    #     if self.hparams.dataset == "math":
+    #         level_and_type_list = [(self.training_prompts_dataset[i]["level"], self.training_prompts_dataset[i]["type"]) for i in indices]
+    #         level_and_type = torch.tensor(level_and_type_list, dtype=torch.long).to(self.device).unsqueeze(1).expand(-1, num_completions_per_prompts, -1)
+    #         # [num_distinct_prompts, num_completions_per_prompts, 2]
+    #     else:
+    #         level_and_type = None
+
+    #     # ---- 3. Convert structured prompts to plain text and tokenize ----
+    #     prompts_text = []
+    #     for sp in structured_prompts:
+    #         if isinstance(sp, list):
+    #             # Typical case for Sudoku / GSM8K / math: [{"role": "...", "content": "..."}]
+    #             text = self.tokenizer.apply_chat_template(sp, tokenize=False, add_generation_prompt=True)
+    #         else:
+    #             raise TypeError(f"Unsupported prompt type {type(sp)} in training_prompts_dataset")
+    #         prompts_text.append(text)
+    #         # print(text)
+
+    #     input_ids = self.tokenizer(
+    #         text=prompts_text,
+    #         return_tensors="pt",
+    #         padding="max_length",
+    #         truncation=True,
+    #         max_length=self.hparams.max_prompt_length,
+    #         padding_side="left",
+    #         add_special_tokens=False,
+    #     )["input_ids"].to(self.device)
+
+    #     # if getattr(self.hparams, "test_prompt_length", False):
+    #     #     # Determining the best max_prompt_length:
+    #     #     sentinel = 126081
+    #     #     starts_ok = (input_ids[:, 0] == sentinel)
+    #     #     neq = (input_ids != sentinel)
+    #     #     has_any_neq = neq.any(dim=1)  
+    #     #     first_neq_pos = neq.int().argmax(dim=1)
+    #     #     A = torch.where(has_any_neq, first_neq_pos, torch.full_like(first_neq_pos, input_ids.size(1)))
+    #     #     false_idx = torch.nonzero(~starts_ok, as_tuple=True)[0]  # 1D [N]
+    #     #     print(false_idx.tolist())
+    #     #     prev_len = 0
+    #     #     for threshold in range(0, 40, 2):
+    #     #         idx = torch.nonzero(A < threshold, as_tuple=True)[0]  # [N] indices into A
+    #     #         print(f"Longer than {self.hparams.max_prompt_length - threshold}:")
+    #     #         print(idx.tolist())
+    #     #         print(f"num prompts of length between {self.hparams.max_prompt_length - threshold} and {self.hparams.max_prompt_length - threshold + 20}: {len(idx.tolist()) - prev_len}")
+    #     #         prev_len = len(idx.tolist())
+
+    #     return input_ids.repeat_interleave(num_completions_per_prompts, dim=0), level_and_type
+
+    def _prepare_prompts(self, num_base_prompts, num_completions_per_prompts):
+        """
+        Select prompts from `self.training_prompts_dataset`, repeat each prompt for
+        `num_completions_per_prompts` times, and return a tensor of token IDs ready
+        to be passed to `self._generate`.
+
+        For non-math datasets: we select `num_base_prompts` prompts sequentially.
+
+        For the math dataset: we select half easy + half hard (easy: level<=2,
+        hard: level>=3, based on `self.math_easy_split_idx`), then *repeat the hard
+        prompts twice*.
+
+        num_easy = floor(num_base_prompts/2)
+        num_hard = num_base_prompts - num_easy
+        num_effective = num_easy + 2*num_hard = num_base_prompts + ceil(num_base_prompts/2)
+
+        Returns:
+            input_ids: torch.Tensor
+                Shape: [num_effective_prompts * num_completions_per_prompts, prompt_length]
+            level_and_type: Optional[torch.Tensor]
+                If math: [num_effective_prompts, num_completions_per_prompts, 2]
+            num_effective_prompts: int
         """
         # Get DDP info (defaults to 1 if not distributed)
         world_size = self.trainer.world_size
         global_rank = self.trainer.global_rank
 
         # ---- 1. Choose distinct prompt indices (with wrap-around) ----
-        indices = []
-        # if self.hparams.dataset == "math":
-        #     for offset in range(num_distinct_prompts // 2):
-        #         #TODO: CHECK CURR_PROMPT_COUNTER
-        #         idx_easy = (self.easy_prompt_counter + (offset * world_size * 2) + global_rank) % self.hparams.math_split_index
-        #         idx_hard = (self.hard_prompt_counter + (offset * world_size * 2) + global_rank) % (self.training_prompts_dataset_len - self.hparams.math_split_index)
-        #         indices.append(idx_easy)
-        #         indices.append(idx_hard + self.hparams.math_split_index)
-        #         indices.append(idx_hard + self.hparams.math_split_index)
-        #         self.easy_prompt_counter = (self.easy_prompt_counter + num_distinct_prompts // 2 * world_size) % self.hparams.math_split_index
-        #         self.hard_prompt_counter = (self.hard_prompt_counter + num_distinct_prompts // 2 * world_size) % (self.training_prompts_dataset_len - self.hparams.math_split_index)
-        # else:
-        for offset in range(num_distinct_prompts):
-            idx = (self.curr_prompt_counter + (offset * world_size) + global_rank) % self.training_prompts_dataset_len
-            indices.append(idx)
-        self.curr_prompt_counter += (num_distinct_prompts * world_size)
-        self.curr_prompt_counter %= self.training_prompts_dataset_len
+        if self.hparams.dataset == "math":
+            if self.math_easy_split_idx is None:
+                raise RuntimeError("math_easy_split_idx was not initialized")
+
+            easy_len = int(self.math_easy_split_idx)
+            hard_len = int(self.training_prompts_dataset_len - self.math_easy_split_idx)
+            if easy_len <= 0 or hard_len <= 0:
+                raise RuntimeError(
+                    f"Invalid math split: easy_len={easy_len}, hard_len={hard_len}, dataset_len={self.training_prompts_dataset_len}"
+                )
+
+            num_easy = int(num_base_prompts // 2)
+            num_hard = int(num_base_prompts - num_easy)
+
+            # Stable (order-preserving) selection within each bucket, strided by DDP.
+            easy_indices = []
+            for offset in range(num_easy):
+                j = (self.curr_easy_prompt_counter + (offset * world_size) + global_rank) % easy_len
+                easy_indices.append(int(j))
+            self.curr_easy_prompt_counter += (num_easy * world_size)
+            self.curr_easy_prompt_counter %= easy_len
+
+            hard_indices = []
+            for offset in range(num_hard):
+                j = (self.curr_hard_prompt_counter + (offset * world_size) + global_rank) % hard_len
+                hard_indices.append(int(self.math_easy_split_idx + j))
+            self.curr_hard_prompt_counter += (num_hard * world_size)
+            self.curr_hard_prompt_counter %= hard_len
+
+            # Duplicate hard prompts as extra rows so each hard prompt gets 2x samples.
+            indices = easy_indices + hard_indices + hard_indices
+        else:
+            indices = []
+            for offset in range(num_base_prompts):
+                idx = (self.curr_prompt_counter + (offset * world_size) + global_rank) % self.training_prompts_dataset_len
+                indices.append(int(idx))
+            self.curr_prompt_counter += (num_base_prompts * world_size)
+            self.curr_prompt_counter %= self.training_prompts_dataset_len
+
+        num_effective_prompts = int(len(indices))
+
         # Remember which dataset rows were used, for reward computation later
+        # (note: for math, hard prompts appear twice)
         self._last_prompt_indices = indices
 
         # ---- 2. Extract structured prompts from the dataset ----
         structured_prompts = [self.training_prompts_dataset[i]["prompt"] for i in indices]
         if self.hparams.dataset == "math":
-            level_and_type_list = [(self.training_prompts_dataset[i]["level"], self.training_prompts_dataset[i]["type"]) for i in indices]
-            level_and_type = torch.tensor(level_and_type_list, dtype=torch.long).to(self.device).unsqueeze(1).expand(-1, num_completions_per_prompts, -1)
-            # [num_distinct_prompts, num_completions_per_prompts, 2]
+            level_and_type_list = [
+                (self.training_prompts_dataset[i]["level"], self.training_prompts_dataset[i]["type"])
+                for i in indices
+            ]
+            level_and_type = (
+                torch.tensor(level_and_type_list, dtype=torch.long)
+                .to(self.device)
+                .unsqueeze(1)
+                .expand(-1, num_completions_per_prompts, -1)
+            )
+            # [num_effective_prompts, num_completions_per_prompts, 2]
         else:
             level_and_type = None
 
@@ -901,12 +1050,11 @@ class TiltMatchingModule(pl.LightningModule):
         prompts_text = []
         for sp in structured_prompts:
             if isinstance(sp, list):
-                # Typical case for Sudoku / GSM8K / math: [{"role": "...", "content": "..."}]
+                # Typical case: [{"role": "...", "content": "..."}]
                 text = self.tokenizer.apply_chat_template(sp, tokenize=False, add_generation_prompt=True)
             else:
                 raise TypeError(f"Unsupported prompt type {type(sp)} in training_prompts_dataset")
             prompts_text.append(text)
-            # print(text)
 
         input_ids = self.tokenizer(
             text=prompts_text,
@@ -918,25 +1066,11 @@ class TiltMatchingModule(pl.LightningModule):
             add_special_tokens=False,
         )["input_ids"].to(self.device)
 
-        # if getattr(self.hparams, "test_prompt_length", False):
-        #     # Determining the best max_prompt_length:
-        #     sentinel = 126081
-        #     starts_ok = (input_ids[:, 0] == sentinel)
-        #     neq = (input_ids != sentinel)
-        #     has_any_neq = neq.any(dim=1)  
-        #     first_neq_pos = neq.int().argmax(dim=1)
-        #     A = torch.where(has_any_neq, first_neq_pos, torch.full_like(first_neq_pos, input_ids.size(1)))
-        #     false_idx = torch.nonzero(~starts_ok, as_tuple=True)[0]  # 1D [N]
-        #     print(false_idx.tolist())
-        #     prev_len = 0
-        #     for threshold in range(0, 40, 2):
-        #         idx = torch.nonzero(A < threshold, as_tuple=True)[0]  # [N] indices into A
-        #         print(f"Longer than {self.hparams.max_prompt_length - threshold}:")
-        #         print(idx.tolist())
-        #         print(f"num prompts of length between {self.hparams.max_prompt_length - threshold} and {self.hparams.max_prompt_length - threshold + 20}: {len(idx.tolist()) - prev_len}")
-        #         prev_len = len(idx.tolist())
-
-        return input_ids.repeat_interleave(num_completions_per_prompts, dim=0), level_and_type
+        return (
+            input_ids.repeat_interleave(num_completions_per_prompts, dim=0),
+            level_and_type,
+            num_effective_prompts,
+        )
 
     def _update_buffer(self, model, num_buffer_updates, num_completions_per_prompt):
         """
@@ -959,26 +1093,55 @@ class TiltMatchingModule(pl.LightningModule):
         model.set_adapter("teacher")
         model.eval()
 
-        build_or_refresh = "building" if num_buffer_updates == self.num_buffer_prompts else "refreshing"
+        is_full_build = num_buffer_updates == self.num_buffer_prompts_base
+        build_or_refresh = "building" if is_full_build else "refreshing"
         print(f"{build_or_refresh} sample buffer ...")
         buffer_start_time = datetime.now()
 
         # ---- 1. Prepare prompts as token IDs ----
-        if num_buffer_updates == self.num_buffer_prompts:
-            update_rows = list(range(self.num_buffer_prompts))
-            self.buffer_update_counter = 0
+        # if num_buffer_updates == self.num_buffer_prompts:
+        #     update_rows = list(range(self.num_buffer_prompts))
+        #     self.buffer_update_counter = 0
+        #     self.buffer = None
+        #     self.buffer_rewards = None
+        #     self.level_and_type = None
+        # else:
+        #     update_rows = [
+        #         (self.buffer_update_counter + u) % self.num_buffer_prompts
+        #         for u in range(num_buffer_updates)
+        #     ]
+        #     self.buffer_update_counter += num_buffer_updates
+        #     self.buffer_update_counter %= self.num_buffer_prompts
+        # prompt_ids, level_and_type = self._prepare_prompts(num_buffer_updates, num_completions_per_prompt)
+        prompt_ids, level_and_type, num_effective_updates = self._prepare_prompts(
+            num_buffer_updates, num_completions_per_prompt
+        )
+        total_batch, prompt_len = prompt_ids.shape
+        # Sanity: total_batch should match expanded prompt count
+        expected_total = num_effective_updates * num_completions_per_prompt
+        if total_batch != expected_total:
+            raise RuntimeError(
+                f"Shape mismatch: total_batch={total_batch} but "
+                f"num_effective_updates*num_completions_per_prompt={expected_total}"
+            )
+
+        # Determine which buffer rows we are overwriting.
+        if is_full_build:
             self.buffer = None
-            self.buffer_rewards = None
-            self.level_and_type = None
+            update_rows = list(range(self.num_buffer_prompts))
+            if num_effective_updates != self.num_buffer_prompts:
+                raise RuntimeError(
+                    f"Full buffer build mismatch: num_effective_updates={num_effective_updates} "
+                    f"but num_buffer_prompts={self.num_buffer_prompts}"
+                )
         else:
             update_rows = [
                 (self.buffer_update_counter + u) % self.num_buffer_prompts
-                for u in range(num_buffer_updates)
+                for u in range(num_effective_updates)
             ]
-            self.buffer_update_counter += num_buffer_updates
+            self.buffer_update_counter += num_effective_updates
             self.buffer_update_counter %= self.num_buffer_prompts
-        prompt_ids, level_and_type = self._prepare_prompts(num_buffer_updates, num_completions_per_prompt)
-        total_batch, prompt_len = prompt_ids.shape
+
 
         # ---- 2. Run diffusion generation to get prompt+completion sequences ----
         chunk_size = max(1, min(self.hparams.tm.buffer_chunk_size, total_batch))
@@ -1007,7 +1170,8 @@ class TiltMatchingModule(pl.LightningModule):
             prompt_completion_ids[start:end].copy_(chunk_completion_ids)
 
         # ---- 3. Reshape into [num_updates, num_completions, seq_len] and update corresponding rows ----
-        new_buffer_block = prompt_completion_ids.view(num_buffer_updates, -1, seq_len)
+        # new_buffer_block = prompt_completion_ids.view(num_buffer_updates, -1, seq_len)
+        new_buffer_block = prompt_completion_ids.view(num_effective_updates, num_completions_per_prompt, seq_len)
         if self.buffer is None:
             self.buffer = new_buffer_block
             if self.hparams.dataset == "math":
@@ -1161,7 +1325,8 @@ class TiltMatchingModule(pl.LightningModule):
 
 
         # Store as shape [num_buffer_updates, num_completions_per_prompt, num_funcs]
-        new_rewards_block = rewards_per_func.view(num_buffer_updates, -1, num_funcs)
+        # new_rewards_block = rewards_per_func.view(num_buffer_updates, -1, num_funcs)
+        new_rewards_block = rewards_per_func.view(num_effective_updates, num_completions_per_prompt, num_funcs)
         # --- Accumulate per-phase distribution of TOTAL reward values ---
         # total reward per sample: [num_buffer_updates, num_completions_per_prompt]
         total_rewards_block = new_rewards_block.sum(dim=-1)
@@ -1180,16 +1345,54 @@ class TiltMatchingModule(pl.LightningModule):
 
         self._phase_total_reward_n += int(totals_flat.numel())
 
+        # avg_rwd = float(new_rewards_block.mean() * new_rewards_block.shape[-1])
+        # print(f"[EVAL] average reward = {avg_rwd:.3f}")
+        # temp_log_dict = {}
+        # for i in range(num_completions_per_prompt + 1):
+        #     if self.hparams.dataset == "gsm8k":
+        #         rows_ok = (new_rewards_block[:,:,-1] == 2).sum(dim=1) == i
+        #         temp_log_dict[f"buffer/buffer_per_prompt_{i}_correct"] = rows_ok.float().mean()
+        #     elif self.hparams.dataset == "math":
+        #         rows_ok = (new_rewards_block[:,:,0] == 2).sum(dim=1) == i
+        #         temp_log_dict[f"buffer/buffer_per_prompt_{i}_correct"] = rows_ok.float().mean()
+
         avg_rwd = float(new_rewards_block.mean() * new_rewards_block.shape[-1])
         print(f"[EVAL] average reward = {avg_rwd:.3f}")
+
+        if self.hparams.dataset == "math":
+            # Per buffer-row correct count out of 6
+            row_correct_6 = (new_rewards_block[:, :, 0] == 2).sum(dim=1)  # [num_effective_updates], in [0..6]
+
+            # Aggregate by ORIGINAL prompt index so duplicated hard rows become out-of-12
+            prompt_correct = {}  # prompt_idx -> total correct (easy:0..6, hard:0..12)
+            prompt_level = {}    # prompt_idx -> level
+
+            for r, prompt_idx in enumerate(self._last_prompt_indices):
+                p = int(prompt_idx)
+                c = int(row_correct_6[r].item())
+                if p in prompt_correct:
+                    prompt_correct[p] += c
+                else:
+                    prompt_correct[p] = c
+                    prompt_level[p] = int(self.training_prompts_dataset[p]["level"])
+
+            # Update local histogram counts (integers)
+            for p, tot in prompt_correct.items():
+                lvl = int(prompt_level[p])
+                if lvl < 0 or lvl >= 5:
+                    continue
+                tot = max(0, min(tot, 6))
+                self._math_level_hist_dict[f"level_{lvl+1}_k_{tot}_count"] += 1
+
+
         temp_log_dict = {}
-        for i in range(num_completions_per_prompt + 1):
-            if self.hparams.dataset == "gsm8k":
-                rows_ok = (new_rewards_block[:,:,-1] == 2).sum(dim=1) == i
+
+        # --- Existing GSM8K logging unchanged ---
+        if self.hparams.dataset == "gsm8k":
+            for i in range(num_completions_per_prompt + 1):
+                rows_ok = (new_rewards_block[:, :, -1] == 2).sum(dim=1) == i
                 temp_log_dict[f"buffer/buffer_per_prompt_{i}_correct"] = rows_ok.float().mean()
-            elif self.hparams.dataset == "math":
-                rows_ok = (new_rewards_block[:,:,0] == 2).sum(dim=1) == i
-                temp_log_dict[f"buffer/buffer_per_prompt_{i}_correct"] = rows_ok.float().mean()
+
         if self.hparams.dataset == "math":
             dim1, dim2, dim3 = level_and_type.shape
             counts, rwds_sums = self._lat_stats(level_and_type.reshape(dim1 * dim2, dim3), rewards_per_func) # [6,7], [2,6,7]
@@ -1293,6 +1496,30 @@ class TiltMatchingModule(pl.LightningModule):
             tname = ID_TO_TYPE[j]
             temp_log_dict[f"buffer/count_{tname}"] = global_counts[offset + j]
             temp_log_dict[f"buffer/{tname}_correct_frac"] = global_fracs[offset + j]
+
+
+        # ---------------------------------------------------------
+        # NEW: gather + log per-level per-prompt correctness histograms
+        # ---------------------------------------------------------
+        hist_keys = [f"level_{lvl+1}_k_{k}_count" for lvl in range(5) for k in range(7)]
+
+        local_hist = []
+        for key in hist_keys:
+            v = self._math_level_hist_dict.get(key, 0)
+            v = v if torch.is_tensor(v) else torch.tensor(v, device=device)
+            local_hist.append(v.to(device=device).reshape(()))
+        local_hist = torch.stack(local_hist)  # [5*7]
+
+        gathered_hist = self.all_gather(local_hist)
+        gathered_hist = gathered_hist.reshape(-1, gathered_hist.shape[-1])  # [ws, 35]
+        global_hist = gathered_hist.sum(dim=0)  # [35]
+
+        global_hist = global_hist.view(5, 7)  # [lvl, k]
+        for lvl in range(5):
+            denom = global_hist[lvl].sum() + eps  # number of prompts of this lvl across all ranks
+            temp_log_dict[f"buffer/level_{lvl+1}_n_prompts"] = global_hist[lvl].sum()
+            for k in range(7):
+                temp_log_dict[f"buffer/level_{lvl+1}_per_prompt_{k}_correct"] = global_hist[lvl, k] / denom
 
         return temp_log_dict
 
@@ -1893,7 +2120,7 @@ class TiltMatchingModule(pl.LightningModule):
             else:
                 unseen_indices = [offset * world_size + global_rank for offset in range(num_total_prompts - num_seen_prompts)]
         elif self.hparams.dataset == "math":
-            if self.a < 2:
+            if self.a < 4:
                 unseen_indices = [offset * world_size * 2 + global_rank * 2 for offset in range(num_total_prompts - num_seen_prompts)]
             else:
                 unseen_indices = [offset * world_size + global_rank for offset in range(num_total_prompts - num_seen_prompts)]
@@ -1955,6 +2182,7 @@ class TiltMatchingModule(pl.LightningModule):
             dtype=prompt_ids.dtype,
         )
         for start in range(0, total_batch, chunk_size):
+            print(start)
             end = min(start + chunk_size, total_batch)
             with torch.no_grad():
                 # chunk_completion_ids = self._generate(
@@ -1975,7 +2203,7 @@ class TiltMatchingModule(pl.LightningModule):
                     block_length=self.hparams.block_length,
                     temperature=0.0,
                     cfg_scale=0.0,
-                    remasking="low_confidence",
+                    remasking="low_confidence"
                 )
 
             prompt_completion_ids[start:end].copy_(chunk_completion_ids)
@@ -2055,3 +2283,8 @@ class TiltMatchingModule(pl.LightningModule):
         for j in range(7):
             self._math_lat_stats_dict[f"count_{ID_TO_TYPE[j]}"] = 0
             self._math_lat_stats_dict[f"{ID_TO_TYPE[j]}_correct_num"] = 0
+
+        self._math_level_hist_dict = {}
+        for lvl in range(5):
+            for k in range(7):
+                self._math_level_hist_dict[f"level_{lvl+1}_k_{k}_count"] = 0

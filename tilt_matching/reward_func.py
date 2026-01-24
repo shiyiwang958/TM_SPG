@@ -125,6 +125,7 @@ def correctness_reward_func(prompts, completions, answer, step=None, run_name=No
                                 pass
 
         is_correct = parsed_answer is not None and parsed_answer == float(ground_truth.replace(",", ""))
+        print(parsed_answer if parsed_answer is not None else "None", ground_truth, is_correct)
         extracted_responses.append(parsed_answer if parsed_answer is not None else "<no valid answer>")
         if is_correct:
             scores.append(2.0)
@@ -405,33 +406,57 @@ def correctness_reward_func_math(
     # boxed_in_answer_rewards = boxed_in_answer(prompts, completions, answer, step=step)
     responses = [completion[0]["content"] for completion in completions]
     q = prompts[0][-1]["content"]
-    extracted_responses = []
-    answer = [remove_boxed(last_boxed_only_string(a)) for a in answer]
-    for r in responses:
+
+    scores = []
+    for i, r in enumerate(responses):
+        a = remove_boxed(last_boxed_only_string(answer[i]))
         try:
             r = remove_boxed(last_boxed_only_string(r))
         except:
             pass
-        extracted_responses.append(r)
-    RED = "\033[91m"
-    GREEN = "\033[92m"
-    YELLOW = "\033[93m"
-    BLUE = "\033[94m"
-    RESET = "\033[0m"
+        
+        parsed_answer = None
+        try:
+            parsed_answer = remove_boxed(last_boxed_only_string(r))
+        except:
+            parsed_answer = None
 
-    print(
-        "-" * 20,
-        f"\n{RED}Question:{RESET}\n{q}",
-        "-" * 20,
-        f"\n{GREEN}Ground Truth:{RESET}\n{answer[0]}",
-        "-" * 20,
-        f"\n{BLUE}Response:{RESET}\n{responses[0]}",
-        "-" * 20,
-        f"\n{YELLOW}Extracted:{RESET}\n{extracted_responses[0]}",
-    )
-    print("✅" if is_equiv(extracted_responses[0], answer[0]) else "❌")
+        if not parsed_answer:
+            answer_match = re.search(r"<answer>(.*?)</answer>", r, re.DOTALL)
+            if answer_match:
+                parsed_answer = answer_match.group(1).strip()
+        if not parsed_answer:
+            parsed_answer = "<no valid answer>"
+        
+        is_correct = False
+        if parsed_answer is not None:
+            is_correct = is_equiv(parsed_answer, a)
+        if is_correct:
+            scores.append(2.0)
+        else:
+            scores.append(0.0)
+        print(parsed_answer, a, is_correct)
 
-    return [2.0 if is_equiv(r, a) else 0.0 for r, a in zip(extracted_responses, answer)]
+    # RED = "\033[91m"
+    # GREEN = "\033[92m"
+    # YELLOW = "\033[93m"
+    # BLUE = "\033[94m"
+    # RESET = "\033[0m"
+
+    # print(
+    #     "-" * 20,
+    #     f"\n{RED}Question:{RESET}\n{q}",
+    #     "-" * 20,
+    #     f"\n{GREEN}Ground Truth:{RESET}\n{answer[0]}",
+    #     "-" * 20,
+    #     f"\n{BLUE}Response:{RESET}\n{responses[0]}",
+    #     "-" * 20,
+    #     f"\n{YELLOW}Extracted:{RESET}\n{extracted_responses[0]}",
+    # )
+    # print("✅" if is_equiv(extracted_responses[0], answer[0]) else "❌")
+
+    # return [2.0 if is_equiv(r, a) else 0.0 for r, a in zip(extracted_responses, answer)]
+    return scores
 
 
 def boxed_and_answer_tags_format_reward(

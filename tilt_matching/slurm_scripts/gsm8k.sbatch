@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=tilt_gsm8k
+#SBATCH --job-name=tilt_gsm
 #SBATCH --account=kempner_albergo_lab
-#SBATCH --partition=kempner
-#SBATCH --nodes=2
-#SBATCH --gpus-per-node=4
+#SBATCH --partition=kempner_h100
+#SBATCH --nodes=4
+#SBATCH --gpus-per-node=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --mem=50GB
-#SBATCH --time=0:18:00
+#SBATCH --time=71:59:59
 #SBATCH --mail-type=END,FAIL,BEGIN
 #SBATCH --mail-user=yuyuanchen@math.harvard.edu
 
@@ -24,7 +24,7 @@ export NCCL_SOCKET_FAMILY=AF_INET
 export GLOO_USE_IPV6=0
 
 # Rendezvous (TCPStore/GLOO) over Ethernet (em2)
-export GLOO_SOCKET_IFNAME=em2
+export GLOO_SOCKET_IFNAME=em4
 
 # NCCL data plane over InfiniBand (ib0)
 export NCCL_SOCKET_IFNAME=ib0
@@ -43,7 +43,7 @@ MASTER_FILE="$OUTPUT_DIR/master_addr.txt"
 
 if [ "$SLURM_NODEID" -eq 0 ]; then
   # Pick em2 IPv4 on rank0 as MASTER_ADDR (rendezvous address)
-  MASTER_ADDR=$(ip -o -4 addr show dev em2 | awk '{print $4}' | cut -d/ -f1 || true)
+  MASTER_ADDR=$(ip -o -4 addr show dev em4 | awk '{print $4}' | cut -d/ -f1 || true)
   if [ -z "${MASTER_ADDR:-}" ]; then
     echo "ERROR: could not find IPv4 on em2 for rank0"
     ip -o -4 addr show
@@ -82,9 +82,9 @@ mkdir -p "$LOGDIR"
 cd /n/home06/yuyuan0/TM_SPG/tilt_matching
 
 
-srun --ntasks-per-node=1 --gpus-per-task=4 \
+srun --ntasks-per-node=1 --gpus-per-task=2 \
   python -m torch.distributed.run \
-    --nproc_per_node=4 \
+    --nproc_per_node=2 \
     --nnodes="$NNODES" \
     --node_rank="$NODE_RANK" \
     --rdzv_backend=c10d \
@@ -95,8 +95,6 @@ srun --ntasks-per-node=1 --gpus-per-task=4 \
     --tee 3 \
     tilt_train.py \
     --config-path /n/home06/yuyuan0/TM_SPG/tilt_matching/config \
-    --config-name tilt_matching.yaml \
-    tm.buffer_chunk_size=15 \
-    tm.num_batch_prompts=1 \
-    tm.grad_accum_steps=12 \
-    tm.num_completions_per_prompt=5
+    --config-name tilt_matching_gsm.yaml \
+    nodes=4 \
+    devices=2

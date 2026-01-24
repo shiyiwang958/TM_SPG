@@ -1,27 +1,28 @@
 #-----------------Tilt Matching Training Config-----------------
 tm:
   a_end: 100.0
-  buffer_chunk_size: 10
-  buffer_refresh_steps: 25
+  a_start: 3.0
+  buffer_chunk_size: 48
+  buffer_refresh_steps: 20
   buffer_print_samples: 4   # 0 disables printing
   control_variate: 1.5
-  control_variate_ema: 0.05
+  control_variate_ema: 0.04
   do_first_eval: false
-  eval_num_prompts: 25
-  eval_student_every: 100
+  eval_num_prompts: 60
+  eval_student_every: 120
   grad_accum_steps: 6
-  h: 1.5
+  h: 1.0
   learned_cv: false
   loss_type: itm
   math_log_lat_every: 100
-  num_batch_prompts: 2
-  num_buffer_prompts: 32
-  num_buffer_refresh: 8
-  num_completions_per_prompt: 6
-  rescale_logits: false
-  rwd_shift: 0.0
+  num_batch_prompts: 3
+  num_buffer_prompts: 48
+  num_buffer_refresh: 12
+  num_completions_per_prompt: 4
+  rescale_logits: true
+  rwd_shift: -1.78
   rwd_shift_auto: false
-  steps_per_h: 500 # this is the number of optimizer steps per h
+  steps_per_h: 480 # this is the number of optimizer steps per h
   student_ema_beta: 0.95
   student_ema_start_step: 1
   use_student_ema: true
@@ -32,10 +33,10 @@ adam_beta2: 0.99
 adam_epsilon: 1e-8
 weight_decay: 0.1
 
-max_grad_norm: 2.0
-learning_rate: 4e-6
+max_grad_norm: 1.0
+learning_rate: 6e-6
 lr_decay_ratio: 0.1
-lr_min: 2e-6
+lr_min: 3e-6
 lr_scheduler_type: linear
 lr_warmup_ratio: 0.05
 use_fresh_lr: true
@@ -61,21 +62,21 @@ lora_dropout: 0.05
 peft_task_type: CAUSAL_LM
 
 #-----------------Logging and Checkpointing Config-----------------
-checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/math_new_rwd
-checkpoint_freq: 50  # in number of optimizer steps
+checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm_purple_resume
+checkpoint_freq: 60  # in number of optimizer steps
 init_ckpt_path: # /n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_long_noconf/checkpoint-a-5.000-7.0.ckpt
 metrics_log_every: 1
-resume_path: #/n/netscratch/albergo_lab/Everyone/frank/llada_tm/math/checkpoint-a-4.000-40.0-v1.ckpt
+resume_path: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_h1_re/checkpoint-a-3.000-24.0.ckpt
 # leave empty if not resuming
 wandb:
   entity: "yuyuanchen-harvard-university"
   project: "LLaDA_TM"
-  name: "math_new_rwd"
+  name: "gsm"
 
 #-----------------Other Training Config-----------------
-dataset: "math"
+dataset: "gsm8k"
 math_split_idx: null
 few_shot: 0
-seed: 42
+seed: 43
 nodes: 1
 devices: 1  # 8? 4?

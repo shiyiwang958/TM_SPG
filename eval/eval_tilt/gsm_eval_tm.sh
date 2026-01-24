@@ -1,12 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=eval_gsm8k
-#SBATCH --account=albergo_lab
-#SBATCH --partition=gpu_requeue
-#SBATCH --constraint=[h200|h100]
+#SBATCH --account=kempner_albergo_lab
+#SBATCH --partition=kempner_h100
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=2
 #SBATCH --mem=50GB
-#SBATCH --time=0:58:00
+#SBATCH --time=0:18:00
 #SBATCH --mail-type=END,FAIL,BEGIN
 #SBATCH --mail-user=yuyuanchen@math.harvard.edu
 
@@ -27,7 +26,7 @@ srun --ntasks-per-node=1 --gpus-per-task=2 \
     --nproc_per_node=2 \
     eval.py \
     --dataset "gsm8k" \
-    --batch_size 8 \
+    --batch_size 32 \
     --gen_length 256 \
     --output_dir "$OUTPUT_DIR" \
     --model_path "/n/netscratch/albergo_lab/Everyone/frank/hf_models/LLaDA-8B-Instruct" \
@@ -35,6 +34,6 @@ srun --ntasks-per-node=1 --gpus-per-task=2 \
     --seed 42 \
     --diffusion_steps 128 \
     --remasking "low_confidence" \
-    --num_prompts_gsm -1 \
+    --num_prompts_gsm 256 \
     --adapter "student" \
-    --checkpoint_path "/n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_long_noconf/checkpoint-a-11.000-4.0.ckpt"
+    --checkpoint_path "/n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_noconf_smallh_temp1_medLR/checkpoint-a-4.000-60.0.ckpt"

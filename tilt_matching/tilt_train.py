@@ -33,6 +33,7 @@ from data_utils import (
     get_sudoku_questions_new,
     set_random_seed,
     get_math_questions,
+    reorder_by_level_halves
 )
 
 import typing
@@ -200,6 +201,11 @@ def train(cfg: DictConfig):
     # Shuffle dataset with fixed seed for reproducibility
     dataset = dataset.shuffle(seed=cfg.seed)
 
+    if cfg.dataset == "math":
+        dataset, split_idx = reorder_by_level_halves(dataset)
+        print(f"[INFO] Reordered math dataset by level halves with split index at {split_idx}.")
+        cfg.math_split_idx = split_idx
+
     # Split dataset if needed
     if cfg.dataset in ["countdown", "sudoku", "sudoku_new"]:
         train_set = dataset.select(range(0, len(dataset) - 500))  # Leave last 500 for evaluation
@@ -332,7 +338,7 @@ def train(cfg: DictConfig):
 
 
 #-------------------------------- Train ------------------------------------
-@hydra.main(config_path = "config", config_name = "tilt_matching_math.yaml")
+@hydra.main(config_path = "config", config_name = "tilt_matching_gsm.yaml")
 def main(cfg: DictConfig):
     train(cfg)
 

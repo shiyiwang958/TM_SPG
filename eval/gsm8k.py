@@ -26,6 +26,7 @@ Your reasoning here
 \\boxed{...}
 </answer>"""
 
+
 class GSM8KDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -42,11 +43,12 @@ class GSM8KDataset(torch.utils.data.Dataset):
         self.load_test_dataset()
         self.create_few_shot_prompt()
 
-        self.subsample = (
-            np.random.choice(len(self.dataset), subsample, replace=False)
-            if subsample != -1
-            else np.arange(len(self.dataset))
-        )
+        # self.subsample = (
+        #     np.random.choice(len(self.dataset), subsample, replace=False)
+        #     if subsample != -1
+        #     else np.arange(len(self.dataset))
+        # )
+        self.subsample = np.arange(len(self.dataset)) if subsample == -1 else np.arange(subsample)
         print(f"evaluating {len(self.subsample)} examples")
         assert subsample <= len(self.dataset), "Subsample size is greater than dataset size"
 
@@ -99,6 +101,6 @@ class GSM8KDataset(torch.utils.data.Dataset):
         questions = [item[1] for item in batch]
         answers = [item[2] for item in batch]
         input_ids = self.tokenizer(
-            prompts, padding_side="left", return_tensors="pt", padding="longest"
+            prompts, padding_side="left", return_tensors="pt", padding="max_length", truncation=True, max_length=240, add_special_tokens=False
         ).input_ids
         return {"input_ids": input_ids, "questions": questions, "answers": answers, "prompts": prompts}

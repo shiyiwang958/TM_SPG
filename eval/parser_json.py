@@ -78,6 +78,7 @@ def parse_gsm_answers(json_path=None, json_data=None):
                                 pass
 
         is_correct = parsed_answer is not None and parsed_answer == ground_truth
+        print(parsed_answer if parsed_answer is not None else "None", ground_truth, is_correct)
         if is_correct:
             total_correct += 1
 

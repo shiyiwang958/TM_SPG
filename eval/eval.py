@@ -3,6 +3,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+#TODO: Check bnb (4 bit quantization)
+
 import argparse
 import imp
 import json
@@ -16,7 +18,7 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig
 from peft import PeftModel, LoraConfig, get_peft_model, set_peft_model_state_dict, get_peft_model_state_dict
 
 from generate import generate
@@ -96,7 +98,7 @@ def evaluate(
             cfg_scale=cfg_scale,
             remasking=remasking, #"low_confidence",
         )
-        generated_texts = tokenizer.batch_decode(out[:, -gen_length:], skip_special_tokens=False)
+        generated_texts = tokenizer.batch_decode(out[:, -gen_length:], skip_special_tokens=True)
 
         example_result = [
             {
@@ -215,6 +217,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--num_prompts_gsm", type=int, default=-1)
     parser.add_argument("--adapter", type=str, choices=["student", "teacher"], default="teacher")
+    parser.add_argument("--use_4bit", type=bool, default=False)
     args = parser.parse_args()
 
     if args.seed is not None:
@@ -255,10 +258,23 @@ if __name__ == "__main__":
         import sys
         sys.exit(0)
 
-    # Load the diffusion LM (optionally LoRA-tuned later)
-    model = AutoModel.from_pretrained(args.model_path, trust_remote_code=True, torch_dtype=torch.bfloat16).to(
-        local_rank
+    # 4 bit quantization configuration
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
     )
+    
+    # Load the diffusion LM (optionally LoRA-tuned later)
+    if args.use_4bit:
+        model = AutoModel.from_pretrained(args.model_path, trust_remote_code=True, torch_dtype=torch.bfloat16,quantization_config=bnb_config).to(
+            local_rank
+        )
+    else:
+        model = AutoModel.from_pretrained(args.model_path, trust_remote_code=True, torch_dtype=torch.bfloat16).to(
+            local_rank
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
 
@@ -310,7 +326,7 @@ if __name__ == "__main__":
         tokenizer,
         subsample=num_evals[args.dataset],
         num_examples=args.few_shot,
-        add_reasoning=True,  # prefill for all models
+        add_reasoning=False,  # prefill for all models
     )
 
     # Build deterministic distributed dataloader for evaluation
