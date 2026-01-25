@@ -43,7 +43,8 @@ class CTDDataset(GSM8KDataset):
     def load_test_dataset(self):
         self.dataset = []
         cur_path = os.path.dirname(os.path.abspath(__file__))
-        with open(f"{cur_path}/../dataset/countdown_cd3_test.jsonl", "r") as f:
+        print(f"cur_path: {cur_path}")
+        with open(f"{cur_path}/../../dataset/countdown_cd3_test.jsonl", "r") as f:
             for line in f:
                 self.dataset.append(json.loads(line))
         print(len(self.dataset), "examples loaded")

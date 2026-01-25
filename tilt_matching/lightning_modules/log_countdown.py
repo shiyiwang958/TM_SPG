@@ -78,6 +78,8 @@ class TiltLogModule(pl.LightningModule):
         self.log_counter = 1
         self.dict_for_logs = {}
         self.log_student_steps = self.hparams.tm.student_log_steps
+        self.log_student = getattr(self.hparams.tm, "log_student", True)
+        self.log_temperature = getattr(self.hparams.tm, "log_temperature", 1.0) 
         self.student_logs_per_prompt = getattr(self.hparams.tm, "student_logs_per_prompt", 4)
         self.validation_set = self.load_test_dataset()
         # micro-step metric accumulation
@@ -92,6 +94,10 @@ class TiltLogModule(pl.LightningModule):
         self.lr_warmup_ratio = getattr(self.hparams, "lr_warmup_ratio", 0)
         self.lr_min = getattr(self.hparams, "lr_min", 0.0)
         self._tm_sched_state = None
+        # EMA over student adapter weights (per h-phase)
+        self.use_ema = getattr(self.hparams.tm, "use_ema", True)
+        self.ema_decay = getattr(self.hparams.tm, "ema_decay", 0.999)
+        self._ema_shadow = None
 
     def load_test_dataset(self):
         self.dataset = []
@@ -134,8 +140,19 @@ class TiltLogModule(pl.LightningModule):
         Load adapter weights saved via `state_dict`.
 
         Expects keys with prefixes `model_adapter.` (student) and `base_adapter.` (teacher).
+        
+        Args:
+            state_dict: Dictionary containing adapter weights
+            strict: If True, raise error on missing or unexpected keys
+            student_copy_over: If True, load student adapter weights into both student and teacher.
+                             If False, load normally (student from model_adapter, teacher from base_adapter).
+        
         Returns a dict mirroring torch's load_state_dict with any missing or unexpected keys.
         """
+        # Allow control via hparams if not explicitly specified
+        student_copy_over = getattr(self.hparams.tm, "student_copy_over", False)
+        keep_base_diverse = getattr(self.hparams.tm, "keep_base_diverse", False)
+        
         expected_student = set(get_peft_model_state_dict(self.model, adapter_name="student").keys())
         expected_teacher = set(get_peft_model_state_dict(self.model, adapter_name="teacher").keys())
 
@@ -147,9 +164,17 @@ class TiltLogModule(pl.LightningModule):
             if key.startswith("model_adapter."):
                 bare = key[len("model_adapter."):]
                 student_state[bare] = value.to(self.model.device)
+                # If student_copy_over is True, also load into teacher
+                if student_copy_over:
+                    teacher_state[bare] = value.to(self.model.device) 
             elif key.startswith("base_adapter."):
                 bare = key[len("base_adapter."):]
-                teacher_state[bare] = value.to(self.model.device)
+                # Only load base_adapter into teacher if student_copy_over is False
+                if not student_copy_over:
+                    if not keep_base_diverse:
+                        teacher_state[bare] = value.to(self.model.device)
+                    else:
+                        continue
             else:
                 unexpected_keys.append(key)
 
@@ -157,7 +182,11 @@ class TiltLogModule(pl.LightningModule):
         set_peft_model_state_dict(self.model, teacher_state, adapter_name="teacher")
 
         missing_student = list(expected_student - set(student_state.keys()))
-        missing_teacher = list(expected_teacher - set(teacher_state.keys()))
+        # Only check for missing teacher keys if we're actually loading them
+        if keep_base_diverse:
+            missing_teacher = []
+        else:
+            missing_teacher = list(expected_teacher - set(teacher_state.keys()))
         missing_keys = [f"model_adapter.{k}" for k in missing_student] + [f"base_adapter.{k}" for k in missing_teacher]
 
         if strict and (missing_keys or unexpected_keys):
@@ -169,6 +198,20 @@ class TiltLogModule(pl.LightningModule):
 
     def on_train_start(self):
         super().on_train_start()
+        
+        # Reset global_step if resuming from checkpoint
+        # (Lightning restores it after on_load_checkpoint, so we override it here)
+        reset_global_step = getattr(self.hparams.tm, "reset_global_step", False)
+        if reset_global_step and self.trainer.global_step > 0:
+            print(f"Resetting global_step from {self.trainer.global_step} to 0")
+            # Reset the internal batch progress counters
+            self.trainer.fit_loop.epoch_loop.batch_progress.current.completed = 0
+            self.trainer.fit_loop.epoch_loop.batch_progress.total.completed = 0
+            # Reset manual optimization step progress (critical for global_step)
+            self.trainer.fit_loop.epoch_loop.manual_optimization.optim_step_progress.current.completed = 0
+            self.trainer.fit_loop.epoch_loop.manual_optimization.optim_step_progress.total.completed = 0
+            print(f"After reset, global_step is now: {self.trainer.global_step}")
+        
         # Set up optimizer and LR
         self.tm_opt = self.optimizers()
         for g in self.tm_opt.param_groups:
@@ -177,6 +220,8 @@ class TiltLogModule(pl.LightningModule):
 
         self._update_buffer(self.model, self.num_buffer_prompts, self.comps_per_prompt)
         print(f"[DEBUG] Buffer initialized with shape {self.buffer.shape}")
+        # Initialize EMA for the current h-phase
+        self._reset_ema()
     
     def configure_optimizers(self):
         params = [p for p in self.model.parameters() if p.requires_grad]
@@ -256,6 +301,32 @@ class TiltLogModule(pl.LightningModule):
         out.update(self._micro_log_maxs)
         return out
 
+    # ---------------------------
+    # EMA (student adapter only)
+    # ---------------------------
+    def _student_param_iter(self):
+        for name, param in self.model.named_parameters():
+            if ".student" in name and param.requires_grad:
+                yield name, param
+
+    def _reset_ema(self):
+        self._ema_shadow = {}
+        for name, param in self._student_param_iter():
+            self._ema_shadow[name] = param.detach().clone()
+    
+    @torch.no_grad()
+    def _update_ema(self):
+        if self._ema_shadow is None:
+            self._reset_ema()
+            return
+        decay = float(self.ema_decay)
+        with torch.no_grad():
+            for name, param in self._student_param_iter():
+                if name not in self._ema_shadow:
+                    self._ema_shadow[name] = param.detach().clone()
+                else:
+                    self._ema_shadow[name].mul_(decay).add_(param.detach(), alpha=1.0 - decay)
+
     def training_step(self, batch, batch_idx):
         """
         Perform one training micro-step of Tilt Matching.
@@ -300,7 +371,7 @@ class TiltLogModule(pl.LightningModule):
         if not is_update_step:
             # Prevent logging hooks from trying to log multiple micro-steps at the same global_step
             self.dict_for_logs = {}
-            return loss
+            return loss.detach()
 
         # ---- Optimizer / scheduler step ----
         self._step_tm_scheduler()
@@ -313,6 +384,9 @@ class TiltLogModule(pl.LightningModule):
 
         opt.step()
         opt.zero_grad(set_to_none=True)
+        # Apply EMA to student weights (per h-phase)
+        if self.use_ema:
+            self._update_ema()
 
         if (self.global_step + 2) % self.steps_per_h < 5:
             print(f"current a is {self.a:.4f}")
@@ -340,8 +414,21 @@ class TiltLogModule(pl.LightningModule):
             if self.a + self.h > self.a_end:
                 self.h = self.a_end - self.a
             with torch.no_grad():
-                adapter_state = get_peft_model_state_dict(self.model, adapter_name="student")
-                set_peft_model_state_dict(self.model, adapter_state, adapter_name="teacher")
+                if self.use_ema and self._ema_shadow is not None:
+                    # Copy EMA (student) weights into teacher adapter
+                    teacher_state = {}
+                    for key in get_peft_model_state_dict(self.model, adapter_name="teacher").keys():
+                        full_name = f"base_model.model.{key}"
+                        if full_name in self._ema_shadow:
+                            teacher_state[key] = self._ema_shadow[full_name]
+                        else:
+                            # Fallback to current student weight if EMA key missing
+                            student_state = get_peft_model_state_dict(self.model, adapter_name="student")
+                            teacher_state[key] = student_state[key]
+                    set_peft_model_state_dict(self.model, teacher_state, adapter_name="teacher")
+                else:
+                    adapter_state = get_peft_model_state_dict(self.model, adapter_name="student")
+                    set_peft_model_state_dict(self.model, adapter_state, adapter_name="teacher")
                 for name, p in self.model.named_parameters():
                     if ".teacher" in name:
                         p.requires_grad_(False)
@@ -355,6 +442,8 @@ class TiltLogModule(pl.LightningModule):
             for g in opt.param_groups:
                 g["lr"] = self.lr
             self._init_tm_scheduler()
+            # Reset EMA for the new h-phase
+            self._reset_ema()
 
         self.log("ckpt_a", self.a, on_step=True, on_epoch=False, sync_dist=True)
         step_end_time = datetime.now()
@@ -437,16 +526,9 @@ class TiltLogModule(pl.LightningModule):
         return loss, log_dict
     
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        # if self.method == "onpolicy":
-        #     if self.global_step % self.hparams.tm.buffer_refresh_steps == 0:
-        #         print(f"[DEBUG] Refreshing {self.hparams.tm.num_buffer_refresh} prompts at global step {self.global_step}")
-        #         self._update_buffer(self.model, self.hparams.tm.num_buffer_refresh, self.comps_per_prompt)
-        # elif self.method == "offpolicy":
-
-        # log the accuracy of the student model:
 
         if (self._grad_accum_counter % self.hparams.tm.grad_accum_steps) == 0:
-            if self.global_step % self.log_student_steps == 0:
+            if self.global_step % self.log_student_steps == 0 and self.log_student:
                 self.log_counter += 1
                 self.log("log_counter", self.log_counter, on_step=True, on_epoch=False, sync_dist=True)
                 print(f"logging counter is {self.log_counter}", flush=True)
@@ -491,6 +573,11 @@ class TiltLogModule(pl.LightningModule):
         # self.h = tilt.get("h", 2.5e-3)
         self.curr_prompt_counter = checkpoint.get("prompt_counter", 0)
         self._grad_accum_counter = checkpoint.get("grad_accum_counter", 0)
+        
+        # # Reset global_step to 0 when loading checkpoint
+        # # This must be done in the checkpoint dict before Lightning restores it
+        # checkpoint["global_step"] = 0
+        # print(f"global step is {self.global_step} after loading checkpoint")
 
         # hparams = checkpoint.get("hparams", None)
         # self.__dict__["hparams"] = hparams
@@ -836,7 +923,7 @@ class TiltLogModule(pl.LightningModule):
                     steps=self.hparams.diffusion_steps,
                     gen_length=gen_length,
                     block_length=self.hparams.block_length,
-                    temperature=self.hparams.sampling_temperature,
+                    temperature=self.log_temperature,
                     cfg_scale=self.hparams.cfg_scale,
                     remasking='low_confidence',
                 )  # [end-start, seq_len]

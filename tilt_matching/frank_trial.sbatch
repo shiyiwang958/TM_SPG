@@ -5,9 +5,9 @@
 #SBATCH --nodes=4
 #SBATCH --gpus-per-node=2
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=100GB
-#SBATCH --time=8:30:00
+#SBATCH --time=14:30:00
 #SBATCH --mail-type=END,FAIL,BEGIN
 #SBATCH --mail-user=fwang@math.harvard.edu
 #SBATCH --output=/n/home03/sw958/project_1/SPG/tilt_matching/outputs/output_%j.out
@@ -104,4 +104,4 @@ srun --ntasks-per-node=1 --gpus-per-task=2 \
     --tee 3 \
     train_log.py \
     --config-path /n/home03/sw958/project_1/SPG/tilt_matching/config \
-    --config-name log_countdown.yaml
+    --config-name trial_countdown.yaml

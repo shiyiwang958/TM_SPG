@@ -2,6 +2,7 @@ import copy
 import logging
 import math
 import os
+import csv
 from datetime import datetime
 from collections import OrderedDict, namedtuple
 from contextlib import contextmanager
@@ -15,6 +16,29 @@ import pytorch_lightning as pl
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from peft import LoraConfig, get_peft_model, PeftModelForCausalLM, get_peft_model_state_dict, set_peft_model_state_dict
+
+SUDOKU_SYSTEM_PROMPT = """
+Please solve the following 4x4 Sudoku puzzle. The puzzle is provided as a 16-character string reading left-to-right, top-to-bottom, where '0' represents empty cells.
+
+Rules:
+- Fill empty cells with digits 1-4
+- Each row must contain digits 1-4 exactly once
+- Each column must contain digits 1-4 exactly once
+- Each 2x2 box must contain digits 1-4 exactly once
+
+Important: Your solution must be a COMPLETE 16-character string with only the digits 1-4, representing your final solved grid.
+
+Respond in this exact format:
+<reasoning>
+Your step-by-step solving process
+</reasoning>
+<answer>
+[16-character solution string with no spaces or separators]
+</answer>
+"""
+short_example_1 = "Question:\nSolve the following Sudoku puzzle: 3014002020004130\nAnswer:\n<reasoning>\nInterpret puzzle as 4 rows of 4:\nR1: 3 0 1 4\nR2: 0 0 2 0\nR3: 2 0 0 0\nR4: 4 1 3 0\n\nFill easy singles:\nR1 missing 2 → R1C2=2.\nR4 missing 2 → R4C4=2.\nBox D (R3-4,C3-4) then needs {1,4}; column4 can only accept 1 → R3C4=1, R3C3=4.\nR3 now missing 3 → R3C2=3.\nColumn1 missing 1 → R2C1=1.\nColumn2 missing 4 → R2C2=4.\nLast cell R2C4=3.\n\nFinal grid:\nR1: 3 2 1 4\nR2: 1 4 2 3\nR3: 2 3 4 1\nR4: 4 1 3 2\n</reasoning>\n<answer>\n3214142323414132\n</answer>"
+short_example_2 = "Question:\nSolve the following Sudoku puzzle: 0000100420013142\nAnswer:\n<reasoning>\nInterpret puzzle as 4 rows of 4:\nR1: 0 0 0 0\nR2: 1 0 0 4\nR3: 2 0 0 1\nR4: 3 1 4 2\n\nFill easy singles:\nCol1 missing 4 → R1C1=4.\nCol4 missing 3 → R1C4=3.\nBox A (R1-2,C1-2) missing {2,3} and R1 now needs {1,2} → R1C2=2, R2C2=3.\nR1C3=1.\nR2 now missing 2 → R2C3=2.\nCol2 missing 4 → R3C2=4, then R3C3=3.\n\nFinal grid:\nR1: 4 2 1 3\nR2: 1 3 2 4\nR3: 2 4 3 1\nR4: 3 1 4 2\n</reasoning>\n<answer>\n4213132424313142\n</answer>"
+short_example_3 = "Question:\nSolve the following Sudoku puzzle: 2001403002001420\nAnswer:\n<reasoning>\nInterpret puzzle as 4 rows of 4:\nR1: 2 0 0 1\nR2: 4 0 3 0\nR3: 0 2 0 0\nR4: 1 4 2 0\n\nFill easy singles:\nR1 missing {3,4}; Col2 can't be 1 so R1C2=3 → R1C3=4.\nR4 missing 3 → R4C4=3.\nCol4 missing {2,4}; R2 must take 2 → R2C4=2 → R2C2=1.\nCol1 missing 3 → R3C1=3.\nCol3 missing 1 → R3C3=1 → R3C4=4.\n\nFinal grid:\nR1: 2 3 4 1\nR2: 4 1 3 2\nR3: 3 2 1 4\nR4: 1 4 2 3\n</reasoning>\n<answer>\n2341413232141423\n</answer>"
 
 
 class TiltSudokuModule(pl.LightningModule):
@@ -64,6 +88,11 @@ class TiltSudokuModule(pl.LightningModule):
         self.comps_per_prompt = self.hparams.tm.num_completions_per_prompt
         self.buffer_update_counter = 0
         self._grad_accum_counter = 0
+        self.log_student = getattr(self.hparams.tm, "log_student", True)
+        self.log_temperature = getattr(self.hparams.tm, "log_temperature", 1.0)
+        self.log_counter = 1
+        self.log_student_steps = getattr(self.hparams.tm, "log_student_steps", 100) 
+
         self.dict_for_logs = {}
         # micro-step metric accumulation
         self._micro_log_sums = {}
@@ -461,6 +490,12 @@ class TiltSudokuModule(pl.LightningModule):
     
     def on_train_batch_end(self, outputs, batch, batch_idx):
         if (self._grad_accum_counter % self.hparams.tm.grad_accum_steps) == 0:
+            if self.global_step % self.log_student_steps == 0 and self.log_student:
+                self.log_counter += 1
+                self.log("log_counter", self.log_counter, on_step=True, on_epoch=False, sync_dist=True)
+                print(f"logging counter is {self.log_counter}", flush=True)
+                self.logging_student(self.model, self.num_buffer_prompts, self.student_logs_per_prompt)
+
             if self.global_step % self.steps_per_h == 0:
                 self._rebuild_buffer_next_phase = True
                 print(f"[DEBUG] Scheduled buffer rebuild for next h-phase at global step {self.global_step}")
@@ -526,11 +561,11 @@ class TiltSudokuModule(pl.LightningModule):
         for offset in range(num_dinstinct_prompts):
             idx = (
                 self.curr_prompt_counter
-                + (offset * logical_world_size)
-                + logical_rank
+                + (offset * physical_world_size)
+                + global_rank
             ) % self.training_prompts_dataset_len
             indices.append(idx)
-        self.curr_prompt_counter += (num_dinstinct_prompts * logical_world_size)
+        self.curr_prompt_counter += (num_dinstinct_prompts * physical_world_size)
         self.curr_prompt_counter %= self.training_prompts_dataset_len
         # Remember which dataset rows were used, for reward computation later
         self._last_prompt_indices = indices
@@ -985,6 +1020,173 @@ class TiltSudokuModule(pl.LightningModule):
                 log_sodoku[f"sudoku_rank_{r}"] = table
             wandb.log(log_sodoku, step=self.global_step)
 
+    def logging_student(self, model, num_buffer_updates, num_completions_per_prompt):
+        """
+        Evaluate the student model on the Sudoku eval set (test_sudoku_split_new.csv).
+        - Distributes eval examples across GPUs
+        - Each GPU evaluates a subset of the eval set
+        - Generates completions and computes rewards
+        """
+        device = self.device
+
+        prev_adapter = model.active_adapter
+        model.set_adapter("student")
+        model.eval()
+        print("Start Logging Student (Sudoku eval) ...")
+        buffer_start_time = datetime.now()
+
+        # ---- 0. Load eval dataset (cached) ----
+        if not hasattr(self, "_sudoku_eval_rows"):
+            cur_path = os.path.dirname(os.path.abspath(__file__))
+            sudoku_file_path = os.path.join(cur_path, "../dataset/test_sudoku_split_new.csv")
+            sudoku_file_path = os.path.normpath(sudoku_file_path)
+            eval_rows = []
+            with open(sudoku_file_path, "r", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    eval_rows.append({"puzzle": row["Puzzle"], "solution": row["Solution"]})
+            self._sudoku_eval_rows = eval_rows
+
+        eval_rows = self._sudoku_eval_rows
+
+        # ---- 1. Distribute eval set across GPUs ----
+        global_world_size = getattr(self.trainer, "world_size", 1)
+        global_rank = getattr(self.trainer, "global_rank", 0)
+
+        total_val_examples = len(eval_rows)
+        examples_per_gpu = total_val_examples // global_world_size
+        start_idx = global_rank * examples_per_gpu
+
+        # Last GPU takes any remainder
+        if global_rank == global_world_size - 1:
+            end_idx = total_val_examples
+        else:
+            end_idx = start_idx + examples_per_gpu
+
+        val_subset = eval_rows[start_idx:end_idx]
+        num_val_prompts = len(val_subset)
+        print(f"[GPU {global_rank}/{global_world_size}] Evaluating {num_val_prompts} Sudoku examples (indices {start_idx} to {end_idx-1})")
+
+        # ---- 2. Prepare prompts (match get_sudoku_questions_new) ----
+        few_shot = int(getattr(self.hparams, "few_shot", 0))
+        few_shot_examples = [short_example_1, short_example_2, short_example_3][:few_shot]
+        few_shot_prompt = "\n\n".join(few_shot_examples)
+        system_prompt = f"{SUDOKU_SYSTEM_PROMPT}\n\n{few_shot_prompt}"
+
+        structured_prompts = []
+        puzzles = []
+        solutions = []
+        for row in val_subset:
+            puzzle = row["puzzle"]
+            solution = row["solution"]
+            prompt_text = f"{system_prompt}\n\nQuestion: Solve the following Sudoku puzzle: {puzzle}\nAnswer:\n"
+            structured_prompt = [{"role": "user", "content": prompt_text}]
+            structured_prompts.append(structured_prompt)
+            puzzles.append(puzzle)
+            solutions.append(solution)
+
+        prompts_text = []
+        for sp in structured_prompts:
+            text = self.tokenizer.apply_chat_template(
+                sp,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            prompts_text.append(text)
+
+        if num_val_prompts == 0:
+            print("[Student Validation] No eval samples assigned to this rank.")
+            model.set_adapter(prev_adapter)
+            model.train()
+            return
+
+        prompt_ids = self.tokenizer(
+            text=prompts_text,
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=self.hparams.max_prompt_length,
+            padding_side="left",
+            add_special_tokens=False,
+        )["input_ids"].to(device)
+
+        # Repeat each prompt for num_completions_per_prompt completions
+        prompt_ids = prompt_ids.repeat_interleave(num_completions_per_prompt, dim=0)
+        total_batch, prompt_len = prompt_ids.shape
+
+        # ---- 3. Run diffusion generation to get prompt+completion sequences ----
+        chunk_size = max(1, min(self.hparams.tm.buffer_chunk_size, total_batch) // 4)
+        gen_length = self.hparams.max_completion_length
+        seq_len = prompt_len + gen_length
+        # pre-allocate
+        prompt_completion_ids = torch.empty(
+            (total_batch, seq_len),
+            device=prompt_ids.device,
+            dtype=prompt_ids.dtype,
+        )
+        for start in range(0, total_batch, chunk_size):
+            end = min(start + chunk_size, total_batch)
+            with torch.no_grad():
+                chunk_completion_ids = self._generate(
+                    model=model,
+                    prompt=prompt_ids[start:end],
+                    steps=self.hparams.diffusion_steps,
+                    gen_length=gen_length,
+                    block_length=self.hparams.block_length,
+                    temperature=self.log_temperature,
+                    cfg_scale=self.hparams.cfg_scale,
+                    remasking='low_confidence',
+                )  # [end-start, seq_len]
+
+            prompt_completion_ids[start:end].copy_(chunk_completion_ids)
+            del chunk_completion_ids
+
+        # ---- 4. Decode completions to text for reward computation ----
+        completion_ids = prompt_completion_ids[:, prompt_len:]  # [total_batch, gen_length]
+        completions_text = self.tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
+
+        # ---- 5. Build reward inputs: prompts, completions, and puzzle/solution ----
+        prompts_for_rewards = []
+        reward_kwargs = {"puzzle": [], "solution": []}
+
+        for i in range(num_val_prompts):
+            for _ in range(num_completions_per_prompt):
+                prompts_for_rewards.append(structured_prompts[i])
+                reward_kwargs["puzzle"].append(puzzles[i])
+                reward_kwargs["solution"].append(solutions[i])
+
+        completions_for_rewards = []
+        for text in completions_text:
+            completions_for_rewards.append([{"role": "assistant", "content": text}])
+
+        # ---- 6. Compute rewards ----
+        num_funcs = len(self.reward_funcs)
+        rewards_per_func = torch.zeros(total_batch, num_funcs, device=device)
+
+        for j, reward_func in enumerate(self.reward_funcs):
+            scores = reward_func(
+                prompts=prompts_for_rewards,
+                completions=completions_for_rewards,
+                **reward_kwargs,
+            )
+            rewards_per_func[:, j] = torch.tensor(scores, device=device, dtype=torch.float32)
+
+        # ---- 7. Accuracy ----
+        new_rewards_block = rewards_per_func.view(num_val_prompts, -1, num_funcs)
+        denom = max(1, num_val_prompts * num_completions_per_prompt)
+        num_correct = (new_rewards_block >= self.hparams.max_rwd - 1e-5).sum().item()
+        frac_num_correct = num_correct / denom
+        print(f"[Student Validation] Sudoku accuracy: {frac_num_correct:.4f}")
+
+        self.log("val/sudoku_acc", frac_num_correct, on_step=True, on_epoch=False, sync_dist=True)
+
+        buffer_end_time = datetime.now()
+        buffer_build_time = (buffer_end_time - buffer_start_time).total_seconds()
+        print(f"Logging Student finished, took {buffer_build_time}")
+
+        # restore adapter
+        model.set_adapter(prev_adapter)
+        model.train()
     
     def _kl_from_logits(self, logits_A, logits_B, mask_indices):
         log_A = F.log_softmax(logits_A, dim=-1)

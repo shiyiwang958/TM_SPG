@@ -115,7 +115,7 @@ def evaluate_equation(equation_str):
         return None
 
 
-def compute_score(solution_str, ground_truth, method="strict", format_score=0.1, score=1.0, scaling=False):
+def compute_score(solution_str, ground_truth, method="strict", format_score=0.1, score=1.0, scaling=True):
     target = ground_truth["target"]
     numbers = ground_truth["numbers"]
 
@@ -161,11 +161,12 @@ def compute_score(solution_str, ground_truth, method="strict", format_score=0.1,
             print(f"Error evaluating equation")
         return format_score
 
-def check_special_operators(equation_str, scale_factor=5.0):
-    if "*" in equation_str or "/" in equation_str:
-        return scale_factor
-    elif "(" in equation_str and ")" in equation_str:
-        return scale_factor
+def check_special_operators(equation_str, scale_factor1=1.1, scale_factor2=1.1):
+    if "(" in equation_str and ")" in equation_str:
+        if "*" in equation_str or "/" in equation_str:
+            return scale_factor1
+    elif "*" in equation_str or "/" in equation_str:
+        return scale_factor1
     else: 
         return 1.0
 
