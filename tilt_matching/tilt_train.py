@@ -1,16 +1,26 @@
+from typing import Any
 import torch
 import wandb
 import math
 import os
 import hydra
 import math
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, ListConfig
+from omegaconf.base import ContainerMetadata
 from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig    
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.utilities import rank_zero_only
-from lightning_modules import TiltMatchingModule
+from lightning_modules import TiltLogModule
+from lightning_fabric.plugins import TorchCheckpointIO
+
+
+class CustomCheckpointIO(TorchCheckpointIO):
+    """Custom checkpoint IO that loads with weights_only=False"""
+    def load_checkpoint(self, path, map_location=None, weights_only=None):
+        return super().load_checkpoint(path, map_location=map_location, weights_only=False)
+
 
 from reward_func import (
     xmlcount_reward_func,
@@ -32,111 +42,6 @@ from data_utils import (
     set_random_seed,
     get_math_questions,
 )
-
-import typing
-from collections import defaultdict
-from torch.serialization import add_safe_globals
-from lightning_fabric.utilities.data import AttributeDict
-from omegaconf.nodes import AnyNode
-from omegaconf.base import Metadata, ContainerMetadata
-def _unwrap(m):
-    # DDP / FSDP / Lightning wrappers sometimes stash the real model here
-    for attr in ["module", "model", "base_model", "net", "backbone", "transformer"]:
-        if hasattr(m, attr):
-            inner = getattr(m, attr)
-            if inner is not None:
-                return inner
-    return m
-
-def _debug_attention_once(model, tokenizer):
-
-    model = _unwrap(model)
-
-    if not torch.cuda.is_available():
-        print("[attn-debug] CUDA not available; skipping.")
-        return
-
-    print("\n[attn-debug] ===== attention debug =====")
-    print("[attn-debug] torch:", torch.__version__)
-
-    # What the model/config claims (HF convention; may be None for custom models)
-    attn_impl = getattr(getattr(model, "config", None), "_attn_implementation", None)
-    print("[attn-debug] model.config._attn_implementation:", attn_impl)
-
-    # PyTorch SDPA feature flags / availability (these matter if the model uses SDPA under the hood)
-    # (PyTorch exposes these knobs for Flash / mem-efficient / math SDPA.)  :contentReference[oaicite:3]{index=3}
-    try:
-        print("[attn-debug] torch.backends.cuda.is_flash_attention_available():",
-              torch.backends.cuda.is_flash_attention_available())
-        print("[attn-debug] torch.backends.cuda.flash_sdp_enabled():",
-              torch.backends.cuda.flash_sdp_enabled())
-        print("[attn-debug] torch.backends.cuda.mem_efficient_sdp_enabled():",
-              torch.backends.cuda.mem_efficient_sdp_enabled())
-        print("[attn-debug] torch.backends.cuda.math_sdp_enabled():",
-              torch.backends.cuda.math_sdp_enabled())
-    except Exception as e:
-        print("[attn-debug] (could not query torch.backends.cuda *sdp* flags):", repr(e))
-
-    # Check whether flash-attn package is importable (relevant if HF "flash_attention_2" is used)
-    try:
-        import flash_attn  # noqa: F401
-        print("[attn-debug] flash_attn import: OK")
-    except Exception as e:
-        print("[attn-debug] flash_attn import: FAILED:", repr(e))
-
-    # Run a tiny forward pass and profile CUDA ops
-    from torch.profiler import profile, ProfilerActivity
-
-    device = next(model.parameters()).device
-    model.eval()
-
-    text = "hello " * 64  # long enough to exercise attention
-    inputs = tokenizer(text, return_tensors="pt").to(device)
-
-    # Warmup (avoids one-time compilation noise)
-    with torch.no_grad():
-        _ = model(**inputs)
-
-    def _run_and_print(tag, force_flash_sdpa: bool):
-        print(f"\n[attn-debug] --- profiler run: {tag} (force_flash_sdpa={force_flash_sdpa}) ---")
-
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-            with torch.no_grad():
-                if force_flash_sdpa:
-                    # Force SDPA to prefer FlashAttention backend (only affects models using SDPA).
-                    # PyTorch docs: torch.nn.attention.sdpa_kernel. :contentReference[oaicite:4]{index=4}
-                    from torch.nn.attention import sdpa_kernel, SDPBackend
-                    with sdpa_kernel(SDPBackend.FLASH_ATTENTION, set_priority=True):
-                        _ = model(**inputs)
-                else:
-                    _ = model(**inputs)
-
-        # Print top CUDA ops
-        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
-
-        # Also print any op names that look attention-related
-        keys = [e.key for e in prof.key_averages()]
-        hits = [k for k in keys if any(s in k.lower() for s in ["flash", "scaled_dot_product", "sdp", "attention"])]
-        print("[attn-debug] ops containing flash/scaled_dot_product/sdp/attention:")
-        for k in sorted(set(hits)):
-            print("  ", k)
-
-    _run_and_print("natural", force_flash_sdpa=False)
-    _run_and_print("forced_sdpa_flash", force_flash_sdpa=True)
-
-    print("[attn-debug] ===== end attention debug =====\n")
-
-
-add_safe_globals([
-    (typing.Any, "typing.Any"),  # special: not a class, use (obj, "qualified.name")
-    dict,
-    defaultdict,
-    AttributeDict,
-    AnyNode,
-    Metadata,
-    ContainerMetadata,
-    DictConfig,
-])
 
 def train(cfg: DictConfig):
     # Set seed for reproducibility
@@ -164,17 +69,22 @@ def train(cfg: DictConfig):
         )
     else:
         wandb_logger = None
+    
+    # checkpoint directory
+    os.makedirs(cfg.checkpoint_dir, exist_ok=True)
 
     # Load dataset based on configuration
+    test_dataset = None
     if cfg.dataset == "gsm8k":
         dataset = get_gsm8k_questions("train")
         reward_functions = [
             xmlcount_reward_func,
-            soft_format_reward_func,
-            strict_format_reward_func,
+            #soft_format_reward_func,
+            #strict_format_reward_func,
             int_reward_func,
             correctness_reward_func,
         ]
+        test_dataset = get_gsm8k_questions("test")
     elif cfg.dataset == "countdown":
         dataset = get_countdown_questions("train")
         reward_functions = [countdown_reward_func]
@@ -190,6 +100,7 @@ def train(cfg: DictConfig):
             correctness_reward_func_math,
             boxed_and_answer_tags_format_reward,
         ]
+        test_dataset = get_math_questions("test")
 
     # Shuffle dataset with fixed seed for reproducibility
     dataset = dataset.shuffle(seed=cfg.seed)
@@ -233,15 +144,14 @@ def train(cfg: DictConfig):
     # TODO: Need to load the LoRA weights onto the base model when starting from a checkpoint
 
     # Load the Tilt Matching training module
-    model = TiltMatchingModule(
+    model = TiltLogModule(
         base_model=base_model,
         tokenizer=tokenizer,
         training_prompts_dataset=train_set,
+        validation_set=test_dataset,
         reward_funcs=reward_functions,
         **cfg,
     )
-
-    # _debug_attention_once(base_model, tokenizer)
 
     # Configure trainer
     trainer_kwargs = dict(
@@ -263,18 +173,19 @@ def train(cfg: DictConfig):
         max_steps = -1,
         # Lightning still requires a finite epoch cap; set a very large number
         max_epochs = 10**12,
+        
+        # Use custom checkpoint IO to load with weights_only=False
+        plugins=[CustomCheckpointIO()],
     )
-    ckpt_steps = int(cfg.tm.steps_per_h * math.floor(cfg.checkpoint_freq / cfg.tm.h))
-
+    
     checkpoint_callback = ModelCheckpoint(
         save_last = True,
         dirpath = cfg.checkpoint_dir,
         save_top_k = -1,
-        every_n_train_steps = ckpt_steps,
+        every_n_train_steps = cfg.tm.student_log_steps // 2,
         save_on_train_epoch_end = False,
-        filename = "checkpoint-a-{ckpt_a:.3f}",
+        filename = "checkpoint-log-{log_counter}",
         auto_insert_metric_name=False,
-        save_on_exception=True,
     )
 
     # finish trainer kwargs
@@ -304,7 +215,7 @@ def train(cfg: DictConfig):
 
 
 #-------------------------------- Train ------------------------------------
-@hydra.main(config_path = "config", config_name = "tilt_matching_local.yaml")
+@hydra.main(config_path = "config", config_name = "trial_countdown.yaml")
 def main(cfg: DictConfig):
     train(cfg)
 

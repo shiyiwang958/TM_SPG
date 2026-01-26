@@ -3,7 +3,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from datasets import load_dataset, Dataset
+from datasets import load_dataset, Dataset, Value
 import pandas as pd
 from reward_func import extract_hash_answer
 
@@ -30,6 +30,15 @@ def set_random_seed(seed: int = 42):
 
 
 # Constants for prompts
+GSM_SYSTEM_PROMPT = """You are a math expert. You will be given a question to solve. Solve it step by step. Wrap the final answer in a \\boxed{}. 
+Respond in the following format:
+<reasoning>
+Your reasoning here
+</reasoning>
+<answer>
+\\boxed{...}
+</answer>"""
+
 SYSTEM_PROMPT = """
 Respond in the following format:
 <reasoning>
@@ -63,22 +72,19 @@ short_example_1 = "Question:\nSolve the following Sudoku puzzle: 301400202000413
 short_example_2 = "Question:\nSolve the following Sudoku puzzle: 0000100420013142\nAnswer:\n<reasoning>\nInterpret puzzle as 4 rows of 4:\nR1: 0 0 0 0\nR2: 1 0 0 4\nR3: 2 0 0 1\nR4: 3 1 4 2\n\nFill easy singles:\nCol1 missing 4 → R1C1=4.\nCol4 missing 3 → R1C4=3.\nBox A (R1-2,C1-2) missing {2,3} and R1 now needs {1,2} → R1C2=2, R2C2=3.\nR1C3=1.\nR2 now missing 2 → R2C3=2.\nCol2 missing 4 → R3C2=4, then R3C3=3.\n\nFinal grid:\nR1: 4 2 1 3\nR2: 1 3 2 4\nR3: 2 4 3 1\nR4: 3 1 4 2\n</reasoning>\n<answer>\n4213132424313142\n</answer>"
 short_example_3 = "Question:\nSolve the following Sudoku puzzle: 2001403002001420\nAnswer:\n<reasoning>\nInterpret puzzle as 4 rows of 4:\nR1: 2 0 0 1\nR2: 4 0 3 0\nR3: 0 2 0 0\nR4: 1 4 2 0\n\nFill easy singles:\nR1 missing {3,4}; Col2 can't be 1 so R1C2=3 → R1C3=4.\nR4 missing 3 → R4C4=3.\nCol4 missing {2,4}; R2 must take 2 → R2C4=2 → R2C2=1.\nCol1 missing 3 → R3C1=3.\nCol3 missing 1 → R3C3=1 → R3C4=4.\n\nFinal grid:\nR1: 2 3 4 1\nR2: 4 1 3 2\nR3: 3 2 1 4\nR4: 1 4 2 3\n</reasoning>\n<answer>\n2341413232141423\n</answer>"
 
-XML_COT_FORMAT = """
-<reasoning>
-{reasoning}
-</reasoning>
-<answer>
-{answer}
-</answer>
-"""
-
 
 def get_gsm8k_questions(split="train") -> Dataset:
     data = load_dataset("openai/gsm8k", "main")[split]
+
+    # Remove a few questions that are too long (we set max_prompt_length to be 240 tokens)
+    data = data.add_column("_idx", list(range(len(data))))
+    data = data.filter(lambda x: x["_idx"] not in [399, 636, 839, 1202, 1647, 1764, 2161, 2345, 3331, 4670, 5918, 1376, 1527, 1542, 3436, 3625, 4560, 5744])
+    data = data.remove_columns(["_idx"])
+
     return data.map(
         lambda x: {
             "prompt": [
-                {"role": "user", "content": SYSTEM_PROMPT + "\n\n" + x["question"]},
+                {"role": "user", "content": GSM_SYSTEM_PROMPT + "\n\n" + x["question"]},
             ],
             "answer": extract_hash_answer(x["answer"]),
         }
@@ -150,17 +156,49 @@ def get_sudoku_questions_new(few_shot=0) -> Dataset:
         }
     )
 
+TYPE_TO_ID = {
+    "Algebra": 0,
+    "Intermediate Algebra": 1,
+    "Prealgebra": 2,
+    "Geometry": 3,
+    "Number Theory": 4,
+    "Counting & Probability": 5,
+    "Precalculus": 6,
+}
+
+ID_TO_TYPE = {
+    0: "Algebra",
+    1: "Intermediate Algebra",
+    2: "Prealgebra",
+    3: "Geometry",
+    4: "Number Theory",
+    5: "Counting & Probability",
+    6: "Precalculus",
+}
+
 def get_math_questions(split="train") -> Dataset:
     data = load_dataset("ankner/math-500", split=split)  # type: ignore
+    def to_int(level: str) -> int:
+        x = level.strip().removeprefix("Level ").strip()
+        return 5 if x == "?" else int(x) - 1
     data = data.map(
         lambda x: {  # type: ignore
             "prompt": [
                 {
                     "role": "user",
-                    "content": f"{SYSTEM_PROMPT}\n\nYou are a math expert. You will be given a question to solve. Solve it step by step. Wrap the final answer in a \\boxed{{}}. \n\n{x['problem']}",
+                    # "content": f"{SYSTEM_PROMPT}\n\nYou are a math expert. You will be given a question to solve. Solve it step by step. Wrap the final answer in a \\boxed{{}}. \n\n{x['problem']}",
+                    "content": GSM_SYSTEM_PROMPT + "\n\n" + x['problem']
                 },
             ],
             "answer": x["solution"],
-        }
-    )  # type: ignore
-    return data  # type: ignore
+            "level": to_int(x["level"]),
+            "type": TYPE_TO_ID[x["type"]],
+        },
+        remove_columns=["solution", "problem"]
+    )
+    # Remove a few questions that are too long (we set max_prompt_length to be 200 tokens)
+    data = data.add_column("_idx", list(range(len(data))))
+    #399data = data.filter(lambda x: x["_idx"] not in [47, 67, 106, 261, 299, 324, 374, 513, 520, 543, 544, 579, 586, 598, 645, 720, 951, 963, 1016, 1023, 1170, 1210, 1211, 1308, 1507, 1518, 1531, 1562, 1581, 1587, 1636, 1665, 1723, 1773, 1818, 1839, 1862, 1933, 2008, 2011, 2029, 2046, 2049, 2132, 2171, 2185, 2268, 2278, 2286, 2388, 2412, 2434, 2500, 2644, 2663, 2680, 2681, 2737, 2842, 2899, 2919, 2938, 2963, 2965, 3103, 3148, 3243, 3385, 3441, 3464, 3471, 3477, 3488, 3491, 3538, 3555, 3557, 3566, 3656, 3773, 3813, 3925, 3930, 3945, 4014, 4059, 4079, 4106, 4112, 4156, 4197, 4221, 4231, 4271, 4273, 4290, 4323, 4332, 4340, 4361, 4401, 4424, 4512, 4555, 4583, 4588, 4590, 4599, 4784, 4788, 4800, 4801, 4807, 4828, 4880, 4886, 4928, 4959, 4991, 4999, 5004, 5011, 5025, 5093, 5191, 5198, 5201, 5257, 5260, 5292, 5419, 5436, 5452, 5459, 5476, 5495, 5513, 5562, 5595, 5617, 5777, 5823, 5868, 5878, 5893, 5961, 5998, 5999, 6062, 6081, 6155, 6192, 6203, 6229, 6254, 6257, 6274, 6311, 6449, 6486, 6501, 6554, 6556, 6574, 6620, 6646, 6669, 6707, 6712, 6787, 6825, 6859, 6869, 6908, 6920, 7150, 7220, 7230, 7269, 7286, 7347, 7379, 7399, 7431, 7469, 7478, 7547, 7567])
+    data = data.filter(lambda x: x["_idx"] not in [3, 32, 47, 67, 90, 106, 114, 261, 284, 299, 324, 374, 470, 499, 513, 520, 543, 544, 579, 583, 586, 598, 644, 645, 704, 720, 780, 822, 951, 963, 1016, 1023, 1170, 1210, 1211, 1243, 1308, 1424, 1462, 1507, 1518, 1523, 1531, 1562, 1581, 1587, 1636, 1647, 1665, 1723, 1773, 1818, 1839, 1840, 1862, 1933, 1957, 2007, 2008, 2011, 2029, 2046, 2049, 2132, 2171, 2185, 2245, 2268, 2278, 2286, 2388, 2412, 2418, 2434, 2500, 2633, 2644, 2663, 2680, 2681, 2710, 2737, 2842, 2899, 2919, 2938, 2963, 2965, 3076, 3086, 3103, 3148, 3243, 3378, 3385, 3441, 3464, 3471, 3477, 3488, 3491, 3520, 3521, 3538, 3555, 3557, 3560, 3566, 3590, 3627, 3635, 3656, 3773, 3780, 3813, 3815, 3925, 3930, 3945, 3966, 3976, 4011, 4014, 4059, 4079, 4106, 4112, 4156, 4195, 4197, 4211, 4221, 4228, 4231, 4271, 4273, 4290, 4323, 4330, 4332, 4340, 4361, 4377, 4401, 4424, 4455, 4512, 4555, 4583, 4588, 4590, 4599, 4731, 4743, 4784, 4788, 4800, 4801, 4807, 4809, 4815, 4828, 4841, 4880, 4886, 4901, 4928, 4959, 4963, 4991, 4999, 5004, 5011, 5025, 5093, 5113, 5191, 5198, 5200, 5201, 5257, 5260, 5292, 5347, 5419, 5436, 5452, 5459, 5463, 5476, 5495, 5513, 5548, 5560, 5562, 5595, 5617, 5731, 5736, 5777, 5786, 5823, 5868, 5878, 5893, 5961, 5998, 5999, 6062, 6081, 6120, 6140, 6141, 6155, 6192, 6203, 6215, 6229, 6254, 6257, 6274, 6311, 6323, 6367, 6449, 6486, 6501, 6524, 6551, 6554, 6556, 6570, 6574, 6620, 6646, 6669, 6707, 6712, 6786, 6787, 6825, 6855, 6859, 6869, 6899, 6908, 6920, 6937, 7039, 7081, 7098, 7150, 7202, 7220, 7230, 7269, 7286, 7347, 7379, 7399, 7431, 7441, 7469, 7478, 7503, 7532, 7547, 7567, 7590])
+    data = data.remove_columns(["_idx"])
+    return data

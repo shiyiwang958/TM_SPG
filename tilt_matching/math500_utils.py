@@ -26,12 +26,20 @@ def boxed_in_answer(prompts, completions, answer, step=None, **kwargs):
         except:
             reward += 0.0
 
-        reward += 1.0 if "\boxed" in r else 0.5
+        # reward += 1.0 if "\\boxed" in r else 0.5
+        if "\\boxed" in r:
+            reward += 0.5
         rewards.append(reward)
     return rewards
 
 
 def is_equiv(str1, str2, verbose=False):
+    if type(str1) == float or type(str2) == float:
+        try:
+            return abs(float(str1) - float(str2)) < 1e-6
+        except:
+            return False
+        
     if str1 is None and str2 is None:
         print("WARNING: Both None")
         return True
