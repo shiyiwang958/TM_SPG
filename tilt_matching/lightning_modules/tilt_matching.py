@@ -8,32 +8,24 @@ from contextlib import contextmanager
 import itertools
 import wandb
 import re
-import json
-import bitsandbytes as bnb
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
+import torch.distributed as dist
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from peft import LoraConfig, get_peft_model, PeftModelForCausalLM, get_peft_model_state_dict, set_peft_model_state_dict
+from data_utils import SYSTEM_PROMPT
 
 
-CTD_SYSTEM_PROMPT = """Respond in the following format:
-<reasoning>
-...
-</reasoning>
-<answer>
-...
-</answer>"""
-
-
-class TiltLogModule(pl.LightningModule):
-    def __init__(self, base_model, tokenizer, training_prompts_dataset, validation_set, reward_funcs, **cfg):
+class DTMModule(pl.LightningModule):
+    def __init__(self, base_model, tokenizer, train_set, validation_set, reward_funcs, **cfg):
         super().__init__()
         self.automatic_optimization = False
-        self.save_hyperparameters(ignore=["base_model", "tokenizer", "training_prompts_dataset", "validation_set", "reward_funcs"], logger=False)
+        self.save_hyperparameters(ignore=["base_model", "tokenizer", "train_set", "validation_set", "reward_funcs"], logger=False)
         self.tokenizer = tokenizer
 
+        # --- Set up student and teacher models with PEFT LoRA adapters ---
         peft_config = LoraConfig(
             r=self.hparams.lora_r,
             lora_alpha=self.hparams.lora_alpha,
@@ -41,7 +33,6 @@ class TiltLogModule(pl.LightningModule):
             task_type=self.hparams.peft_task_type,
             lora_dropout=self.hparams.lora_dropout,
         )
-
         peft_wrapped = get_peft_model(base_model, peft_config, adapter_name="student")
         peft_wrapped.add_adapter("teacher", peft_config)
         student_state = get_peft_model_state_dict(peft_wrapped, adapter_name="student")
@@ -50,43 +41,33 @@ class TiltLogModule(pl.LightningModule):
         for name, param in peft_wrapped.named_parameters():
             if ".teacher" in name:
                 param.requires_grad = False
-
         peft_wrapped.set_adapter("student")
         self.model = peft_wrapped
 
+        # --- Initialize dataset, reward functions, and buffer-related variables ---
         self.curr_prompt_counter = 0
-        self.training_prompts_dataset = training_prompts_dataset
-        self.training_prompts_dataset_len = len(training_prompts_dataset)
+        self.train_set = train_set
+        self.train_set_len = len(train_set)
+        self.validation_set = validation_set
         self.reward_funcs = reward_funcs
-        self.reward_weights = None
 
-        self.a = 0.0
-        self.h = self.hparams.tm.h
-        self.steps_per_h = self.hparams.tm.steps_per_h
-        self.a_end = self.hparams.tm.a_end
-        self.mask_id = 126336
-        self.cv = self.hparams.tm.control_variate
         self.buffer = None
         self.buffer_rewards = None
-        self.student_buffer = None
-        self.student_rewards = None
         self._rebuild_buffer_next_phase = False
         self.num_buffer_prompts = self.hparams.tm.num_buffer_prompts
         self.comps_per_prompt = self.hparams.tm.num_completions_per_prompt
         self.buffer_update_counter = 0
         self._grad_accum_counter = 0
-        self.log_counter = 1
-        self.dict_for_logs = {}
-        self.log_student_steps = self.hparams.tm.student_log_steps
-        self.log_student = getattr(self.hparams.tm, "log_student", True)
-        self.log_temperature = getattr(self.hparams.tm, "log_temperature", 1.0) 
-        self.student_logs_per_prompt = getattr(self.hparams.tm, "student_logs_per_prompt", 4)
-        self.validation_set = validation_set
-        # micro-step metric accumulation
-        self._micro_log_sums = {}
-        self._micro_log_counts = {}
-        self._micro_log_mins = {}
-        self._micro_log_maxs = {}
+        self._step_counter = 0
+
+        # --- Set up DTM hyperparameters ---
+        self.a = 0.0
+        self.h = self.hparams.tm.h
+        self.steps_per_h = self.hparams.tm.steps_per_h
+        self.a_end = self.hparams.tm.a_end
+        self.mask_id = 126336
+        self.rwd_shift = self.hparams.tm.rwd_shift
+        self.cv = self.hparams.tm.control_variate
 
         self.lr = self.hparams.learning_rate
         self.lr_scheduler_type = self.hparams.lr_scheduler_type
@@ -94,21 +75,27 @@ class TiltLogModule(pl.LightningModule):
         self.lr_warmup_ratio = getattr(self.hparams, "lr_warmup_ratio", 0)
         self.lr_min = getattr(self.hparams, "lr_min", 0.0)
         self._tm_sched_state = None
+
         # EMA over student adapter weights (per h-phase)
         self.use_ema = getattr(self.hparams.tm, "use_ema", True)
         self.ema_decay = getattr(self.hparams.tm, "ema_decay", 0.999)
         self._ema_shadow = None
 
-    # def load_test_dataset(self):
-    #     self.dataset = []
-    #     cur_path = os.path.dirname(os.path.abspath(__file__))
-    #     print(f"cur_path: {cur_path}")
-    #     with open(f"{cur_path}/../../dataset/countdown_cd3_test.jsonl", "r") as f:
-    #         for line in f:
-    #             self.dataset.append(json.loads(line))
-        
-    #     print(len(self.dataset), "examples loaded")
-    #     return self.dataset
+        # --- Set up control variate estimation and logging ---
+        self._cv_num_accum = None  # sum of w*<pi_theta-delta, delta-pi_a> over masked positions
+        self._cv_den_accum = None  # sum of ||delta-pi_a||^2 over masked positions
+        self._cv_ema_beta = float(getattr(self.hparams.tm, "control_variate_ema", 0.05))
+        self.dict_for_logs = {}
+        self.ckpt_counter = 0
+        self.log_student_steps = self.hparams.tm.student_log_steps
+        self.log_student = getattr(self.hparams.tm, "log_student", True)
+        self.log_temperature = getattr(self.hparams.tm, "log_temperature", 0.0) 
+        self.student_logs_per_prompt = getattr(self.hparams.tm, "student_logs_per_prompt", 1)
+        # for micro-step metric accumulation:
+        self._micro_log_sums = {}
+        self._micro_log_counts = {}
+        self._micro_log_mins = {}
+        self._micro_log_maxs = {}
 
     @contextmanager
     def _use_adapter(self, adapter_name: str):
@@ -138,20 +125,19 @@ class TiltLogModule(pl.LightningModule):
     def load_state_dict(self, state_dict, strict: bool = True):
         """
         Load adapter weights saved via `state_dict`.
-
         Expects keys with prefixes `model_adapter.` (student) and `base_adapter.` (teacher).
         
         Args:
             state_dict: Dictionary containing adapter weights
             strict: If True, raise error on missing or unexpected keys
-            student_copy_over: If True, load student adapter weights into both student and teacher.
-                             If False, load normally (student from model_adapter, teacher from base_adapter).
+
+        student_copy_over: If True, load student adapter weights into both student and teacher.
+            If False, load normally (student from model_adapter, teacher from base_adapter).
         
         Returns a dict mirroring torch's load_state_dict with any missing or unexpected keys.
         """
         # Allow control via hparams if not explicitly specified
-        student_copy_over = getattr(self.hparams.tm, "student_copy_over", False)
-        keep_base_diverse = getattr(self.hparams.tm, "keep_base_diverse", False)
+        student_copy_over = getattr(self.hparams, "student_copy_over", False)
         
         expected_student = set(get_peft_model_state_dict(self.model, adapter_name="student").keys())
         expected_teacher = set(get_peft_model_state_dict(self.model, adapter_name="teacher").keys())
@@ -171,10 +157,7 @@ class TiltLogModule(pl.LightningModule):
                 bare = key[len("base_adapter."):]
                 # Only load base_adapter into teacher if student_copy_over is False
                 if not student_copy_over:
-                    if not keep_base_diverse:
-                        teacher_state[bare] = value.to(self.model.device)
-                    else:
-                        continue
+                    teacher_state[bare] = value.to(self.model.device)
             else:
                 unexpected_keys.append(key)
 
@@ -183,10 +166,7 @@ class TiltLogModule(pl.LightningModule):
 
         missing_student = list(expected_student - set(student_state.keys()))
         # Only check for missing teacher keys if we're actually loading them
-        if keep_base_diverse:
-            missing_teacher = []
-        else:
-            missing_teacher = list(expected_teacher - set(teacher_state.keys()))
+        missing_teacher = list(expected_teacher - set(teacher_state.keys()))
         missing_keys = [f"model_adapter.{k}" for k in missing_student] + [f"base_adapter.{k}" for k in missing_teacher]
 
         if strict and (missing_keys or unexpected_keys):
@@ -198,19 +178,17 @@ class TiltLogModule(pl.LightningModule):
 
     def on_train_start(self):
         super().on_train_start()
-        
-        # Reset global_step if resuming from checkpoint
-        # (Lightning restores it after on_load_checkpoint, so we override it here)
-        reset_global_step = getattr(self.hparams.tm, "reset_global_step", False)
-        if reset_global_step and self.trainer.global_step > 0:
-            print(f"Resetting global_step from {self.trainer.global_step} to 0")
-            # Reset the internal batch progress counters
-            self.trainer.fit_loop.epoch_loop.batch_progress.current.completed = 0
-            self.trainer.fit_loop.epoch_loop.batch_progress.total.completed = 0
-            # Reset manual optimization step progress (critical for global_step)
-            self.trainer.fit_loop.epoch_loop.manual_optimization.optim_step_progress.current.completed = 0
-            self.trainer.fit_loop.epoch_loop.manual_optimization.optim_step_progress.total.completed = 0
-            print(f"After reset, global_step is now: {self.trainer.global_step}")
+        if getattr(self.hparams, "eval", False):
+            self.logging_student(self.model, self.student_logs_per_prompt)
+
+        global_world_size = getattr(self.trainer, "world_size", 1)
+        global_rank = getattr(self.trainer, "global_rank", 0)
+        logical_world_size = min(global_world_size, self.hparams.world_size)
+        logical_rank = global_rank % logical_world_size
+        self.g = torch.Generator(device=self.device)
+        self.g.manual_seed(12345 + logical_rank)
+
+        self._start_step = getattr(self, "global_step", 0)
         
         # Set up optimizer and LR
         self.tm_opt = self.optimizers()
@@ -232,13 +210,6 @@ class TiltLogModule(pl.LightningModule):
             eps=self.hparams.adam_epsilon,
             weight_decay=self.hparams.weight_decay,
         )
-        # opt = bnb.optim.PagedAdamW32bit(
-        #     params,
-        #     lr=self.hparams.learning_rate,
-        #     betas=(self.hparams.adam_beta1, self.hparams.adam_beta2),
-        #     eps=self.hparams.adam_epsilon,
-        #     weight_decay=self.hparams.weight_decay,
-        # )
         return opt
     
     def on_train_batch_start(self, batch, batch_idx):
@@ -246,7 +217,7 @@ class TiltLogModule(pl.LightningModule):
         # do it now (i.e., at the start of the new h-phase), after checkpointing.
         if getattr(self, "_rebuild_buffer_next_phase", False):
             self._update_buffer(self.model, self.num_buffer_prompts, self.comps_per_prompt)
-            print(f"[DEBUG] Buffer built at start of new h-phase (global step {self.global_step}) with shape {self.buffer.shape}")
+            print(f"[DEBUG] Buffer built at start of new h-phase (global step {self.global_step})")
             self._rebuild_buffer_next_phase = False
     
     # ---------------------------
@@ -340,19 +311,32 @@ class TiltLogModule(pl.LightningModule):
         micro-steps to avoid an all-reduce every backward pass.
 
         Args:
-            batch: Dummy batch (not used).
-            batch_idx: Index of the batch (not used).
+            batch: Dummy batch (not used, for Lightning interface only).
+            batch_idx: Index of the batch (not used, for Lightning interface only).
         """
-        step_start_time = datetime.now()
         opt = self.tm_opt
         accum = self.hparams.tm.grad_accum_steps
 
         # At the start of a new accumulation window:
         if (self._grad_accum_counter % accum) == 0:
+            if getattr(self.hparams.tm, "mix_batches", False):
+                total_sample_needed = self.hparams.tm.num_batch_prompts * self.comps_per_prompt * accum
+                self._accum_prompts_idx = torch.randperm(self.buffer.shape[0] * self.comps_per_prompt, device=self.device)[:total_sample_needed]              
+            else:
+                total_prompts_needed = self.hparams.tm.num_batch_prompts * accum
+                self._accum_prompts_idx = torch.randperm(self.buffer.shape[0], device=self.device)[:total_prompts_needed]
+            self._reset_micro_log_accum()
             # randomly choose the prompts to use for the microsteps
             total_prompts_needed = self.hparams.tm.num_batch_prompts * accum
-            self._accum_prompts_idx = torch.randperm(self.buffer.shape[0], device=self.device)[:total_prompts_needed]
+            # self._accum_prompts_idx = torch.randperm(self.buffer.shape[0], device=self.device)[:total_prompts_needed]
+            self._accum_prompts_idx = torch.randperm(
+                self.buffer.shape[0],
+                device=self.device,
+                generator=self.g
+            )[:total_prompts_needed]
             self._reset_micro_log_accum()
+            self._cv_num_accum = torch.zeros((), device=self.device)
+            self._cv_den_accum = torch.zeros((), device=self.device)
 
         loss, micro_log_dict = self._tm_step()
         self._accumulate_micro_log_dict(micro_log_dict)
@@ -362,21 +346,15 @@ class TiltLogModule(pl.LightningModule):
         self._grad_accum_counter += 1
         is_update_step = (self._grad_accum_counter % accum) == 0
         if not is_update_step:
-            with self.trainer.strategy.block_backward_sync():
+            with self.trainer.model.no_sync():
                 self.manual_backward(loss_scaled)
+            self.dict_for_logs = {}
+            return
         else:
             self.manual_backward(loss_scaled)
 
-        # Only update weights / schedules on the last micro-step of the window
-        if not is_update_step:
-            # Prevent logging hooks from trying to log multiple micro-steps at the same global_step
-            self.dict_for_logs = {}
-            return loss.detach()
-
-        # ---- Optimizer / scheduler step ----
+        # ---- Perform gradient update on the student and step optimizer ----
         self._step_tm_scheduler()
-
-        # Gradient clipping (on accumulated grads)
         params = [p for p in self.model.parameters() if p.requires_grad]
         grad_norm_before = clip_grad_norm_(params, self.hparams.max_grad_norm).item()
         grad_norm_after = clip_grad_norm_(params, float("inf")).item()
@@ -384,32 +362,32 @@ class TiltLogModule(pl.LightningModule):
 
         opt.step()
         opt.zero_grad(set_to_none=True)
-        # Apply EMA to student weights (per h-phase)
         if self.use_ema:
             self._update_ema()
 
-        if (self.global_step + 2) % self.steps_per_h < 5:
-            print(f"current a is {self.a:.4f}")
-            print(f"global step is {self.global_step}")
+        # ---- Update control variate once per global step (after grad accumulation, synced across GPUs) ----
+        # Aggregate across all GPUs
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(self._cv_num_accum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(self._cv_den_accum, op=dist.ReduceOp.SUM)
+
+        c_batch = (-self._cv_num_accum / self._cv_den_accum.clamp_min(1e-12))
+        cv_old = torch.tensor(float(self.cv), device=self.device)
+        cv_new = (1.0 - self._cv_ema_beta) * cv_old + self._cv_ema_beta * c_batch
+        self.cv = float(cv_new.item())
 
         # Build averaged metrics (over micro-steps) for this optimizer/global step
         self.dict_for_logs = self._finalize_micro_log_dict()
-
-        # Reconstruct correct fraction across the full accumulation window
-        if "train/correct_sum" in self.dict_for_logs and "train/correct_count" in self.dict_for_logs:
-            denom = self.dict_for_logs.pop("train/correct_count", 0.0)
-            num = self.dict_for_logs.pop("train/correct_sum", 0.0)
-            if denom > 0:
-                self.dict_for_logs["train/correct_frac"] = num / denom
 
         # Log current learning rate and grad norms
         self.dict_for_logs["train/lr"] = opt.param_groups[0]["lr"]
         self.dict_for_logs["grads/grad_norm_before"] = grad_norm_before
         self.dict_for_logs["grads/grad_norm_after"] = grad_norm_after
         self.dict_for_logs["grads/grad_clipped"] = grad_clipped
+        self.dict_for_logs["train/cv"] = self.cv
 
-        # At each h phase boundary, update a and the teacher adapter; save ckpt if necessary
-        if self.global_step % self.steps_per_h == 0:
+        # At each h phase boundary, update a and the teacher adapter
+        if (self.global_step - self._start_step) % self.steps_per_h == 0:
             self.a += self.h
             if self.a + self.h > self.a_end:
                 self.h = self.a_end - self.a
@@ -422,6 +400,7 @@ class TiltLogModule(pl.LightningModule):
                         if full_name in self._ema_shadow:
                             teacher_state[key] = self._ema_shadow[full_name]
                         else:
+                            print("[WARNING] EMA key missing for teacher adapter weight:", full_name)
                             # Fallback to current student weight if EMA key missing
                             student_state = get_peft_model_state_dict(self.model, adapter_name="student")
                             teacher_state[key] = student_state[key]
@@ -446,9 +425,6 @@ class TiltLogModule(pl.LightningModule):
             self._reset_ema()
 
         self.log("ckpt_a", self.a, on_step=True, on_epoch=False, sync_dist=True)
-        step_end_time = datetime.now()
-        time_per_step = (step_end_time - step_start_time).total_seconds()   
-        return loss
 
     def _tm_step(self):
         num_buffer_prompts, comps_per_prompt, L = self.buffer.shape
@@ -457,29 +433,35 @@ class TiltLogModule(pl.LightningModule):
         gen_length = self.hparams.max_completion_length
 
         # Draw a batch from the buffer
-        start_idx = ((self._grad_accum_counter % self.hparams.tm.grad_accum_steps) * num_batch_prompts) % self.buffer.shape[0]
-        end_idx = start_idx + num_batch_prompts
-        idx = (torch.arange(start_idx, end_idx, device=self.device) % self._accum_prompts_idx.shape[0])
-        prompts_idx = self._accum_prompts_idx[idx]
-        x1s = self.buffer[prompts_idx].reshape(B, L)           # [B, L]
-        rwds = self.buffer_rewards[prompts_idx].reshape(B, -1) # [B, num_reward_funcs]
+        if getattr(self.hparams.tm, "mix_batches", False):
+            total_samples = self.buffer.shape[0] * comps_per_prompt
+            start_idx = (self._grad_accum_counter % self.hparams.tm.grad_accum_steps) * B
+            end_idx = start_idx + B
+            idx = (torch.arange(start_idx, end_idx, device=self.device) % self._accum_prompts_idx.shape[0])
+            prompts_idx = self._accum_prompts_idx[idx]
+            flat_buffer = self.buffer.reshape(-1, L)
+            flat_rewards = self.buffer_rewards.reshape(-1, self.buffer_rewards.shape[-1])
+            x1s = flat_buffer[prompts_idx]           # [B, L]
+            del flat_buffer
+            rwds = flat_rewards[prompts_idx]         # [B, num_reward_funcs]
+            del flat_rewards
+        else:
+            start_idx = (self._grad_accum_counter % self.hparams.tm.grad_accum_steps) * num_batch_prompts
+            end_idx = start_idx + num_batch_prompts
+            idx = (torch.arange(start_idx, end_idx, device=self.device) % self._accum_prompts_idx.shape[0])
+            prompts_idx = self._accum_prompts_idx[idx]
+            x1s = self.buffer[prompts_idx].reshape(B, L)           # [B, L]
+            rwds = self.buffer_rewards[prompts_idx].reshape(B, -1) # [B, num_reward_funcs]
 
         # Aggregate rewards from multiple functions
-        if self.reward_weights is None:
-            weights = torch.ones(rwds.shape[1], device=self.device, dtype=rwds.dtype)
-        else:
-            weights = self.reward_weights.to(device=self.device, dtype=rwds.dtype)
+        weights = torch.ones(rwds.shape[1], device=self.device, dtype=rwds.dtype)
         rwd = torch.nansum(rwds * weights.unsqueeze(0), dim=1) # [B,]
-        # Count totally correct samples so we can aggregate across micro-steps
-        if self.hparams.dataset == "countdown":
-            correct_mask = torch.isclose(rwd, self.hparams.max_rwd * torch.ones_like(rwd), atol=1e-5, rtol=0.0) | \
-                       torch.isclose(rwd, self.hparams.max_rwd * self.hparams.scale_factor * torch.ones_like(rwd), atol=1e-5, rtol=0.0)
-        elif self.hparams.dataset == "gsm8k":
-            correct_mask = torch.isclose(rwds[:, -1], 2.0 * torch.ones_like(rwd), atol=1e-5, rtol=0.0)
+        if self.hparams.dataset == "gsm8k":
+            correct_frac = torch.isclose(rwds[:, -1], 2.0 * torch.ones_like(rwd), atol=1e-6, rtol=0.0).float().mean()
         elif self.hparams.dataset == "math":
-            correct_mask = torch.isclose(rwds[:, 0], 2.0 * torch.ones_like(rwd), atol=1e-5, rtol=0.0)
-        correct_sum = correct_mask.sum().float()
-        correct_count = torch.tensor(float(correct_mask.numel()), device=self.device)
+            correct_frac = torch.isclose(rwds[:, 0], 2.0 * torch.ones_like(rwd), atol=1e-6, rtol=0.0).float().mean()
+        else:
+            correct_frac = torch.isclose(rwd, self.hparams.max_rwd * torch.ones_like(rwd), atol=1e-6, rtol=0.0).float().mean()
         
         # Create x_t's by masking the x_1's
         num_to_mask = torch.randint(low=1, high=gen_length+1, size=(x1s.shape[0],), device=self.device)
@@ -499,10 +481,31 @@ class TiltLogModule(pl.LightningModule):
             old_logits  /= temp
             curr_logits /= temp
         old_probs = F.softmax(old_logits, dim=-1) # [B, gen_length, V]
+        with torch.no_grad():
+            curr_probs_ng = F.softmax(curr_logits, dim=-1)  # [B, gen_length, V]
         
-        loss_type = self.hparams.tm.loss_type
         # shift reward for minimizing gradient variance for loss computation
-        hr = self.h * (rwd + self.hparams.tm.rwd_shift) # [B,]
+        hr = self.h * (rwd + self.rwd_shift) # [B,]
+
+        # learnable control variate accumulation
+        with torch.no_grad():
+            w = torch.exp(hr).view(-1, 1)  # [B,1]
+
+            # A = delta - pi_a, B = pi_theta - delta
+            A = x1_equals_v - old_probs       # [B,L,V]
+            Bv = curr_probs_ng - x1_equals_v  # [B,L,V]
+
+            dot = (Bv * A).sum(dim=-1)  # [B,L]
+            den = (A * A).sum(dim=-1)   # [B,L]
+
+            self._cv_num_accum += (w * dot)[mask_indices.bool()].sum()
+            self._cv_den_accum += den[mask_indices.bool()].sum()
+                
+        prev_cv = self.cv
+        if not getattr(self.hparams.tm, "learned_cv", False):
+            self.cv = self.hparams.tm.control_variate
+
+        loss_type = self.hparams.tm.loss_type
         if loss_type == "itm":
             target = self.cv * old_probs + x1_equals_v * (1 - self.cv + torch.expm1(hr)).view(-1, 1, 1) # [B, gen_length, V]
         elif loss_type == "etm":
@@ -514,6 +517,7 @@ class TiltLogModule(pl.LightningModule):
             raise ValueError(f"Invalid loss_type: {loss_type}")
         per_sample_losses = -(target * F.log_softmax(curr_logits, dim=-1)).sum(dim=-1) # [B, gen_length]
         loss = per_sample_losses[mask_indices.bool()].mean()
+        self.cv = prev_cv
 
         log_dict = {
             f"train/loss": loss,
@@ -524,30 +528,27 @@ class TiltLogModule(pl.LightningModule):
             f"train/rwd_min": rwd.min(),
             f"train/rwd_mean": rwd.mean(),
             f"train/rwd_std": rwd.std(),
-            f"train/correct_sum": correct_sum,
-            f"train/correct_count": correct_count,
+            f"train/correct_frac": correct_frac,
+            f"charts/step_counter": self._step_counter,
         }
         
         return loss, log_dict
     
     def on_train_batch_end(self, outputs, batch, batch_idx):
-
         if (self._grad_accum_counter % self.hparams.tm.grad_accum_steps) == 0:
-            if self.global_step % self.log_student_steps == 0 and self.log_student:
-                self.log_counter += 1
-                self.log("log_counter", self.log_counter, on_step=True, on_epoch=False, sync_dist=True)
-                print(f"logging counter is {self.log_counter}", flush=True)
-                self.logging_student(self.model, self.num_buffer_prompts, self.student_logs_per_prompt)
-
-            if self.global_step % self.steps_per_h == 0:
+            if (self.global_step - self._start_step + 1) % self.hparams.ckpt_freq == 0:
+                self.ckpt_counter += 1
+                self.log("ckpt_counter", self.ckpt_counter, on_step=True, on_epoch=False, sync_dist=True)
+            if (self.global_step - self._start_step) % self.log_student_steps == 0 and self.log_student:
+                self.logging_student(self.model, self.student_logs_per_prompt)
+            if (self.global_step - self._start_step) % self.steps_per_h == 0:
                 self._rebuild_buffer_next_phase = True
                 print(f"[DEBUG] Scheduled buffer rebuild for next h-phase at global step {self.global_step}")
             # Partially refresh buffer
-            elif self.global_step % self.hparams.tm.buffer_refresh_steps == 0:
+            elif (self.global_step - self._start_step) % self.hparams.tm.buffer_refresh_steps == 0:
                 print(f"[DEBUG] Refreshing {self.hparams.tm.num_buffer_refresh} prompts at global step {self.global_step}")
                 self._update_buffer(self.model, self.hparams.tm.num_buffer_refresh, self.comps_per_prompt)
-#TODO print prompt as well for eval
-        if not self.dict_for_logs or (self.global_step - 1) % self.hparams.metrics_log_every != 0:
+        if not self.dict_for_logs or (self.global_step - self._start_step - 1) % self.hparams.metrics_log_every != 0:
             return
         # log all at once
         try:
@@ -563,21 +564,25 @@ class TiltLogModule(pl.LightningModule):
         except Exception:
             pass
         self.log_dict(self.dict_for_logs, on_step=True, on_epoch=False, sync_dist=True)
-        # self.monitor_sudoku()
         self.dict_for_logs = {}
+        self._step_counter += 1
     
     def on_save_checkpoint(self, checkpoint: dict):
         print(f"saving checkpoint at global step = {self.global_step}")
-        checkpoint["tilt"] = {"a": self.a, "h": self.h}
+        checkpoint["tilt_a"] = self.a
         checkpoint["prompt_counter"] = self.curr_prompt_counter
-        checkpoint["grad_accum_counter"] = getattr(self, "_grad_accum_counter", 0)
+        checkpoint["tm_sched_state"] = copy.deepcopy(getattr(self, "_tm_sched_state", None))
+        checkpoint["step_counter"] = self._step_counter + 1 # since ckpt saving is before on_train_batch_end
+        checkpoint["ckpt_counter"] = self.ckpt_counter
         
     def on_load_checkpoint(self, checkpoint: dict):
-        tilt = checkpoint.get("tilt", None)
-        self.a = tilt.get("a", 0.0)
-        # self.h = tilt.get("h", 2.5e-3)
+        self.a = checkpoint.get("tilt_a", 0.0)
         self.curr_prompt_counter = checkpoint.get("prompt_counter", 0)
-        self._grad_accum_counter = checkpoint.get("grad_accum_counter", 0)
+        self._tm_sched_state = checkpoint.get("tm_sched_state", None)
+        self.cv = float(checkpoint.get("cv", getattr(self, "cv", 0.0)))
+        self._step_counter = checkpoint.get("step_counter", 0)
+        self._resuming_from_ckpt = True
+        self.ckpt_counter = checkpoint.get("ckpt_counter", 0)
         
         # # Reset global_step to 0 when loading checkpoint
         # # This must be done in the checkpoint dict before Lightning restores it
@@ -590,7 +595,7 @@ class TiltLogModule(pl.LightningModule):
 
     def _prepare_prompts(self, num_dinstinct_prompts, num_completions_per_prompts):
         """
-        Select `num_dinstinct_prompts` prompts from `self.training_prompts_dataset`,
+        Select `num_dinstinct_prompts` prompts from `self.train_set`,
         starting at `self.curr_prompt_counter`, repeat each prompt for
         `num_completions_per_prompts` times, and return a tensor of token IDs
         ready to be passed to `self._generate`.
@@ -613,17 +618,17 @@ class TiltLogModule(pl.LightningModule):
                 self.curr_prompt_counter
                 + (offset * logical_world_size)
                 + logical_rank
-            ) % self.training_prompts_dataset_len
+            ) % self.train_set_len
             indices.append(idx)
         self.curr_prompt_counter += (num_dinstinct_prompts * logical_world_size)
-        self.curr_prompt_counter %= self.training_prompts_dataset_len
+        self.curr_prompt_counter %= self.train_set_len
         # Remember which dataset rows were used, for reward computation later
         self._last_prompt_indices = indices
 
         # ---- 2. Extract structured prompts from the dataset ----
         # For get_countdown_questions, each element looks like:
         #   {"prompt": [{"role": "user", "content": "..."}], "target": ..., "numbers": ...}
-        structured_prompts = [self.training_prompts_dataset[i]["prompt"] for i in indices]
+        structured_prompts = [self.train_set[i]["prompt"] for i in indices]
 
         # ---- 3. Convert structured prompts to plain text and tokenize ----
         prompts_text = []
@@ -634,7 +639,7 @@ class TiltLogModule(pl.LightningModule):
                 # Typical case for Sudoku / GSM8K / math: [{"role": "...", "content": "..."}]
                 text = self.tokenizer.apply_chat_template(sp, tokenize=False, add_generation_prompt=True)
             else:
-                raise TypeError(f"Unsupported prompt type {type(sp)} in training_prompts_dataset")
+                raise TypeError(f"Unsupported prompt type {type(sp)} in train_set")
             prompts_text.append(text)
 
         input_ids = self.tokenizer(
@@ -736,7 +741,7 @@ class TiltLogModule(pl.LightningModule):
                 print(f"Completion {i+1}/{completion_ids.shape[0]}: {completions_text[i]}")
         
         # ---- 5. Build reward inputs: prompts, completions, and extra dataset columns ----
-        data_keys = [key for key in self.training_prompts_dataset[0].keys() if key != "prompt"]
+        data_keys = [key for key in self.train_set[0].keys() if key != "prompt"]
         # For each generated sample we need:
         #   - a structured prompt (list of chat messages)
         #   - a structured completion (list with one assistant message)
@@ -746,7 +751,7 @@ class TiltLogModule(pl.LightningModule):
         reward_kwargs = {key: [] for key in data_keys}
 
         for row_idx in self._last_prompt_indices:
-            row = self.training_prompts_dataset[row_idx]
+            row = self.train_set[row_idx]
             base_prompt = row["prompt"]  # list[{"role": ..., "content": ...}, ...]
 
             for _ in range(num_completions_per_prompt):
@@ -784,7 +789,7 @@ class TiltLogModule(pl.LightningModule):
             
             # Get the prompt index in the dataset
             row_idx = self._last_prompt_indices[i]
-            row = self.training_prompts_dataset[row_idx]
+            row = self.train_set[row_idx]
             
             # Extract target and numbers for this prompt
             target = row.get("target", None)
@@ -824,6 +829,14 @@ class TiltLogModule(pl.LightningModule):
             self.buffer_rewards = new_rewards_block
         else:
             self.buffer_rewards[update_rows, :, :] = new_rewards_block
+        
+        avg_rwd = float(new_rewards_block.mean() * new_rewards_block.shape[-1])
+
+        print(f"[EVAL] average reward = {avg_rwd:.3f}")
+        
+        if getattr(self, "_rebuild_buffer_next_phase", False) and getattr(self.hparams.tm, "rwd_shift_auto", True):
+            self.rwd_shift = - self.all_gather(torch.tensor(avg_rwd, device=self.device)).mean().item()
+            print(f"New phase: setting rwd_shift = {self.rwd_shift:.3f}")
 
         buffer_end_time = datetime.now()
         buffer_build_time = (buffer_end_time - buffer_start_time).total_seconds()
@@ -833,7 +846,7 @@ class TiltLogModule(pl.LightningModule):
         model.set_adapter(prev_adapter)
         model.train()
 
-    def logging_student(self, model, num_buffer_updates, num_completions_per_prompt):
+    def logging_student(self, model, num_completions_per_prompt):
         """
         Evaluate the student model on the validation set.
         - Distributes validation examples across GPUs
@@ -866,43 +879,33 @@ class TiltLogModule(pl.LightningModule):
         # Get this GPU's subset of validation examples
         val_subset_indices = list(range(start_idx, end_idx))
         num_val_prompts = len(val_subset_indices)
-        
         print(f"[GPU {global_rank}/{global_world_size}] Evaluating {num_val_prompts} validation examples (indices {start_idx} to {end_idx-1})")
         
         # ---- 2. Prepare prompts from validation set ----
-        structured_prompts = []
-        # targets = []
-        # numbers_list = []
-
-        for idx in val_subset_indices:
-            structured_prompts.append(self.validation_set[idx]["prompt"])
+        structured_prompts = [self.validation_set[i]["prompt"] for i in val_subset_indices]
         
-        prompts_text = []
-        for sp in structured_prompts:
-            text = self.tokenizer.apply_chat_template(sp, tokenize=False, add_generation_prompt=True)
-            prompts_text.append(text)
+        if self.hparams.dataset == "countdown":
+            structured_prompts = []
+            targets = []
+            numbers_list = []
         
-        # for idx in val_subset_indices:
-        #     val_entry = self.validation_set[idx]
-        #     # Extract target and numbers like in __getitem__
-        #     target = int(val_entry["output"])
-        #     numbers_str = val_entry["input"]
-        #     numbers = [int(num) for num in numbers_str.split(",")]
-            
-        #     # Create structured prompt matching countdown.py format
-        #     prompt_text = f"{CTD_SYSTEM_PROMPT}\nUsing only the numbers {numbers}, create an arithmetic expression that evaluates to exactly {target}. You must use all numbers from the list, and each number must be used exactly once. You may use the operations +, -, *, and / as needed. After reasoning, provide only your final expression inside <answer></answer> tags without including an equals sign or the target number. For example, if the numbers are [2, 3, 4] and the target is 5, a valid answer is: <answer>\n2*4-3\n</answer>"
-        #     structured_prompt = [{"role": "user", "content": prompt_text}]
-            
-        #     structured_prompts.append(structured_prompt)
-        #     targets.append(target)
-        #     numbers_list.append(numbers)
+            for idx in val_subset_indices:
+                val_entry = self.validation_set[idx]
+                target = int(val_entry["output"])
+                numbers_str = val_entry["input"]
+                numbers = [int(num) for num in numbers_str.split(",")]
+                
+                # Create structured prompt matching countdown.py format
+                prompt_text = f"{SYSTEM_PROMPT}\nUsing only the numbers {numbers}, create an arithmetic expression that evaluates to exactly {target}. You must use all numbers from the list, and each number must be used exactly once. You may use the operations +, -, *, and / as needed. After reasoning, provide only your final expression inside <answer></answer> tags without including an equals sign or the target number. For example, if the numbers are [2, 3, 4] and the target is 5, a valid answer is: <answer>\n2*4-3\n</answer>"
+                structured_prompts.append([{"role": "user", "content": prompt_text}])
+                targets.append(target)
+                numbers_list.append(numbers)
         
+        prompts_text = [self.tokenizer.apply_chat_template(sp, tokenize=False, add_generation_prompt=True) for sp in structured_prompts]
         prompt_ids = self.tokenizer(
             text=prompts_text,
             return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=self.hparams.max_prompt_length,
+            padding="longest",
             padding_side="left",
             add_special_tokens=False,
         )["input_ids"].to(device)
@@ -911,7 +914,7 @@ class TiltLogModule(pl.LightningModule):
         prompt_ids = prompt_ids.repeat_interleave(num_completions_per_prompt, dim=0)
         total_batch, prompt_len = prompt_ids.shape
 
-        # ---- 2. Run diffusion generation to get prompt+completion sequences ----
+        # ---- 3. Run diffusion generation to get prompt+completion sequences ----
         chunk_size = max(1, min(self.hparams.tm.buffer_chunk_size, total_batch)//4)
         gen_length = self.hparams.max_completion_length
         seq_len = prompt_len + gen_length
@@ -938,40 +941,31 @@ class TiltLogModule(pl.LightningModule):
             prompt_completion_ids[start:end].copy_(chunk_completion_ids)
             del chunk_completion_ids
         
-
-        # ---- 4. Reshape into [num_val_prompts, num_completions, seq_len] ----
-        new_buffer_block = prompt_completion_ids.view(num_val_prompts, -1, seq_len)
-        
-        # ---- 5. Decode completions to text for reward computation ----
+        # ---- 4. Decode completions to text for reward computation ----
         completion_ids = prompt_completion_ids[:, prompt_len:]  # [total_batch, gen_length]
         completions_text = self.tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
 
-        # ---- 6. Build reward inputs: prompts, completions, and extra dataset columns ----
-        data_keys = [key for key in self.training_prompts_dataset[0].keys() if key != "prompt"]
-        # For each generated sample we need:
-        #   - a structured prompt (list of chat messages)
-        #   - a structured completion (list with one assistant message)
-        #   - one entry per dataset column (e.g. "answer", "puzzle", "solution", "target", "numbers")
-        prompts_for_rewards = []
-        completions_for_rewards = []
-        reward_kwargs = {key: [] for key in data_keys}
-
-        for row_idx in val_subset_indices:
-            row = self.validation_set[row_idx]
-            base_prompt = row["prompt"]  # list[{"role": ..., "content": ...}, ...]
-
-            # Structured prompt for this completion
-            prompts_for_rewards.append(base_prompt)
-
-            # Copy all extra fields for this completion
-            for key in data_keys:
-                reward_kwargs[key].append(row[key])
+        # ---- 5. Build reward inputs: prompts, completions, and extra dataset columns ----
+        data_keys = [key for key in self.train_set[0].keys() if key != "prompt"]
+        if self.hparams.dataset == "countdown":
+            reward_kwargs = {"target": [], "numbers": []}
+            prompts_for_rewards = structured_prompts
+            for i in range(num_val_prompts):
+                # Add target and numbers for reward computation
+                reward_kwargs["target"].append(targets[i])
+                reward_kwargs["numbers"].append(numbers_list[i])
+        else:
+            reward_kwargs = {key: [] for key in data_keys}
+            prompts_for_rewards = [self.validation_set[i]["prompt"] for i in val_subset_indices]
+            for row_idx in val_subset_indices:
+                # Copy all extra fields for this completion
+                for key in data_keys:
+                    reward_kwargs[key].append(self.validation_set[row_idx][key])
 
         # Turn plain completions into chat-style completions [{"role": "assistant", "content": "..."}]
-        completions_for_rewards = []
-        for text in completions_text:
-            completions_for_rewards.append([{"role": "assistant", "content": text}])
+        completions_for_rewards = [[{"role": "assistant", "content": text}] for text in completions_text]
 
+        # ---- 6. Compute rewards for every generated completion ----
         num_funcs = len(self.reward_funcs)
         rewards_per_func = torch.zeros(total_batch, num_funcs, device=device)
         reward_kwargs["buffer_print_samples"] = int(getattr(self.hparams.tm, "buffer_print_samples", 0))
@@ -990,23 +984,25 @@ class TiltLogModule(pl.LightningModule):
         del completions_for_rewards
         del reward_kwargs
 
-        # # Count how many entries have max reward, and how many have the format correct
-        # num_correct = (new_rewards_block >= self.hparams.max_rwd - 1e-5).sum().item()
-        # frac_num_correct = num_correct / (num_val_prompts * num_completions_per_prompt)  
-        # print(f"[Student Validation] Number of correct completions with max reward: {frac_num_correct:.2f}")
-
-        # format_correct = (new_rewards_block >= self.hparams.format_rwd - 1e-5).sum().item()
-        # frac_format_correct = format_correct / (num_val_prompts * num_completions_per_prompt) - frac_num_correct
-        # print(f"[Student Validation] Number of correct completions with format reward: {frac_format_correct:.2f}")
-
         if self.hparams.dataset == "gsm8k":
-            correct_frac_eval = torch.isclose(rewards_per_func[:, -1], 2.0 * torch.ones_like(rewards_per_func[:, -1]), atol=1e-6, rtol=0.0).float().mean()
+            correct_nums_eval = torch.isclose(rewards_per_func[:, -1], 2.0 * torch.ones_like(rewards_per_func[:, -1]), atol=1e-3, rtol=0.0).float().sum().item()
         elif self.hparams.dataset == "math":
-            correct_frac_eval = torch.isclose(rewards_per_func[:, 0], 2.0 * torch.ones_like(rewards_per_func[:, 0]), atol=1e-6, rtol=0.0).float().mean()
-        avg_rwd_eval = rewards_per_func.sum(dim=-1).mean() # [N_eval,]
-        self.dict_for_logs["eval/correct_frac"] = correct_frac_eval
-        self.dict_for_logs["eval/avg_rwd"] = avg_rwd_eval
-        print(f"[EVAL] At global step {self.global_step}, for gpu {self.global_rank}, student correctness fraction: {correct_frac_eval:.4f}, avg reward: {avg_rwd_eval:.4f}")
+            correct_nums_eval = torch.isclose(rewards_per_func[:, 0], 2.0 * torch.ones_like(rewards_per_func[:, 0]), atol=1e-3, rtol=0.0).float().sum().item()
+        else:
+            correct_nums_eval = torch.isclose(rewards_per_func, self.hparams.max_rwd * torch.ones_like(rewards_per_func), atol=1e-3, rtol=0.0).float().sum().item()
+        total_rwd_eval = rewards_per_func.sum(dim=-1).sum().item()
+        local_counts = torch.tensor([correct_nums_eval, total_rwd_eval, num_val_prompts * num_completions_per_prompt], device=self.device, dtype=torch.long)
+        gathered = self.all_gather(local_counts)  # shape: (world_size, 3) for DDP
+        global_correct = gathered[:, 0].sum()
+        global_rwd = gathered[:, 1].sum()
+        global_total   = gathered[:, 2].sum()
+        global_acc = (global_correct.float() / global_total.float())
+        global_rwd_avg = (global_rwd.float() / global_total.float())
+
+        print(f"[EVAL] Global accuracy is {global_acc:.4f}, global average reward is {global_rwd_avg:.4f}")
+        self.dict_for_logs["eval/correct_frac"] = global_acc.item()
+        self.dict_for_logs["eval/avg_rwd"] = global_rwd_avg.item()
+        # print(f"[EVAL] At global step {self.global_step}, for gpu {self.global_rank}, student correctness fraction: {global_acc:.4f}, avg reward: {global_rwd_avg:.4f}")
         
         buffer_end_time = datetime.now()
         buffer_build_time = (buffer_end_time - buffer_start_time).total_seconds()
@@ -1015,11 +1011,6 @@ class TiltLogModule(pl.LightningModule):
         # restore adapter
         model.set_adapter(prev_adapter)
         model.train()
-
-    def extract_solution(self, solution_str):
-        answer_pattern = r"<answer>(.*?)</answer>"
-        matches = re.findall(answer_pattern, solution_str, re.DOTALL)
-        return matches[-1].strip() if matches else None
 
     def _init_tm_scheduler(self):
         """Initialize a per-h-phase, linear LR scheduler with warmup.

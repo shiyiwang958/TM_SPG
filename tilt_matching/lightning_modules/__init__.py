@@ -1,9 +1,7 @@
 from .tilt_sudoku import TiltSudokuModule
-from .tilt_countdown import TiltCountdownModule
-from .tilt_matching import TiltLogModule
+from .tilt_matching import DTMModule
 
 __all__ = [
-    "TiltSudokuModule",
-    "TiltCountdownModule",
-    "TiltLogModule",
+    "DTMModule",
+    "TiltSudokuModule"
 ]

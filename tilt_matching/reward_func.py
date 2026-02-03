@@ -213,7 +213,7 @@ def int_reward_func(completions, **kwargs) -> list[float]:
     responses = [completion[0]["content"] for completion in completions]
     extracted_responses = [_debox_if_present(extract_xml_answer(r)) for r in responses]
     # extracted_responses = [extract_xml_answer(r) for r in responses]
-    return [0.125 if re.fullmatch(r"-?\d+", r) else 0.0 for r in extracted_responses]
+    return [0.25 if re.fullmatch(r"-?\d+", r) else 0.0 for r in extracted_responses]
 
 
 def strict_format_reward_func(completions, **kwargs) -> list[float]:
@@ -247,7 +247,7 @@ def count_xml(text) -> float:
 
 def xmlcount_reward_func(completions, **kwargs) -> list[float]:
     contents = [completion[0]["content"] for completion in completions]
-    return [0.25 * count_xml(c) for c in contents]
+    return [0.5 * count_xml(c) for c in contents]
 
 
 def reward_len(completions, **kwargs):
@@ -463,5 +463,5 @@ def boxed_and_answer_tags_format_reward(
     prompts, completions, answer, step=None, run_name=None, **kwargs
 ) -> list[float]:
     boxed_in_answer_rewards = boxed_in_answer(prompts, completions, answer, step=step)
-    rewards = [b * 0.125 for b in boxed_in_answer_rewards]
+    rewards = [b * 0.25 for b in boxed_in_answer_rewards]
     return rewards

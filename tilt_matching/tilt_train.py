@@ -5,6 +5,7 @@ import math
 import os
 import hydra
 import math
+import json
 from omegaconf import DictConfig, OmegaConf, ListConfig
 from omegaconf.base import ContainerMetadata
 from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig    
@@ -12,7 +13,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.utilities import rank_zero_only
-from lightning_modules import TiltLogModule
+from lightning_modules import DTMModule
 from lightning_fabric.plugins import TorchCheckpointIO
 
 
@@ -32,12 +33,10 @@ from reward_func import (
     correctness_reward_func_math,
     sudoku_reward_func,
     boxed_and_answer_tags_format_reward,
-    reward_len,
 )
 from data_utils import (
     get_gsm8k_questions,
     get_countdown_questions,
-    # get_sudoku_questions,
     get_sudoku_questions_new,
     set_random_seed,
     get_math_questions,
@@ -74,7 +73,7 @@ def train(cfg: DictConfig):
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
 
     # Load dataset based on configuration
-    test_dataset = None
+    test_dataset = []
     if cfg.dataset == "gsm8k":
         dataset = get_gsm8k_questions("train")
         reward_functions = [
@@ -88,9 +87,10 @@ def train(cfg: DictConfig):
     elif cfg.dataset == "countdown":
         dataset = get_countdown_questions("train")
         reward_functions = [countdown_reward_func]
-    # elif cfg.dataset == "sudoku":
-    #     dataset = get_sudoku_questions()
-    #     reward_functions = [sudoku_reward_func]
+        cur_path = os.path.dirname(os.path.abspath(__file__))
+        with open(f"{cur_path}/../dataset/countdown_cd3_test.jsonl", "r") as f:
+            test_dataset = [json.loads(line) for line in f]    
+        print(len(test_dataset), "examples loaded")
     elif cfg.dataset == "sudoku_new":
         dataset = get_sudoku_questions_new(few_shot=cfg.few_shot)
         reward_functions = [sudoku_reward_func]
@@ -106,7 +106,7 @@ def train(cfg: DictConfig):
     dataset = dataset.shuffle(seed=cfg.seed)
 
     # Split dataset if needed
-    if cfg.dataset in ["countdown", "sudoku", "sudoku_new"]:
+    if cfg.dataset in ["countdown", "sudoku_new"]:
         train_set = dataset.select(range(0, len(dataset) - 500))  # Leave last 500 for evaluation
     else:
         train_set = dataset
@@ -144,10 +144,10 @@ def train(cfg: DictConfig):
     # TODO: Need to load the LoRA weights onto the base model when starting from a checkpoint
 
     # Load the Tilt Matching training module
-    model = TiltLogModule(
+    model = DTMModule(
         base_model=base_model,
         tokenizer=tokenizer,
-        training_prompts_dataset=train_set,
+        train_set=train_set,
         validation_set=test_dataset,
         reward_funcs=reward_functions,
         **cfg,
@@ -182,10 +182,11 @@ def train(cfg: DictConfig):
         save_last = True,
         dirpath = cfg.checkpoint_dir,
         save_top_k = -1,
-        every_n_train_steps = cfg.tm.student_log_steps // 2,
+        every_n_train_steps = cfg.ckpt_freq,
         save_on_train_epoch_end = False,
-        filename = "checkpoint-log-{log_counter}",
+        filename = "a-{ckpt_a:.2f}-{ckpt_counter}",
         auto_insert_metric_name=False,
+        save_on_exception=True,
     )
 
     # finish trainer kwargs
@@ -205,7 +206,7 @@ def train(cfg: DictConfig):
         trainer.fit(
             model,
             train_dataloaders = dummy_loader,
-            ckpt_path = resume_path #TODO: Later add resume functionality
+            ckpt_path = resume_path
         )
     else:
         trainer.fit(
