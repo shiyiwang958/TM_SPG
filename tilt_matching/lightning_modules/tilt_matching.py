@@ -6,7 +6,6 @@ from datetime import datetime
 from collections import OrderedDict, namedtuple
 from contextlib import contextmanager
 import itertools
-import wandb
 import re
 import torch
 import torch.nn.functional as F
@@ -85,6 +84,8 @@ class DTMModule(pl.LightningModule):
         self._cv_num_accum = None  # sum of w*<pi_theta-delta, delta-pi_a> over masked positions
         self._cv_den_accum = None  # sum of ||delta-pi_a||^2 over masked positions
         self._cv_ema_beta = float(getattr(self.hparams.tm, "control_variate_ema", 0.05))
+        self._wv_num_accum = None  # sum of w over masked positions, grouped by token v  -> [V]
+        self._wv_den_accum = None  # count of masked positions with token v              -> [V]
         self.dict_for_logs = {}
         self.ckpt_counter = 0
         self.log_student_steps = self.hparams.tm.student_log_steps
@@ -337,6 +338,7 @@ class DTMModule(pl.LightningModule):
             self._reset_micro_log_accum()
             self._cv_num_accum = torch.zeros((), device=self.device)
             self._cv_den_accum = torch.zeros((), device=self.device)
+            self._wv_den_accum = torch.zeros((), device=self.device)
 
         loss, micro_log_dict = self._tm_step()
         self._accumulate_micro_log_dict(micro_log_dict)
@@ -370,6 +372,8 @@ class DTMModule(pl.LightningModule):
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(self._cv_num_accum, op=dist.ReduceOp.SUM)
             dist.all_reduce(self._cv_den_accum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(self._wv_num_accum, op=dist.ReduceOp.SUM)
+            self._wv_num_accum /= self.trainer.world_size
 
         c_batch = (-self._cv_num_accum / self._cv_den_accum.clamp_min(1e-12))
         cv_old = torch.tensor(float(self.cv), device=self.device)
@@ -378,6 +382,12 @@ class DTMModule(pl.LightningModule):
 
         # Build averaged metrics (over micro-steps) for this optimizer/global step
         self.dict_for_logs = self._finalize_micro_log_dict()
+
+        # ---- compute + log min_v hat_w[v] for this global step ----
+        if self._wv_num_accum is not None:
+            hat_w = self._wv_num_accum / accum # [V]
+            wv_min = hat_w.min()
+            self.dict_for_logs["train/hat_wv_min"] = float(wv_min.item())
 
         # Log current learning rate and grad norms
         self.dict_for_logs["train/lr"] = opt.param_groups[0]["lr"]
@@ -498,9 +508,9 @@ class DTMModule(pl.LightningModule):
             dot = (Bv * A).sum(dim=-1)  # [B,L]
             den = (A * A).sum(dim=-1)   # [B,L]
 
-            self._cv_num_accum += (w * dot)[mask_indices.bool()].sum()
-            self._cv_den_accum += den[mask_indices.bool()].sum()
-                
+            self._cv_num_accum += (w * dot)[mask_indices].sum()
+            self._cv_den_accum += den[mask_indices].sum()
+
         prev_cv = self.cv
         if not getattr(self.hparams.tm, "learned_cv", False):
             self.cv = self.hparams.tm.control_variate
@@ -515,8 +525,16 @@ class DTMModule(pl.LightningModule):
             target = self.cv * old_probs + x1_equals_v * (1 - self.cv + torch.expm1(hr)).view(-1, 1, 1) - torch.expm1(hr) * curr_probs.detach()
         else:
             raise ValueError(f"Invalid loss_type: {loss_type}")
-        per_sample_losses = -(target * F.log_softmax(curr_logits, dim=-1)).sum(dim=-1) # [B, gen_length]
-        loss = per_sample_losses[mask_indices.bool()].mean()
+        
+        with torch.no_grad():
+            if not self._wv_num_accum:
+                self._wv_num_accum = torch.zeros((V,), device=self.device)
+            per_row_coeff = (target.detach() * mask_indices.unsqueeze(-1)).sum(dim=1)  # [B, V]
+            self._wv_num_accum += (per_row_coeff / mask_indices.sum(dim=1).to(per_row_coeff.dtype).unsqueeze(-1)).mean(dim=0)  # [V,]
+
+        per_position_losses = -(target * F.log_softmax(curr_logits, dim=-1)).sum(dim=-1) # [B, gen_length]
+        per_row_losses = (per_position_losses * mask_indices).sum(dim=1) # [B,]
+        loss = (per_row_losses / mask_indices.sum(dim=1).to(per_row_losses.dtype)).mean()
         self.cv = prev_cv
 
         log_dict = {
@@ -1109,7 +1127,7 @@ class DTMModule(pl.LightningModule):
         log_A = F.log_softmax(logits_A, dim=-1)
         log_B = F.log_softmax(logits_B, dim=-1)
         kl = F.kl_div(log_A, log_B, reduction='none', log_target=True).sum(-1)
-        return kl[mask_indices.bool()].float().mean()
+        return kl[mask_indices].float().mean()
 
     def _generate(
         self,
@@ -1298,7 +1316,7 @@ class DTMModule(pl.LightningModule):
         ) # [B, gen_len]
         xts[:, prompt_len:] = completion_region
 
-        return xts, mask_indices
+        return xts, mask_indices.bool()
 
     def _unwrap_llada_core(self, m: torch.nn.Module):
         """

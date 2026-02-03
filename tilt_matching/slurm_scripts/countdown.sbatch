@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=base_math
+#SBATCH --job-name=ctd_cv
 #SBATCH --account=kempner_albergo_lab
 #SBATCH --partition=kempner_h100
 #SBATCH --nodes=4
@@ -10,7 +10,7 @@
 #SBATCH --mail-type=END,FAIL,BEGIN
 #SBATCH --mail-user=yuyuanchen@math.harvard.edu
 
-OUTPUT_DIR="/n/home06/yuyuan0/TM_SPG/tilt_matching/outputs/output_${SLURM_JOB_ID}"
+OUTPUT_DIR="/n/home06/yuyuan0/TM_SPG/tilt_matching/ctd_outputs/output_${SLURM_JOB_ID}"
 mkdir -p "$OUTPUT_DIR"
 
 module load cuda/12.4.1-fasrc01
