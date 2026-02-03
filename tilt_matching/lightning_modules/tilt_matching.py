@@ -338,7 +338,7 @@ class DTMModule(pl.LightningModule):
             self._reset_micro_log_accum()
             self._cv_num_accum = torch.zeros((), device=self.device)
             self._cv_den_accum = torch.zeros((), device=self.device)
-            self._wv_den_accum = torch.zeros((), device=self.device)
+            self._wv_num_accum = None
 
         loss, micro_log_dict = self._tm_step()
         self._accumulate_micro_log_dict(micro_log_dict)
@@ -527,7 +527,7 @@ class DTMModule(pl.LightningModule):
             raise ValueError(f"Invalid loss_type: {loss_type}")
         
         with torch.no_grad():
-            if not self._wv_num_accum:
+            if self._wv_num_accum is None:
                 self._wv_num_accum = torch.zeros((V,), device=self.device)
             per_row_coeff = (target.detach() * mask_indices.unsqueeze(-1)).sum(dim=1)  # [B, V]
             self._wv_num_accum += (per_row_coeff / mask_indices.sum(dim=1).to(per_row_coeff.dtype).unsqueeze(-1)).mean(dim=0)  # [V,]
