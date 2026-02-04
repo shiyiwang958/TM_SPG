@@ -3,7 +3,7 @@ tm:
   a_end: 100.0
   buffer_chunk_size: 60
   buffer_print_samples: 0
-  buffer_refresh_steps: 24
+  buffer_refresh_steps: 40
   control_variate: 1.0
   control_variate_ema: 0.04
   ema_decay: 0.95
@@ -13,12 +13,12 @@ tm:
   loss_type: itm
   mix_batches: true
   num_batch_prompts: 2
-  num_buffer_prompts: 40  # grad accum steps can't use more prompts than the buffer has, otherwise indexing error
-  num_buffer_refresh: 10
+  num_buffer_prompts: 80  # grad accum steps can't use more prompts than the buffer has, otherwise indexing error
+  num_buffer_refresh: 20
   num_completions_per_prompt: 6
   rescale_logits: false
   rwd_shift: 0.0
-  rwd_shift_auto: true
+  rwd_shift_auto: false
   steps_per_h: 800 # this is the number of optimizer steps per h
   log_student: true
   log_temperature: 0.0
