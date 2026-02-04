@@ -891,8 +891,6 @@ class DTMModule(pl.LightningModule):
         print(f"[GPU {global_rank}/{global_world_size}] Evaluating {num_val_prompts} validation examples (indices {start_idx} to {end_idx-1})")
         
         # ---- 2. Prepare prompts from validation set ----
-        structured_prompts = [self.validation_set[i]["prompt"] for i in val_subset_indices]
-        
         if self.hparams.dataset == "countdown":
             structured_prompts = []
             targets = []
@@ -909,6 +907,8 @@ class DTMModule(pl.LightningModule):
                 structured_prompts.append([{"role": "user", "content": prompt_text}])
                 targets.append(target)
                 numbers_list.append(numbers)
+        else:
+            structured_prompts = [self.validation_set[i]["prompt"] for i in val_subset_indices]
         
         prompts_text = [self.tokenizer.apply_chat_template(sp, tokenize=False, add_generation_prompt=True) for sp in structured_prompts]
         prompt_ids = self.tokenizer(
