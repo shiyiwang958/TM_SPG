@@ -2,18 +2,29 @@
 tm:
   a_end: 100.0
   buffer_chunk_size: 16
-  buffer_refresh_steps: 32
+  buffer_refresh_steps: 2
+  buffer_print_samples: 10
   control_variate: 1.0
-  grad_accum_steps: 16
-  h: 1.0
+  grad_accum_steps: 4
+  h: 0.6
   loss_type: itm
   num_batch_prompts: 2
-  num_buffer_prompts: 64
-  num_buffer_refresh: 16
+  num_buffer_prompts: 32   # grad accum steps can't use more prompts than the buffer has, otherwise indexing error
+  num_buffer_refresh: 8
   num_completions_per_prompt: 1
   rescale_logits: false
   rwd_shift: 0.0
-  steps_per_h: 256 # this is the number of optimizer steps per h
+  steps_per_h: 400 # this is the number of optimizer steps per h
+  log_student: true
+  log_temperature: 0.0
+  student_log_steps: 5
+  student_logs_per_prompt: 1
+  student_copy_over: false
+  reset_global_step: false
+  use_ema: true
+  ema_decay: 0.95
+  student_print_samples: 20
+
 
 #-----------------Optimizer Config-----------------
 adam_beta1: 0.9
@@ -21,19 +32,19 @@ adam_beta2: 0.99
 adam_epsilon: 1e-8
 weight_decay: 0.1
 
-max_grad_norm: 1.0
-learning_rate: 3e-6
-lr_decay_ratio: 0.25
-lr_min: 1e-6
+max_grad_norm: 2.0 # to be decreased
+learning_rate: 4e-6
+lr_decay_ratio: 0.20
+lr_min: 2e-6
 lr_scheduler_type: linear
-lr_warmup_ratio: 0.1
+lr_warmup_ratio: 0.0
 
 #-----------------Diffusion Generation Config-----------------
 block_length: 32
 cfg_scale: 0.0 #TODO: check
 diffusion_steps: 128
 max_completion_length: 256
-max_prompt_length: 1132  # for sudoku with few_shot=3
+max_prompt_length: 1132  # short for countdown/long for sudoku
 remasking_strategy: low_confidence # or random
 sampling_temperature: 0.0
 
@@ -50,20 +61,24 @@ lora_dropout: 0.05
 peft_task_type: CAUSAL_LM
 
 #-----------------Logging and Checkpointing Config-----------------
-checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/test_ckpt
-checkpoint_freq: 1.0  # in units of h
-metrics_log_every: 4
-resume_path: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/test_ckpt/checkpoint-a-8.000.ckpt
+checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/scratch
+metrics_log_every: 1
+resume_path:
 # leave empty if not resuming
+
 wandb:
   entity: "yuyuanchen-harvard-university"
   project: "LLaDA_TM"
-  name: "sudoku_run"
+  name: "test_sudoku"
 
 #-----------------Other Training Config-----------------
 dataset: sudoku_new
 max_rwd: 1.0
+scale_factor: 1.1
+format_rwd: 0.50
 few_shot: 3
 seed: 42
 nodes: 4
-devices: 4  # 8? 4?
+devices: 2  # 8? 4?
+world_size: 8
+

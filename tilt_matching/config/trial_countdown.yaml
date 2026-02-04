@@ -58,9 +58,9 @@ lora_dropout: 0.05
 peft_task_type: CAUSAL_LM
 
 #-----------------Logging and Checkpointing Config-----------------
-checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/countdown_result/resume2
+checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/countdown_result/resume6
 metrics_log_every: 1
-resume_path: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/countdown_result/resume/last.ckpt
+resume_path: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/countdown_result/resume5/last.ckpt
 # leave empty if not resuming
 
 wandb:

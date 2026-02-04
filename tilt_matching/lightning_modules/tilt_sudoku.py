@@ -79,7 +79,6 @@ class TiltSudokuModule(pl.LightningModule):
         self.steps_per_h = self.hparams.tm.steps_per_h
         self.a_end = self.hparams.tm.a_end
         self.mask_id = 126336
-        self.checkpoint_freq = self.hparams.checkpoint_freq
         self.cv = self.hparams.tm.control_variate
         self.buffer = None
         self.buffer_rewards = None
@@ -91,7 +90,9 @@ class TiltSudokuModule(pl.LightningModule):
         self.log_student = getattr(self.hparams.tm, "log_student", True)
         self.log_temperature = getattr(self.hparams.tm, "log_temperature", 1.0)
         self.log_counter = 1
-        self.log_student_steps = getattr(self.hparams.tm, "log_student_steps", 100) 
+        self.log_student_steps = getattr(self.hparams.tm, "student_log_steps", 100) 
+        self.student_logs_per_prompt = getattr(self.hparams.tm, "student_logs_per_prompt", 1)
+        self.method = getattr(self.hparams.tm, "method", "cross-entropy")
 
         self.dict_for_logs = {}
         # micro-step metric accumulation
@@ -106,6 +107,11 @@ class TiltSudokuModule(pl.LightningModule):
         self.lr_warmup_ratio = getattr(self.hparams, "lr_warmup_ratio", 0)
         self.lr_min = getattr(self.hparams, "lr_min", 0.0)
         self._tm_sched_state = None
+        # EMA over student adapter weights (per h-phase)
+        self.use_ema = getattr(self.hparams.tm, "use_ema", True)
+        self.ema_decay = getattr(self.hparams.tm, "ema_decay", 0.999)
+        self._ema_shadow = None
+
 
     @contextmanager
     def _use_adapter(self, adapter_name: str):
@@ -180,6 +186,8 @@ class TiltSudokuModule(pl.LightningModule):
 
         self._update_buffer(self.model, self.num_buffer_prompts, self.comps_per_prompt)
         print(f"[DEBUG] Buffer initialized with shape {self.buffer.shape}")
+        # Initialize EMA for the current h-phase
+        self._reset_ema()
     
     def configure_optimizers(self):
         params = [p for p in self.model.parameters() if p.requires_grad]
@@ -250,10 +258,41 @@ class TiltSudokuModule(pl.LightningModule):
         out = {}
         for k, s in self._micro_log_sums.items():
             c = self._micro_log_counts.get(k, 1)
-            out[k] = s / float(c)
+            # Keep total sums for *_sum / *_count metrics; average everything else.
+            if k.endswith(("_sum", "_count")):
+                out[k] = s
+            else:
+                out[k] = s / float(c)
         out.update(self._micro_log_mins)
         out.update(self._micro_log_maxs)
         return out
+    
+    # ---------------------------
+    # EMA (student adapter only)
+    # ---------------------------
+    def _student_param_iter(self):
+        for name, param in self.model.named_parameters():
+            if ".student" in name and param.requires_grad:
+                yield name, param
+
+    def _reset_ema(self):
+        self._ema_shadow = {}
+        for name, param in self._student_param_iter():
+            self._ema_shadow[name] = param.detach().clone()
+    
+    @torch.no_grad()
+    def _update_ema(self):
+        if self._ema_shadow is None:
+            self._reset_ema()
+            return
+        decay = float(self.ema_decay)
+        with torch.no_grad():
+            for name, param in self._student_param_iter():
+                if name not in self._ema_shadow:
+                    self._ema_shadow[name] = param.detach().clone()
+                else:
+                    self._ema_shadow[name].mul_(decay).add_(param.detach(), alpha=1.0 - decay)
+
 
     def training_step(self, batch, batch_idx):
         """
@@ -311,6 +350,9 @@ class TiltSudokuModule(pl.LightningModule):
 
         opt.step()
         opt.zero_grad(set_to_none=True)
+        # Apply EMA to student weights (per h-phase)
+        if self.use_ema:
+            self._update_ema()
 
         if (self.global_step + 2) % self.steps_per_h < 5:
             print(f"current a is {self.a:.4f}")
@@ -318,6 +360,13 @@ class TiltSudokuModule(pl.LightningModule):
 
         # Build averaged metrics (over micro-steps) for this optimizer/global step
         self.dict_for_logs = self._finalize_micro_log_dict()
+
+        # Reconstruct correct fraction across the full accumulation window
+        if "train/correct_sum" in self.dict_for_logs and "train/correct_count" in self.dict_for_logs:
+            denom = self.dict_for_logs.pop("train/correct_count", 0.0)
+            num = self.dict_for_logs.pop("train/correct_sum", 0.0)
+            if denom > 0:
+                self.dict_for_logs["train/correct_frac"] = num / denom
 
         # Log current learning rate and grad norms
         self.dict_for_logs["train/lr"] = opt.param_groups[0]["lr"]
@@ -331,8 +380,21 @@ class TiltSudokuModule(pl.LightningModule):
             if self.a + self.h > self.a_end:
                 self.h = self.a_end - self.a
             with torch.no_grad():
-                adapter_state = get_peft_model_state_dict(self.model, adapter_name="student")
-                set_peft_model_state_dict(self.model, adapter_state, adapter_name="teacher")
+                if self.use_ema and self._ema_shadow is not None:
+                    # Copy EMA (student) weights into teacher adapter
+                    teacher_state = {}
+                    for key in get_peft_model_state_dict(self.model, adapter_name="teacher").keys():
+                        full_name = f"base_model.model.{key}"
+                        if full_name in self._ema_shadow:
+                            teacher_state[key] = self._ema_shadow[full_name]
+                        else:
+                            # Fallback to current student weight if EMA key missing
+                            student_state = get_peft_model_state_dict(self.model, adapter_name="student")
+                            teacher_state[key] = student_state[key]
+                    set_peft_model_state_dict(self.model, teacher_state, adapter_name="teacher")
+                else:
+                    adapter_state = get_peft_model_state_dict(self.model, adapter_name="student")
+                    set_peft_model_state_dict(self.model, adapter_state, adapter_name="teacher")
                 for name, p in self.model.named_parameters():
                     if ".teacher" in name:
                         p.requires_grad_(False)
@@ -346,6 +408,8 @@ class TiltSudokuModule(pl.LightningModule):
             for g in opt.param_groups:
                 g["lr"] = self.lr
             self._init_tm_scheduler()
+            # Reset EMA for the new h-phase
+            self._reset_ema()
 
         self.log("ckpt_a", self.a, on_step=True, on_epoch=False, sync_dist=True)
         return loss
@@ -369,8 +433,13 @@ class TiltSudokuModule(pl.LightningModule):
         else:
             weights = self.reward_weights.to(device=self.device, dtype=rwds.dtype)
         rwd = torch.nansum(rwds * weights.unsqueeze(0), dim=1) # [B,]
+
         # % of totally correct samples
-        correct_frac = torch.isclose(rwd, self.hparams.max_rwd * torch.ones_like(rwd), atol=1e-6, rtol=0.0).float().mean()
+        correct_mask = torch.isclose(rwd, self.hparams.max_rwd * torch.ones_like(rwd), atol=1e-3, rtol=0.0).float()
+        correct_sum = correct_mask.sum().float()
+        correct_count = torch.tensor(float(correct_mask.numel()), device=self.device)
+
+
         
         # Create x_t's by masking the x_1's
         num_to_mask = torch.randint(low=1, high=gen_length+1, size=(x1s.shape[0],), device=self.device)
@@ -379,10 +448,12 @@ class TiltSudokuModule(pl.LightningModule):
         # Get model predictions and compute loss
         temp = self.hparams.sampling_temperature
         with torch.no_grad(), self._use_adapter("teacher"):
+            self.model.eval()
             old_logits = self._new_forward(self.model, xts, gen_length) # [B, gen_length, V]
         V = old_logits.shape[-1]
         x1_equals_v = F.one_hot(x1s.long()[:, -gen_length:], num_classes = V) # [B, gen_length, V]
         with self._use_adapter("student"):
+            self.model.train()
             curr_logits = self._new_forward(self.model, xts, gen_length) # [B, gen_length, V]
         if temp > 0.0 and self.hparams.tm.rescale_logits:
             old_logits  /= temp
@@ -392,89 +463,25 @@ class TiltSudokuModule(pl.LightningModule):
         loss_type = self.hparams.tm.loss_type
         # shift reward for minimizing gradient variance for loss computation
         hr = self.h * (rwd + self.hparams.tm.rwd_shift) # [B,]
-        if loss_type == "itm":
-            target = self.cv * old_probs + x1_equals_v * (1 - self.cv + torch.expm1(hr)).view(-1, 1, 1) # [B, gen_length, V]
-        elif loss_type == "etm":
-            target = (1 - hr) * old_probs + x1_equals_v * hr.view(-1, 1, 1) # [B, gen_length, V]
-        elif loss_type == "sg-itm":
-            curr_probs = F.softmax(curr_logits, dim=-1) # [B, gen_length, V]
-            target = self.cv * old_probs + x1_equals_v * (1 - self.cv + torch.expm1(hr)).view(-1, 1, 1) - torch.expm1(hr) * curr_probs.detach()
-        else:
-            raise ValueError(f"Invalid loss_type: {loss_type}")
-        per_sample_losses = -(target * F.log_softmax(curr_logits, dim=-1)).sum(dim=-1) # [B, gen_length]
-        loss = per_sample_losses[mask_indices.bool()].mean()
 
-        # ---- DEBUG: investigate loss spikes ----
-        debug_thresh = getattr(self.hparams, "debug_loss_spike_threshold", None)
-        debug_topk = int(getattr(self.hparams, "debug_loss_spike_topk", 3))       # how many samples to print
+        if self.method == "cross-entropy":
+            if loss_type == "itm":
+                target = self.cv * old_probs + x1_equals_v * (1 - self.cv + torch.expm1(hr)).view(-1, 1, 1) # [B, gen_length, V]
+            elif loss_type == "etm":
+                target = (1 - hr) * old_probs + x1_equals_v * hr.view(-1, 1, 1) # [B, gen_length, V]
+            elif loss_type == "sg-itm":
+                curr_probs = F.softmax(curr_logits, dim=-1) # [B, gen_length, V]
+                target = self.cv * old_probs + x1_equals_v * (1 - self.cv + torch.expm1(hr)).view(-1, 1, 1) - torch.expm1(hr) * curr_probs.detach()
+        
+            per_sample_losses = -(target * F.log_softmax(curr_logits, dim=-1)).sum(dim=-1) # [B, gen_length]
+            loss = per_sample_losses[mask_indices.bool()].mean()
 
-        if debug_thresh is not None:
-            loss_val = float(loss.detach().cpu())
-            if (not torch.isfinite(loss)) or (loss_val > float(debug_thresh)):
-                if getattr(self.trainer, "global_rank", 0) == 0:
-                    gen_len = gen_length
-
-                    # 1) Check finiteness / ranges
-                    finite_curr = torch.isfinite(curr_logits).all().item()
-                    finite_old  = torch.isfinite(old_logits).all().item()
-                    print("\n" + "=" * 80)
-                    print(f"[LOSS SPIKE] global_step={self.global_step}  micro={self._grad_accum_counter}  loss={loss_val:.4f}")
-                    print(f"  finite: curr_logits={finite_curr} old_logits={finite_old} mask_any={mask_indices.any().item()}")
-                    print(f"  curr_logits: min={curr_logits.min().item():.3e} max={curr_logits.max().item():.3e}")
-                    print(f"  old_logits : min={old_logits.min().item():.3e} max={old_logits.max().item():.3e}")
-
-                    # 2) How many masked tokens per sample?
-                    masked_counts = mask_indices.sum(dim=1)  # [B]
-                    print(f"  masked_counts: min={masked_counts.min().item()} max={masked_counts.max().item()} mean={masked_counts.float().mean().item():.2f}")
-
-                    # 3) Per-sample mean loss over masked positions (to find the worst offenders)
-                    masked_counts_clamped = masked_counts.clamp(min=1)
-                    per_sample_mean = (per_sample_losses * mask_indices).sum(dim=1) / masked_counts_clamped  # [B]
-                    k = min(debug_topk, per_sample_mean.numel())
-                    worst_vals, worst_idx = torch.topk(per_sample_mean, k=k)
-
-                    # 4) Compare teacher vs student NLL on the *true* token at masked positions
-                    # true token ids on the completion suffix
-                    true_ids = x1s[:, -gen_len:]  # [B, gen_len]
-                    logp_curr = F.log_softmax(curr_logits, dim=-1).gather(-1, true_ids.unsqueeze(-1)).squeeze(-1)  # [B, gen_len]
-                    logp_old  = F.log_softmax(old_logits,  dim=-1).gather(-1, true_ids.unsqueeze(-1)).squeeze(-1)  # [B, gen_len]
-
-                    for rank_i, i in enumerate(worst_idx.tolist()):
-                        # decode completion for this sample
-                        completion_text = self.tokenizer.decode(true_ids[i], skip_special_tokens=True)
-
-                        # worst token within masked positions
-                        masked_pos = mask_indices[i].nonzero(as_tuple=False).squeeze(-1)
-                        if masked_pos.numel() > 0:
-                            # token with lowest prob under student among masked positions
-                            worst_tok_j = masked_pos[torch.argmax(per_sample_losses[i, masked_pos])]
-                            # then compute logps at that same position
-                            curr_lp = logp_curr[i, worst_tok_j].item()
-                            old_lp  = logp_old[i,  worst_tok_j].item()
-                            tok_loss = per_sample_losses[i, worst_tok_j].item()
-                            print(f"    tok_loss(NLL)={tok_loss:.4f}")
-                            print(f"    logp_student={curr_lp:.4f}  logp_teacher={old_lp:.4f}")
-                            tok_id  = int(true_ids[i, worst_tok_j].item())
-                            tok_str = self.tokenizer.decode([tok_id])
-
-                            print("-" * 80)
-                            print(f"  [sample {rank_i}] per_sample_mean={worst_vals[rank_i].item():.4f}  masked={int(masked_counts[i].item())}")
-                            print(f"    worst_masked_token_pos={int(worst_tok_j.item())} tok_id={tok_id} tok='{tok_str}'")
-                            print(f"    logp_student={curr_lp:.4f}  logp_teacher={old_lp:.4f}")
-                        else:
-                            print("-" * 80)
-                            print(f"  [sample {rank_i}] per_sample_mean={worst_vals[rank_i].item():.4f} (no masked positions??)")
-
-                        # print completion text (truncate)
-                        max_chars = int(getattr(self.hparams, "debug_completion_max_chars", 400))
-                        print("    completion_text:", completion_text[:max_chars].replace("\n", "\\n"))
-
-                    # 5) Reward / hr stats for this batch (often explains ITM blowups if rewards are large)
-                    print(f"  rwd: min={rwd.min().item():.4f} max={rwd.max().item():.4f} mean={rwd.mean().item():.4f}")
-                    print(f"  hr=h*rwd: min={(self.h*rwd).min().item():.4f} max={(self.h*rwd).max().item():.4f}")
-                    print("=" * 80 + "\n")
-
-
+        elif self.method == "square-loss":
+            target = (torch.exp(-hr).view(-1, 1, 1)) * (self.cv * old_probs + x1_equals_v * (1 - self.cv + torch.expm1(hr)).view(-1, 1, 1)) # [B, gen_length, V]
+            per_sample_losses = (((torch.exp(hr)).view(-1, 1, 1))*(curr_logits - target)**2).sum(dim=-1) # [B, gen_length]
+            loss = per_sample_losses[mask_indices.bool()].mean()
+            print(f"mean squared loss: {loss.item():.6f}")
+        
         log_dict = {
             f"train/loss": loss,
             f"train/a": self.a,
@@ -484,6 +491,8 @@ class TiltSudokuModule(pl.LightningModule):
             f"train/rwd_min": rwd.min(),
             f"train/rwd_mean": rwd.mean(),
             f"train/rwd_std": rwd.std(),
+            f"train/correct_sum": correct_sum,
+            f"train/correct_count": correct_count,
         }
         
         return loss, log_dict
@@ -620,6 +629,7 @@ class TiltSudokuModule(pl.LightningModule):
 
         prev_adapter = model.active_adapter
         model.set_adapter("teacher")
+        model.eval()
         print(f"{build_or_refresh} sample buffer ...")
         buffer_start_time = datetime.now()
 
@@ -820,6 +830,7 @@ class TiltSudokuModule(pl.LightningModule):
 
         # restore adapter
         model.set_adapter(prev_adapter)
+        model.train()
     
     def _init_tm_scheduler(self):
         """Initialize a per-h-phase, linear LR scheduler with warmup.
@@ -1038,7 +1049,7 @@ class TiltSudokuModule(pl.LightningModule):
         # ---- 0. Load eval dataset (cached) ----
         if not hasattr(self, "_sudoku_eval_rows"):
             cur_path = os.path.dirname(os.path.abspath(__file__))
-            sudoku_file_path = os.path.join(cur_path, "../dataset/test_sudoku_split_new.csv")
+            sudoku_file_path = os.path.join(cur_path, "../../dataset/test_sudoku_split_new.csv")
             sudoku_file_path = os.path.normpath(sudoku_file_path)
             eval_rows = []
             with open(sudoku_file_path, "r", newline="") as f:
@@ -1171,10 +1182,87 @@ class TiltSudokuModule(pl.LightningModule):
             )
             rewards_per_func[:, j] = torch.tensor(scores, device=device, dtype=torch.float32)
 
+        # ---- DEBUG: print a few eval samples (rank 0 only) ----
+        num_print = int(getattr(self.hparams.tm, "student_print_samples", 0))
+        if num_print > 0 and global_rank == 0:
+            def _extract_answer_digits(s: str):
+                m = re.findall(r"<answer>(.*?)</answer>", s, re.DOTALL)
+                if not m:
+                    return None
+                return "".join(ch for ch in m[-1].strip() if ch.isdigit())
+
+            def _partial_score(solution_str: str | None, ground_truth: str, puzzle: str) -> float:
+                if solution_str is None or len(solution_str) == 0:
+                    return 0.0
+                if len(solution_str) < 16:
+                    solution_str = solution_str + "0" * (16 - len(solution_str))
+                elif len(solution_str) > 16:
+                    solution_str = solution_str[:16]
+                empty_indices = [i for i in range(16) if puzzle[i] == "0"]
+                if not empty_indices:
+                    return 0.0
+                correct_cells = sum(1 for i in empty_indices if solution_str[i] == ground_truth[i])
+                return correct_cells / len(empty_indices)
+
+            r = rewards_per_func[:, 0] if num_funcs > 0 else torch.zeros(total_batch, device=device)
+            is_max = torch.isclose(r, torch.full_like(r, self.hparams.max_rwd), atol=1e-6, rtol=0.0)
+            max_idxs = torch.nonzero(is_max, as_tuple=False).squeeze(-1)
+            all_idxs = torch.arange(total_batch, device=device)
+
+            k_total = min(num_print, int(total_batch))
+            k_max = min(k_total // 2, int(max_idxs.numel()))
+            k_any = k_total - k_max
+
+            chosen = []
+            if k_max > 0:
+                perm = torch.randperm(max_idxs.numel(), device=device)[:k_max]
+                chosen.append(max_idxs[perm])
+            if k_any > 0:
+                if len(chosen) > 0:
+                    already = torch.zeros_like(all_idxs, dtype=torch.bool)
+                    already[chosen[0]] = True
+                    pool = all_idxs[~already]
+                else:
+                    pool = all_idxs
+                if pool.numel() > 0:
+                    perm = torch.randperm(pool.numel(), device=device)[: min(k_any, int(pool.numel()))]
+                    chosen.append(pool[perm])
+
+            chosen = torch.cat(chosen, dim=0) if len(chosen) > 0 else torch.empty(0, dtype=torch.long, device=device)
+
+            print(
+                f"[Student Validation] Printing {int(chosen.numel())} samples "
+                f"(requested={k_total}, max-reward available={int(max_idxs.numel())})",
+                flush=True,
+            )
+
+            for idx in chosen.tolist():
+                puzzle = reward_kwargs.get("puzzle", [None])[idx]
+                ground_truth = reward_kwargs.get("solution", [None])[idx]
+                completion_raw = completions_text[idx]
+                completion_pretty = completion_raw.replace("\\n", "\n")
+
+                extracted = _extract_answer_digits(completion_raw)
+                score = float(r[idx].detach().cpu().item()) if num_funcs > 0 else 0.0
+                partial = _partial_score(extracted, ground_truth, puzzle) if puzzle and ground_truth else 0.0
+
+                print("====================================================================", flush=True)
+                print("Model = Student")
+                print(f"Puzzle: {puzzle} (length: {len(puzzle) if puzzle else 0})", flush=True)
+                print(
+                    f"Extracted solution: {extracted}  (length: {len(extracted) if extracted else 0})",
+                    flush=True,
+                )
+                print(f"Ground_truth: {ground_truth}", flush=True)
+                print(f"Reward: {score:.4f} | Partial: {partial:.4f}", flush=True)
+                print("\nCompletion:\n", flush=True)
+                print(completion_pretty, flush=True)
+                print("====================================================================", flush=True)
+
         # ---- 7. Accuracy ----
         new_rewards_block = rewards_per_func.view(num_val_prompts, -1, num_funcs)
         denom = max(1, num_val_prompts * num_completions_per_prompt)
-        num_correct = (new_rewards_block >= self.hparams.max_rwd - 1e-5).sum().item()
+        num_correct = (new_rewards_block >= self.hparams.max_rwd - 1e-3).sum().item()
         frac_num_correct = num_correct / denom
         print(f"[Student Validation] Sudoku accuracy: {frac_num_correct:.4f}")
 

@@ -241,7 +241,7 @@ def parse_countdown_answers(json_path=None, json_data=None):
         equation = ""
         
         # First try to extract from answer tags (new format)
-        answer_match = re.search(r"<answer>\s*(.*?)\s*</answer>", generated_text, re.DOTALL)
+        answer_match = re.search(r"<answer>\n(.*?)\n</answer>", generated_text, re.DOTALL)
         if answer_match:
             equation = answer_match.group(1).strip()
         else:
@@ -467,4 +467,4 @@ def aggregate_results(directory="."):
 
 
 if __name__ == "__main__":
-    aggregate_results(directory="tilt_results/countdown_0.1")
+    aggregate_results(directory="tilt_results/sudoku_12.500_512")

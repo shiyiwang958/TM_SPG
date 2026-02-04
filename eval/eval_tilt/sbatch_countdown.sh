@@ -2,7 +2,7 @@
 #SBATCH --job-name=eval_countdown
 #SBATCH --partition=kempner
 #SBATCH --account=kempner_albergo_lab
-#SBATCH --output=../logs_eval/eval_countdown_%j.out
+#SBATCH --output=/n/home03/sw958/project_1/SPG/eval/logs_eval/eval_countdown_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -12,8 +12,10 @@
 #SBATCH --mail-type=END,FAIL,BEGIN
 #SBATCH --mail-user=fwang@math.harvard.edu
 
-
-source activate spg
+source ~/.bashrc
+mamba deactivate
+mamba activate spg
+module load cuda/12.4.1-fasrc01
 
 # TODO: Change to eval only one checkpoint.
 # SUBMIT THIS IN THE EVAL DIRECTORY!
@@ -68,10 +70,13 @@ for task in "${TASKS[@]}"; do
       --dataset $task \
       --batch_size $batch_size \
       --gen_length $gen_length \
-      --few_shot 0 \
-      --output_dir "tilt_results/countdown_0.2" \
+      --diffusion_steps $((gen_length/2)) \
+      --few_shot 3 \
+      --output_dir "tilt_results/countdown_best_256_conf_full" \
+      --block_length 256 \
+      --remasking "low_confidence" \
       --model_path "/n/netscratch/albergo_lab/Everyone/frank/hf_models/LLaDA-8B-Instruct" \
-      --checkpoint_path "/n/netscratch/albergo_lab/Everyone/frank/llada_tm/countdown_0.2/checkpoint-a-2.400.ckpt"
+      --checkpoint_path "/n/netscratch/albergo_lab/Everyone/frank/llada_tm/countdown_result/resume5/checkpoint-log-25.0.ckpt" \
       # TODO: change to your checkpoint path
   done
 done

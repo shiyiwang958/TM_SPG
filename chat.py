@@ -9,25 +9,30 @@ def chat():
     device = 'cuda'
     model = AutoModel.from_pretrained("/n/netscratch/albergo_lab/Everyone/frank/hf_models/LLaDA-8B-Instruct", trust_remote_code=True, torch_dtype=torch.bfloat16).to(device).eval()
     path = "/n/netscratch/albergo_lab/Everyone/frank/llada_tm/countdown_0.1/checkpoint-a-2.200.ckpt"
-    ckpt = torch.load(path, map_location='cpu', weights_only=False)
-    print(f"Loaded checkpoint from {path}")
-    hparams = ckpt.get("hyper_parameters", {})
-    lora_cfg = LoraConfig(
-        r=hparams.get("lora_r", 128),
-        lora_alpha=hparams.get("lora_alpha", 64),
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "gate_proj"],
-        task_type=hparams.get("peft_task_type", "CAUSAL_LM"),
-        lora_dropout=hparams.get("lora_dropout", 0.05),
-    )
-    tokenizer = AutoTokenizer.from_pretrained("/n/netscratch/albergo_lab/Everyone/frank/hf_models/LLaDA-8B-Instruct", trust_remote_code=True)
+    
+    if path is not None:
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        print(f"Loaded checkpoint from {path}")
+        hparams = ckpt.get("hyper_parameters", {})
+        lora_cfg = LoraConfig(
+            r=hparams.get("lora_r", 128),
+            lora_alpha=hparams.get("lora_alpha", 64),
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "gate_proj"],
+            task_type=hparams.get("peft_task_type", "CAUSAL_LM"),
+            lora_dropout=hparams.get("lora_dropout", 0.05),
+        )
+        tokenizer = AutoTokenizer.from_pretrained("/n/netscratch/albergo_lab/Everyone/frank/hf_models/LLaDA-8B-Instruct", trust_remote_code=True)
 
-    peft_model = get_peft_model(model, lora_cfg, adapter_name="teacher")
-    sd = ckpt.get("state_dict", ckpt)
-    teacher_state = {k[len("base_adapter."):]: v.to(peft_model.device) for k, v in sd.items() if k.startswith("base_adapter.")}
+        peft_model = get_peft_model(model, lora_cfg, adapter_name="teacher")
+        sd = ckpt.get("state_dict", ckpt)
+        teacher_state = {k[len("base_adapter."):]: v.to(peft_model.device) for k, v in sd.items() if k.startswith("base_adapter.")}
 
-    set_peft_model_state_dict(peft_model, teacher_state, adapter_name="teacher")
-    peft_model.set_adapter("teacher")
-    model = peft_model.to(device).eval()
+        set_peft_model_state_dict(peft_model, teacher_state, adapter_name="teacher")
+        peft_model.set_adapter("teacher")
+        model = peft_model.to(device).eval()
+    else: 
+        tokenizer = AutoTokenizer.from_pretrained("/n/netscratch/albergo_lab/Everyone/frank/hf_models/LLaDA-8B-Instruct", trust_remote_code=True)
+        model = model.to(device).eval()
 
     gen_length = 256
     steps = 128

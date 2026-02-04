@@ -196,7 +196,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # Core paths and hyperparameters exposed to the cluster job
     parser.add_argument("--model_path", type=str, default="/data1/shared/LLaDA-8B-Instruct/")
-    parser.add_argument("--few_shot", type=int, default=0)
+    parser.add_argument("--few_shot", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument(
         "--dataset", type=str, choices=["gsm8k", "math", "countdown", "sudoku", "game24"], default="gsm8k"
