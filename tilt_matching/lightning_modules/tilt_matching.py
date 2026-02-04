@@ -601,15 +601,6 @@ class DTMModule(pl.LightningModule):
         self._step_counter = checkpoint.get("step_counter", 0)
         self._resuming_from_ckpt = True
         self.ckpt_counter = checkpoint.get("ckpt_counter", 0)
-        
-        # # Reset global_step to 0 when loading checkpoint
-        # # This must be done in the checkpoint dict before Lightning restores it
-        # checkpoint["global_step"] = 0
-        # print(f"global step is {self.global_step} after loading checkpoint")
-
-        # hparams = checkpoint.get("hparams", None)
-        # self.__dict__["hparams"] = hparams
-        # self.__dict__["_hparams"] = hparams
 
     def _prepare_prompts(self, num_dinstinct_prompts, num_completions_per_prompts):
         """
