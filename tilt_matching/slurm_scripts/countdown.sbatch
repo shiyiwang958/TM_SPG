@@ -6,7 +6,7 @@
 #SBATCH --gpus-per-node=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --mem=50GB
-#SBATCH --time=12:29:59
+#SBATCH --time=24:29:59
 #SBATCH --mail-type=END,FAIL,BEGIN
 #SBATCH --mail-user=yuyuanchen@math.harvard.edu
 

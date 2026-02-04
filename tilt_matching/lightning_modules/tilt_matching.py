@@ -84,8 +84,6 @@ class DTMModule(pl.LightningModule):
         self._cv_num_accum = None  # sum of w*<pi_theta-delta, delta-pi_a> over masked positions
         self._cv_den_accum = None  # sum of ||delta-pi_a||^2 over masked positions
         self._cv_ema_beta = float(getattr(self.hparams.tm, "control_variate_ema", 0.05))
-        self._wv_num_accum = None  # sum of w over masked positions, grouped by token v  -> [V]
-        self._wv_den_accum = None  # count of masked positions with token v              -> [V]
         self.dict_for_logs = {}
         self.ckpt_counter = 0
         self.log_student_steps = self.hparams.tm.student_log_steps
