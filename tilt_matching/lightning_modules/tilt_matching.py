@@ -333,11 +333,11 @@ class DTMModule(pl.LightningModule):
         # At the start of a new accumulation window:
         if (self._grad_accum_counter % accum) == 0:
             if getattr(self.hparams.tm, "mix_batches", False):
-                total_sample_needed = self.hparams.tm.num_batch_prompts * self.comps_per_prompt * accum
+                total_sample_needed = self.hparams.tm.num_batch_prompts * accum
                 self._accum_prompts_idx = torch.randperm(self.buffer.shape[0] * self.comps_per_prompt, device=self.device, generator=self.g)[:total_sample_needed]              
             else:
                 total_prompts_needed = self.hparams.tm.num_batch_prompts * accum
-                self._accum_prompts_idx = torch.randperm(self.buffer.shape[0], device=self.device)[:total_prompts_needed]
+                self._accum_prompts_idx = torch.randperm(self.buffer.shape[0], device=self.device, generator=self.g)[:total_prompts_needed]
             self._reset_micro_log_accum()
             self._cv_num_accum = torch.zeros((), device=self.device)
             self._cv_den_accum = torch.zeros((), device=self.device)
@@ -567,15 +567,13 @@ class DTMModule(pl.LightningModule):
     def _tm_step(self):
         num_buffer_prompts, comps_per_prompt, L = self.buffer.shape
         num_batch_prompts = self.hparams.tm.num_batch_prompts
-        B = num_batch_prompts * comps_per_prompt
         gen_length = self.hparams.max_completion_length
 
         # Draw a batch from the buffer
         if getattr(self.hparams.tm, "mix_batches", False):
+            B = num_batch_prompts
             start_idx = (self._grad_accum_counter % self.hparams.tm.grad_accum_steps) * B
-            end_idx = start_idx + B
-            idx = (torch.arange(start_idx, end_idx, device=self.device) % self._accum_prompts_idx.shape[0])
-            prompts_idx = self._accum_prompts_idx[idx]
+            prompts_idx = self._accum_prompts_idx[start_idx:start_idx + B]
             flat_buffer = self.buffer.reshape(-1, L)
             flat_rewards = self.buffer_rewards.reshape(-1, self.buffer_rewards.shape[-1])
             x1s = flat_buffer[prompts_idx]           # [B, L]
@@ -583,10 +581,9 @@ class DTMModule(pl.LightningModule):
             rwds = flat_rewards[prompts_idx]         # [B, num_reward_funcs]
             del flat_rewards
         else:
+            B = num_batch_prompts * comps_per_prompt
             start_idx = (self._grad_accum_counter % self.hparams.tm.grad_accum_steps) * num_batch_prompts
-            end_idx = start_idx + num_batch_prompts
-            idx = (torch.arange(start_idx, end_idx, device=self.device) % self._accum_prompts_idx.shape[0])
-            prompts_idx = self._accum_prompts_idx[idx]
+            prompts_idx = self._accum_prompts_idx[start_idx:start_idx + num_batch_prompts]
             x1s = self.buffer[prompts_idx].reshape(B, L)           # [B, L]
             rwds = self.buffer_rewards[prompts_idx].reshape(B, -1) # [B, num_reward_funcs]
 
