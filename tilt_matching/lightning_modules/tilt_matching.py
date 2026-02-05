@@ -612,7 +612,9 @@ class DTMModule(pl.LightningModule):
         
         # Create x_t's by masking the x_1's
         num_to_mask = torch.randint(low=1, high=gen_length+1, size=(x1s.shape[0],), device=self.device)
-        xts, mask_indices = self._build_interpolant(x1s, num_to_mask, self.hparams.block_length)
+        xts, mask_indices, active_block_mask = self._build_interpolant(x1s, num_to_mask, self.hparams.block_length)
+        use_sar = bool(getattr(self.hparams.tm, "use_sar_active_block_norm", False))
+        mask_for_loss = active_block_mask if use_sar else mask_indices
 
         # Get model predictions and compute loss
         temp = self.hparams.sampling_temperature
@@ -645,8 +647,8 @@ class DTMModule(pl.LightningModule):
             dot = (Bv * A).sum(dim=-1)  # [B,L]
             den = (A * A).sum(dim=-1)   # [B,L]
 
-            self._cv_num_accum += (w * dot)[mask_indices].sum()
-            self._cv_den_accum += den[mask_indices].sum()
+            self._cv_num_accum += (w * dot)[mask_for_loss].sum()
+            self._cv_den_accum += den[mask_for_loss].sum()
 
         prev_cv = self.cv
         if not getattr(self.hparams.tm, "learned_cv", False):
@@ -663,12 +665,6 @@ class DTMModule(pl.LightningModule):
         else:
             raise ValueError(f"Invalid loss_type: {loss_type}")
         
-        # with torch.no_grad():
-        #     if self._wv_num_accum is None:
-        #         self._wv_num_accum = torch.zeros((V,), device=self.device)
-        #     per_row_coeff = (target.detach() * mask_indices.unsqueeze(-1)).sum(dim=1)  # [B, V]
-        #     self._wv_num_accum += (per_row_coeff / mask_indices.sum(dim=1).to(per_row_coeff.dtype).unsqueeze(-1)).mean(dim=0)  # [V,]
-
         with torch.no_grad():
             if self._wv_num_accum is None:
                 self._wv_num_accum = torch.zeros((V,), device=self.device)
@@ -677,10 +673,10 @@ class DTMModule(pl.LightningModule):
                 self._wv_exp_onehot_accum = torch.zeros((V,), device=self.device)
 
             # counts per row (how many masked positions)
-            row_cnt = mask_indices.sum(dim=1).to(old_probs.dtype).clamp_min(1.0)  # [B]
+            row_cnt = mask_for_loss.sum(dim=1).to(old_probs.dtype).clamp_min(1.0)  # [B]
 
             # row-average then batch-average estimates
-            mask3 = mask_indices.unsqueeze(-1)  # [B, L, 1]
+            mask3 = mask_for_loss.unsqueeze(-1)  # [B, L, 1]
 
             # pi_a is old_probs
             per_row_pi_a = (old_probs * mask3).sum(dim=1) / row_cnt.unsqueeze(-1)          # [B, V]
@@ -705,15 +701,15 @@ class DTMModule(pl.LightningModule):
 
 
         per_position_losses = -(target * F.log_softmax(curr_logits, dim=-1)).sum(dim=-1) # [B, gen_length]
-        per_row_losses = (per_position_losses * mask_indices).sum(dim=1) # [B,]
-        loss = (per_row_losses / mask_indices.sum(dim=1).to(per_row_losses.dtype)).mean()
+        per_row_losses = (per_position_losses * mask_for_loss).sum(dim=1)  # [B]
+        loss = (per_row_losses / mask_for_loss.sum(dim=1).to(per_row_losses.dtype)).mean()
         self.cv = prev_cv
 
         log_dict = {
             f"train/loss": loss,
             f"train/a": self.a,
             f"train/h": self.h,
-            f"train/drift_gap_kl": self._kl_from_logits(old_logits, curr_logits, mask_indices),
+            f"train/drift_gap_kl": self._kl_from_logits(old_logits, curr_logits, mask_for_loss),
             f"train/rwd_max": rwd.max(),
             f"train/rwd_min": rwd.min(),
             f"train/rwd_mean": rwd.mean(),
@@ -1435,7 +1431,8 @@ class DTMModule(pl.LightningModule):
                         block-wise left-to-right generation schedule.
         Returns:
             xts: Tensor of shape [B, L], the partially masked sequences at time t.
-            mask_indices: BoolTensor of shape [B, gen_length], True where tokens are masked.
+            mask_indices: [B, gen_length] BoolTensor, True where tokens are masked.
+            partial_to_mask: [B, gen_length] BoolTensor, True where tokens are masked in the partial block.
         """
         device = x1s.device
         B, L = x1s.shape
@@ -1479,7 +1476,7 @@ class DTMModule(pl.LightningModule):
         ) # [B, gen_len]
         xts[:, prompt_len:] = completion_region
 
-        return xts, mask_indices.bool()
+        return xts, mask_indices.bool(), partial_to_mask.bool()
 
     def _unwrap_llada_core(self, m: torch.nn.Module):
         """
