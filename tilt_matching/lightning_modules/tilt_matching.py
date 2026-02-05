@@ -334,19 +334,10 @@ class DTMModule(pl.LightningModule):
         if (self._grad_accum_counter % accum) == 0:
             if getattr(self.hparams.tm, "mix_batches", False):
                 total_sample_needed = self.hparams.tm.num_batch_prompts * self.comps_per_prompt * accum
-                self._accum_prompts_idx = torch.randperm(self.buffer.shape[0] * self.comps_per_prompt, device=self.device)[:total_sample_needed]              
+                self._accum_prompts_idx = torch.randperm(self.buffer.shape[0] * self.comps_per_prompt, device=self.device, generator=self.g)[:total_sample_needed]              
             else:
                 total_prompts_needed = self.hparams.tm.num_batch_prompts * accum
                 self._accum_prompts_idx = torch.randperm(self.buffer.shape[0], device=self.device)[:total_prompts_needed]
-            self._reset_micro_log_accum()
-            # randomly choose the prompts to use for the microsteps
-            total_prompts_needed = self.hparams.tm.num_batch_prompts * accum
-            # self._accum_prompts_idx = torch.randperm(self.buffer.shape[0], device=self.device)[:total_prompts_needed]
-            self._accum_prompts_idx = torch.randperm(
-                self.buffer.shape[0],
-                device=self.device,
-                generator=self.g
-            )[:total_prompts_needed]
             self._reset_micro_log_accum()
             self._cv_num_accum = torch.zeros((), device=self.device)
             self._cv_den_accum = torch.zeros((), device=self.device)
@@ -581,7 +572,6 @@ class DTMModule(pl.LightningModule):
 
         # Draw a batch from the buffer
         if getattr(self.hparams.tm, "mix_batches", False):
-            total_samples = self.buffer.shape[0] * comps_per_prompt
             start_idx = (self._grad_accum_counter % self.hparams.tm.grad_accum_steps) * B
             end_idx = start_idx + B
             idx = (torch.arange(start_idx, end_idx, device=self.device) % self._accum_prompts_idx.shape[0])
