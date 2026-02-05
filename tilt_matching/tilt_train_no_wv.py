@@ -10,7 +10,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.utilities import rank_zero_only
-from lightning_modules import DTMModule
+from lightning_modules import DTMModuleNoWV
 from lightning_fabric.plugins import TorchCheckpointIO
 
 
@@ -141,7 +141,7 @@ def train(cfg: DictConfig):
     # TODO: Need to load the LoRA weights onto the base model when starting from a checkpoint
 
     # Load the Tilt Matching training module
-    model = DTMModule(
+    model = DTMModuleNoWV(
         base_model=base_model,
         tokenizer=tokenizer,
         train_set=train_set,

@@ -3,17 +3,17 @@ tm:
   a_end: 100.0
   buffer_chunk_size: 60
   buffer_print_samples: 0
-  buffer_refresh_steps: 40
+  buffer_refresh_steps: 50
   control_variate: 1.0
   control_variate_ema: 0.04
   ema_decay: 0.95
-  grad_accum_steps: 8
+  grad_accum_steps: 6
   h: 3.0
   learned_cv: false
   loss_type: itm
   mix_batches: true
-  num_batch_prompts: 2
-  num_buffer_prompts: 80 # grad accum steps can't use more prompts than the buffer has, otherwise indexing error
+  num_batch_prompts: 16
+  num_buffer_prompts: 80
   num_buffer_refresh: 20
   num_completions_per_prompt: 6
   rescale_logits: false
@@ -26,11 +26,11 @@ tm:
   student_logs_per_prompt: 1
   use_ema: true
   hat_wv_neg_thresh: -1e-8
-  hat_wv_print_max: 30
-  hat_wv_cum_print_every: 4
+  hat_wv_print_max: 10
+  hat_wv_cum_print_every: 20
   hat_wv_cum_min_steps: 8
-  hat_wv_cum_print_max: 50
-  use_sar_active_block_norm: true
+  hat_wv_cum_print_max: 30
+  use_sar_active_block_norm: false
 
 #-----------------Optimizer Config-----------------
 adam_beta1: 0.9
@@ -66,7 +66,7 @@ lora_dropout: 0.05
 peft_task_type: CAUSAL_LM
 
 #-----------------Logging and Checkpointing Config-----------------
-checkpoint_dir: /n/netscratch/albergo_lab/Everyone/yuyuan0/ctd/cv1_sar
+checkpoint_dir: /n/netscratch/albergo_lab/Everyone/yuyuan0/ctd/mix_batch_old_itpl
 ckpt_freq: 100 # in optimizer steps
 metrics_log_every: 1
 resume_path: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/countdown_result/checkpoint-log-22.0.ckpt
@@ -76,7 +76,7 @@ student_copy_over: true
 wandb:
   entity: "yuyuanchen-harvard-university"
   project: "LLaDA_TM"
-  name: "ctd_cv1_sar"
+  name: "ctd_mix_batch_old_itpl"
 
 #-----------------Other Training Config-----------------
 dataset: countdown

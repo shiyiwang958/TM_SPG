@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=ctd_cv
+#SBATCH --job-name=ctd_mix_batch_old_itpl
 #SBATCH --account=kempner_albergo_lab
 #SBATCH --partition=kempner_h100
 #SBATCH --nodes=4
 #SBATCH --gpus-per-node=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --mem=50GB
-#SBATCH --time=24:29:59
+#SBATCH --time=20:29:59
 #SBATCH --mail-type=END,FAIL,BEGIN
 #SBATCH --mail-user=yuyuanchen@math.harvard.edu
 
@@ -93,7 +93,7 @@ srun --ntasks-per-node=1 --gpus-per-task=2 \
     --log_dir="$LOGDIR" \
     --redirects 3 \
     --tee 3 \
-    tilt_train.py \
+    tilt_train_no_wv.py \
     --config-path /n/home06/yuyuan0/TM_SPG/tilt_matching/config \
     --config-name countdown.yaml \
     nodes=4 \
