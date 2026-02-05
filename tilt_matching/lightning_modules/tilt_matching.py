@@ -96,6 +96,20 @@ class DTMModule(pl.LightningModule):
         self._micro_log_mins = {}
         self._micro_log_maxs = {}
 
+        # --- Diagnostics for minibatch hat_w_v(c) decomposition ---
+        self._wv_pi_a_accum = None          # sum over microsteps of row-avg(pi_a(v)) then batch-avg -> [V]
+        self._wv_onehot_accum = None        # sum over microsteps of row-avg(1{x=v}) then batch-avg -> [V]
+        self._wv_exp_onehot_accum = None    # sum over microsteps of row-avg(exp(hr)*1{x=v}) then batch-avg -> [V]
+
+        # persistent across training (for "consistently negative" tracking)
+        self._neg_steps_count = None        # [V] int32, how many global steps had hat_w[v] < thresh
+        self._neg_steps_total = 0           # python int, number of global steps we've updated
+
+        # --- Persistent tracking for tokens that are ever negative ---
+        self._neg_ever = None              # [V] bool
+        self._neg_cum_w = None             # [V] float32 (or float64), cumulative sum of hat_w over steps
+        self._neg_cum_steps = None         # [V] int32, number of steps accumulated into _neg_cum_w
+
     @contextmanager
     def _use_adapter(self, adapter_name: str):
         prev = self.model.active_adapter
@@ -337,6 +351,9 @@ class DTMModule(pl.LightningModule):
             self._cv_num_accum = torch.zeros((), device=self.device)
             self._cv_den_accum = torch.zeros((), device=self.device)
             self._wv_num_accum = None
+            self._wv_pi_a_accum = None
+            self._wv_onehot_accum = None
+            self._wv_exp_onehot_accum = None
 
         loss, micro_log_dict = self._tm_step()
         self._accumulate_micro_log_dict(micro_log_dict)
@@ -373,6 +390,13 @@ class DTMModule(pl.LightningModule):
             dist.all_reduce(self._wv_num_accum, op=dist.ReduceOp.SUM)
             self._wv_num_accum /= self.trainer.world_size
 
+            dist.all_reduce(self._wv_pi_a_accum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(self._wv_onehot_accum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(self._wv_exp_onehot_accum, op=dist.ReduceOp.SUM)
+            self._wv_pi_a_accum /= self.trainer.world_size
+            self._wv_onehot_accum /= self.trainer.world_size
+            self._wv_exp_onehot_accum /= self.trainer.world_size
+
         c_batch = (-self._cv_num_accum / self._cv_den_accum.clamp_min(1e-12))
         cv_old = torch.tensor(float(self.cv), device=self.device)
         cv_new = (1.0 - self._cv_ema_beta) * cv_old + self._cv_ema_beta * c_batch
@@ -386,6 +410,121 @@ class DTMModule(pl.LightningModule):
             hat_w = self._wv_num_accum / accum # [V]
             wv_min = hat_w.min()
             self.dict_for_logs["train/hat_wv_min"] = float(wv_min.item())
+
+            # --- Persistent per-token running average for ever-negative tokens ---
+            neg_thresh = float(getattr(self.hparams.tm, "hat_wv_neg_thresh", 0.0))
+            neg_mask = hat_w < neg_thresh  # [V] bool
+
+            # lazy init persistent buffers
+            if self._neg_ever is None:
+                self._neg_ever = torch.zeros_like(hat_w, dtype=torch.bool)
+                self._neg_cum_w = torch.zeros_like(hat_w, dtype=torch.float32)
+                self._neg_cum_steps = torch.zeros_like(hat_w, dtype=torch.int32)
+
+            # update "ever negative"
+            self._neg_ever |= neg_mask
+
+            # update cumulative stats ONLY for tokens that have ever been negative
+            ever = self._neg_ever
+            self._neg_cum_w[ever] += hat_w[ever].to(self._neg_cum_w.dtype)
+            self._neg_cum_steps[ever] += 1
+
+            # --- Print tokens whose cumulative hat_w is negative (rank 0 only) ---
+            if getattr(self.trainer, "global_rank", 0) == 0:
+                print_every = int(getattr(self.hparams.tm, "hat_wv_cum_print_every", 50))
+                min_steps = int(getattr(self.hparams.tm, "hat_wv_cum_min_steps", 20))
+                max_print = int(getattr(self.hparams.tm, "hat_wv_cum_print_max", 50))
+
+                if (self.global_step % print_every) == 0 and self._neg_ever.any():
+                    steps = self._neg_cum_steps
+                    enough = steps >= min_steps
+                    cum_neg = (self._neg_cum_w < 0.0) & enough & self._neg_ever
+
+                    num_cum_neg = int(cum_neg.sum().item())
+                    self.log("train/hat_wv_cum_neg_count", num_cum_neg, on_step=True, on_epoch=False, sync_dist=False)
+
+                    if num_cum_neg > 0:
+                        ids = torch.nonzero(cum_neg, as_tuple=False).squeeze(-1)
+                        cumw = self._neg_cum_w[ids]
+                        meanw = cumw / steps[ids].clamp_min(1).to(cumw.dtype)
+
+                        # sort by mean (most negative mean first); alternatively sort by cumw
+                        _, order = torch.sort(meanw, descending=False)
+                        ids = ids[order[: min(max_print, ids.numel())]]
+
+                        ids_list = ids.tolist()
+                        if hasattr(self.tokenizer, "convert_ids_to_tokens"):
+                            toks = self.tokenizer.convert_ids_to_tokens(ids_list)
+                        else:
+                            toks = [self.tokenizer.decode([tid]) for tid in ids_list]
+
+                        print(f"\n[hat_wv CUM] step={self.global_step}  cum_neg_count={num_cum_neg} "
+                            f"(min_steps={min_steps}) printing={len(ids_list)}/{max_print}")
+
+                        for tid, tok in zip(ids_list, toks):
+                            s = float(self._neg_cum_w[tid].item())
+                            n = int(self._neg_cum_steps[tid].item())
+                            mu = s / max(n, 1)
+                            print(f"  id={tid:6d} tok={repr(tok):>16s}  cum_w={s:+.6e}  steps={n:4d}  mean_w={mu:+.6e}")
+
+            # Decomposition (per global step)
+            pi_a_hat = self._wv_pi_a_accum / accum
+            onehot_hat = self._wv_onehot_accum / accum
+            exp_onehot_hat = self._wv_exp_onehot_accum / accum
+            gap = pi_a_hat - onehot_hat
+
+            # threshold: ignore pure fp dust if you want
+            neg_thresh = float(getattr(self.hparams.tm, "hat_wv_neg_thresh", 0.0))
+            neg_mask = hat_w < neg_thresh
+            neg_count = int(neg_mask.sum().item())
+            self.dict_for_logs["train/hat_wv_neg_count"] = neg_count
+
+            # persistent tracking
+            if self._neg_steps_count is None:
+                self._neg_steps_count = torch.zeros_like(hat_w, dtype=torch.int32)
+            self._neg_steps_count += neg_mask.to(torch.int32)
+            self._neg_steps_total += 1
+
+            # print ALL negative tokens on rank 0 (warning: can be a lot)
+            if getattr(self.trainer, "global_rank", 0) == 0 and neg_count > 0:
+                # indices of negative tokens
+                K = int(getattr(self.hparams.tm, "hat_wv_print_max", 50))
+                neg_ids = torch.nonzero(neg_mask, as_tuple=False).squeeze(-1)  # [Nneg]
+
+                # sort by hat_w (most negative first) and keep only worst K
+                neg_hat_w = hat_w[neg_ids]  # [Nneg]
+                k = min(K, neg_hat_w.numel())
+                sorted_vals, sorted_idx = torch.sort(neg_hat_w, descending=False)  # ascending: most negative first
+                top_ids = neg_ids[sorted_idx[:k]]  # [k]
+
+                # gather diagnostics for top_ids
+                top_hat_w = hat_w[top_ids]
+                top_gap = gap[top_ids]
+                top_pi = pi_a_hat[top_ids]
+                top_oh = onehot_hat[top_ids]
+                top_expoh = exp_onehot_hat[top_ids]
+                top_freq = (self._neg_steps_count[top_ids].float() / float(self._neg_steps_total))
+
+                top_ids_list = top_ids.tolist()
+                toks = self.tokenizer.convert_ids_to_tokens(top_ids_list)
+
+                print(f"\n[hat_w_v DIAG] global_step={self.global_step}  cv={self.cv:.6f}  "
+                    f"neg_thresh={neg_thresh}  neg_count={neg_count}  printing_worst={k}/{K}")
+
+                for tid, tok, wv, g, p, oh, eoh, fr in zip(
+                        top_ids_list,
+                        toks,
+                        top_hat_w.tolist(),
+                        top_gap.tolist(),
+                        top_pi.tolist(),
+                        top_oh.tolist(),
+                        top_expoh.tolist(),
+                        top_freq.tolist(),
+                ):
+                    print(f"  id={tid:6d} tok={repr(tok):>16s}  hat_w={wv:+.6e}  "
+                        f"gap(pi-onehot)={g:+.6e}  pi={p:.6e}  onehot={oh:.6e}  "
+                        f"exp*onehot={eoh:.6e}  neg_freq={fr:.3f}")
+
 
         # Log current learning rate and grad norms
         self.dict_for_logs["train/lr"] = opt.param_groups[0]["lr"]
@@ -524,11 +663,46 @@ class DTMModule(pl.LightningModule):
         else:
             raise ValueError(f"Invalid loss_type: {loss_type}")
         
+        # with torch.no_grad():
+        #     if self._wv_num_accum is None:
+        #         self._wv_num_accum = torch.zeros((V,), device=self.device)
+        #     per_row_coeff = (target.detach() * mask_indices.unsqueeze(-1)).sum(dim=1)  # [B, V]
+        #     self._wv_num_accum += (per_row_coeff / mask_indices.sum(dim=1).to(per_row_coeff.dtype).unsqueeze(-1)).mean(dim=0)  # [V,]
+
         with torch.no_grad():
             if self._wv_num_accum is None:
                 self._wv_num_accum = torch.zeros((V,), device=self.device)
-            per_row_coeff = (target.detach() * mask_indices.unsqueeze(-1)).sum(dim=1)  # [B, V]
-            self._wv_num_accum += (per_row_coeff / mask_indices.sum(dim=1).to(per_row_coeff.dtype).unsqueeze(-1)).mean(dim=0)  # [V,]
+                self._wv_pi_a_accum = torch.zeros((V,), device=self.device)
+                self._wv_onehot_accum = torch.zeros((V,), device=self.device)
+                self._wv_exp_onehot_accum = torch.zeros((V,), device=self.device)
+
+            # counts per row (how many masked positions)
+            row_cnt = mask_indices.sum(dim=1).to(old_probs.dtype).clamp_min(1.0)  # [B]
+
+            # row-average then batch-average estimates
+            mask3 = mask_indices.unsqueeze(-1)  # [B, L, 1]
+
+            # pi_a is old_probs
+            per_row_pi_a = (old_probs * mask3).sum(dim=1) / row_cnt.unsqueeze(-1)          # [B, V]
+            per_row_onehot = (x1_equals_v * mask3).sum(dim=1) / row_cnt.unsqueeze(-1)      # [B, V]
+
+            exp_hr = torch.exp(hr).view(-1, 1, 1)  # [B,1,1]
+            per_row_exp_onehot = ((x1_equals_v * exp_hr) * mask3).sum(dim=1) / row_cnt.unsqueeze(-1)  # [B,V]
+
+            # batch-average
+            pi_a_hat = per_row_pi_a.mean(dim=0)            # [V]
+            onehot_hat = per_row_onehot.mean(dim=0)        # [V]
+            exp_onehot_hat = per_row_exp_onehot.mean(dim=0)# [V]
+
+            # your existing hat_w accumulator (equivalent to batch mean of row-avg target)
+            per_row_coeff = (target.detach() * mask3).sum(dim=1) / row_cnt.unsqueeze(-1)  # [B,V]
+            self._wv_num_accum += per_row_coeff.mean(dim=0)
+
+            # new diagnostic accumulators
+            self._wv_pi_a_accum += pi_a_hat
+            self._wv_onehot_accum += onehot_hat
+            self._wv_exp_onehot_accum += exp_onehot_hat
+
 
         per_position_losses = -(target * F.log_softmax(curr_logits, dim=-1)).sum(dim=-1) # [B, gen_length]
         per_row_losses = (per_position_losses * mask_indices).sum(dim=1) # [B,]
