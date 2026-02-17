@@ -258,7 +258,7 @@ if __name__ == "__main__":
         local_rank
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained("/n/netscratch/albergo_lab/Everyone/frank/hf_models/LLaDA-8B-Instruct", trust_remote_code=True)
 
     if args.checkpoint_path:
         # Attach PEFT weights if provided and sync across ranks.

@@ -246,6 +246,16 @@ class DTMModule(pl.LightningModule):
             raise ValueError("Expected a scalar tensor for logging/accumulation")
         return x
 
+    @staticmethod
+    def _extract_boxed_answer(text):
+        """Return the last \boxed{...} content from a string, or None if missing."""
+        if text is None:
+            return None
+        matches = re.findall(r"\\boxed\{(.*?)\}", str(text), re.DOTALL)
+        if not matches:
+            return None
+        return matches[-1].strip()
+
     def _reset_micro_log_accum(self):
         self._micro_log_sums = {}
         self._micro_log_counts = {}
@@ -289,14 +299,14 @@ class DTMModule(pl.LightningModule):
     # EMA (student adapter only)
     # ---------------------------
     def _student_param_iter(self):
-        for name, param in self.model.named_parameters():
-            if ".student" in name and param.requires_grad:
-                yield name, param
+        state = get_peft_model_state_dict(self.model, adapter_name="student")
+        for key, value in state.items():
+            yield key, value
 
     def _reset_ema(self):
         self._ema_shadow = {}
-        for name, param in self._student_param_iter():
-            self._ema_shadow[name] = param.detach().clone()
+        for key, param in self._student_param_iter():
+            self._ema_shadow[key] = param.detach().clone()
     
     @torch.no_grad()
     def _update_ema(self):
@@ -305,11 +315,11 @@ class DTMModule(pl.LightningModule):
             return
         decay = float(self.ema_decay)
         with torch.no_grad():
-            for name, param in self._student_param_iter():
-                if name not in self._ema_shadow:
-                    self._ema_shadow[name] = param.detach().clone()
+            for key, param in self._student_param_iter():
+                if key not in self._ema_shadow:
+                    self._ema_shadow[key] = param.detach().clone()
                 else:
-                    self._ema_shadow[name].mul_(decay).add_(param.detach(), alpha=1.0 - decay)
+                    self._ema_shadow[key].mul_(decay).add_(param.detach(), alpha=1.0 - decay)
 
     def training_step(self, batch, batch_idx):
         """
@@ -449,14 +459,14 @@ class DTMModule(pl.LightningModule):
                         else:
                             toks = [self.tokenizer.decode([tid]) for tid in ids_list]
 
-                        print(f"\n[hat_wv CUM] step={self.global_step}  cum_neg_count={num_cum_neg} "
-                            f"(min_steps={min_steps}) printing={len(ids_list)}/{max_print}")
+                        # print(f"\n[hat_wv CUM] step={self.global_step}  cum_neg_count={num_cum_neg} "
+                        #     f"(min_steps={min_steps}) printing={len(ids_list)}/{max_print}")
 
-                        for tid, tok in zip(ids_list, toks):
-                            s = float(self._neg_cum_w[tid].item())
-                            n = int(self._neg_cum_steps[tid].item())
-                            mu = s / max(n, 1)
-                            print(f"  id={tid:6d} tok={repr(tok):>16s}  cum_w={s:+.6e}  steps={n:4d}  mean_w={mu:+.6e}")
+                        # for tid, tok in zip(ids_list, toks):
+                        #     s = float(self._neg_cum_w[tid].item())
+                        #     n = int(self._neg_cum_steps[tid].item())
+                        #     mu = s / max(n, 1)
+                        #     print(f"  id={tid:6d} tok={repr(tok):>16s}  cum_w={s:+.6e}  steps={n:4d}  mean_w={mu:+.6e}")
 
             # Decomposition (per global step)
             pi_a_hat = self._wv_pi_a_accum / accum
@@ -499,22 +509,22 @@ class DTMModule(pl.LightningModule):
                 top_ids_list = top_ids.tolist()
                 toks = self.tokenizer.convert_ids_to_tokens(top_ids_list)
 
-                print(f"\n[hat_w_v DIAG] global_step={self.global_step}  cv={self.cv:.6f}  "
-                    f"neg_thresh={neg_thresh}  neg_count={neg_count}  printing_worst={k}/{K}")
+                # print(f"\n[hat_w_v DIAG] global_step={self.global_step}  cv={self.cv:.6f}  "
+                #     f"neg_thresh={neg_thresh}  neg_count={neg_count}  printing_worst={k}/{K}")
 
-                for tid, tok, wv, g, p, oh, eoh, fr in zip(
-                        top_ids_list,
-                        toks,
-                        top_hat_w.tolist(),
-                        top_gap.tolist(),
-                        top_pi.tolist(),
-                        top_oh.tolist(),
-                        top_expoh.tolist(),
-                        top_freq.tolist(),
-                ):
-                    print(f"  id={tid:6d} tok={repr(tok):>16s}  hat_w={wv:+.6e}  "
-                        f"gap(pi-onehot)={g:+.6e}  pi={p:.6e}  onehot={oh:.6e}  "
-                        f"exp*onehot={eoh:.6e}  neg_freq={fr:.3f}")
+                # for tid, tok, wv, g, p, oh, eoh, fr in zip(
+                #         top_ids_list,
+                #         toks,
+                #         top_hat_w.tolist(),
+                #         top_gap.tolist(),
+                #         top_pi.tolist(),
+                #         top_oh.tolist(),
+                #         top_expoh.tolist(),
+                #         top_freq.tolist(),
+                # ):
+                #     print(f"  id={tid:6d} tok={repr(tok):>16s}  hat_w={wv:+.6e}  "
+                #         f"gap(pi-onehot)={g:+.6e}  pi={p:.6e}  onehot={oh:.6e}  "
+                #         f"exp*onehot={eoh:.6e}  neg_freq={fr:.3f}")
 
 
         # Log current learning rate and grad norms
@@ -533,14 +543,13 @@ class DTMModule(pl.LightningModule):
                 if self.use_ema and self._ema_shadow is not None:
                     # Copy EMA (student) weights into teacher adapter
                     teacher_state = {}
-                    for key in get_peft_model_state_dict(self.model, adapter_name="teacher").keys():
-                        full_name = f"base_model.model.{key}"
-                        if full_name in self._ema_shadow:
-                            teacher_state[key] = self._ema_shadow[full_name]
+                    student_state = get_peft_model_state_dict(self.model, adapter_name="student")
+                    for key in student_state.keys():
+                        if key in self._ema_shadow:
+                            teacher_state[key] = self._ema_shadow[key]
                         else:
-                            print("[WARNING] EMA key missing for teacher adapter weight:", full_name)
+                            print("[WARNING] EMA key missing for student adapter weight:", key)
                             # Fallback to current student weight if EMA key missing
-                            student_state = get_peft_model_state_dict(self.model, adapter_name="student")
                             teacher_state[key] = student_state[key]
                     set_peft_model_state_dict(self.model, teacher_state, adapter_name="teacher")
                 else:
@@ -899,10 +908,10 @@ class DTMModule(pl.LightningModule):
         # ---- 4. Decode completions to text for reward computation ----
         completion_ids = prompt_completion_ids[:, prompt_len:]  # [total_batch, gen_length]
         completions_text = self.tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
-        print_mask = (torch.rand(completion_ids.shape[0], device=completion_ids.device) < 0.1)
-        for i in range(completion_ids.shape[0]):
-            if print_mask[i]:
-                print(f"Completion {i+1}/{completion_ids.shape[0]}: {completions_text[i]}")
+        # print_mask = (torch.rand(completion_ids.shape[0], device=completion_ids.device) < 0.1)
+        # for i in range(completion_ids.shape[0]):
+        #     if print_mask[i]:
+        #         print(f"Completion {i+1}/{completion_ids.shape[0]}: {completions_text[i]}")
         
         # ---- 5. Build reward inputs: prompts, completions, and extra dataset columns ----
         data_keys = [key for key in self.train_set[0].keys() if key != "prompt"]
@@ -946,7 +955,7 @@ class DTMModule(pl.LightningModule):
             rewards_per_func[:, j] = torch.tensor(scores, device=device, dtype=torch.float32).clamp(min=0.0)
         
         #DEBUG: for a given prompt, with prob 0.1 print all the generated completions and their rewards
-        do_print = torch.rand(num_buffer_updates, device=device) < 0.05
+        do_print = torch.rand(num_buffer_updates, device=device) < getattr(self.hparams.tm, "buffer_student_print_prob", 0.1)
         for i in range(num_buffer_updates):
             if not do_print[i]:
                 continue
@@ -954,14 +963,30 @@ class DTMModule(pl.LightningModule):
             # Get the prompt index in the dataset
             row_idx = self._last_prompt_indices[i]
             row = self.train_set[row_idx]
-            
-            # Extract target and numbers for this prompt
-            target = row.get("target", None)
-            numbers = row.get("numbers", None)
-            
-            print(f"\n{'='*80}", flush=True)
-            print(f"Model = Teacher", flush=True)
-            print(f"Target: {target} | Numbers: {numbers}", flush=True)
+        
+            if self.hparams.dataset == "math" or self.hparams.dataset == "gsm8k":
+                prompt = row.get("prompt", None)
+                prompt_text = None
+                if isinstance(prompt, list) and prompt:
+                    prompt_text = prompt[0].get("content", None)
+                elif isinstance(prompt, str):
+                    prompt_text = prompt
+                if prompt_text:
+                    parts = prompt_text.split("\n\n", 1)
+                    question = parts[1] if len(parts) > 1 else prompt_text
+                else:
+                    question = None
+                answer = row.get("answer", None)
+                boxed = self._extract_boxed_answer(answer)
+                print(prompt_text, flush=True)
+                print(f"\n{'='*80}", flush=True)
+                print(f"Model = Teacher", flush=True)
+                print(f"Question: {question}", flush=True)
+                print(f"Ground truth answer (boxed): {boxed}", flush=True)
+            elif self.hparams.dataset == "countdown":
+                target = row.get("target", None)
+                numbers = row.get("numbers", None)
+                print(f"Target: {target} | Numbers: {numbers}", flush=True)
             print(f"{'='*80}\n", flush=True)
             
             # Print all completions for this prompt
@@ -1143,6 +1168,51 @@ class DTMModule(pl.LightningModule):
             )
             rewards_per_func[:, j] = torch.tensor(scores, device=device, dtype=torch.float32)
 
+        do_print = torch.rand(num_val_prompts, device=device) < getattr(self.hparams.tm, "buffer_student_print_prob", 0.1)
+        for i in range(num_val_prompts):
+            if not do_print[i]:
+                continue
+            
+            row_idx = val_subset_indices[i]
+            row = self.validation_set[row_idx]
+
+            print(f"\n{'='*80}", flush=True)
+            print(f"Model = Student", flush=True)
+            if self.hparams.dataset == "math" or self.hparams.dataset == "gsm8k":
+                prompt = row.get("prompt", None)
+                prompt_text = None
+                if isinstance(prompt, list) and prompt:
+                    prompt_text = prompt[0].get("content", None)
+                elif isinstance(prompt, str):
+                    prompt_text = prompt
+                if prompt_text:
+                    parts = prompt_text.split("\n\n", 1)
+                    question = parts[1] if len(parts) > 1 else prompt_text
+                else:
+                    question = None
+                answer = row.get("answer", None)
+                boxed = self._extract_boxed_answer(answer)
+                print(f"Question: {question}", flush=True)
+                print(f"Ground truth answer (boxed): {boxed}", flush=True)
+            elif self.hparams.dataset == "countdown":
+                target = row.get("target", None)
+                numbers = row.get("numbers", None)
+                print(f"Target: {target} | Numbers: {numbers}", flush=True)
+            print(f"{'='*80}\n", flush=True)    
+
+            matches = re.findall(r"<answer>(.*?)</answer>", completions_text[i], re.DOTALL)
+            if matches:
+                equation = matches[-1].strip()
+            else:
+                equation = None
+            
+            reward_val = rewards_per_func[i, 0].item() if num_funcs > 0 else 0.0
+            print(f"  --------------------------------", flush=True)
+            print(f"  Extracted equation: {equation}", flush=True)
+            print(f"  Reward: {reward_val:.4f}", flush=True)
+            print(f"  Full completion: {completions_text[i]}", flush=True)  # truncate long completions
+            print()
+
         # Free memory after reward computation
         del prompts_for_rewards
         del completions_for_rewards
@@ -1150,20 +1220,27 @@ class DTMModule(pl.LightningModule):
 
         if self.hparams.dataset == "gsm8k":
             correct_nums_eval = torch.isclose(rewards_per_func[:, -1], 2.0 * torch.ones_like(rewards_per_func[:, -1]), atol=1e-3, rtol=0.0).float().sum().item()
+            format_eval = 0 # TODO: add
         elif self.hparams.dataset == "math":
             correct_nums_eval = torch.isclose(rewards_per_func[:, 0], 2.0 * torch.ones_like(rewards_per_func[:, 0]), atol=1e-3, rtol=0.0).float().sum().item()
+            format_eval = torch.isclose(rewards_per_func[:, 1], 0.375 * torch.ones_like(rewards_per_func[:, 1]), atol=1e-3, rtol=0.0).float().sum().item()  
         else:
             correct_nums_eval = torch.isclose(rewards_per_func, self.hparams.max_rwd * torch.ones_like(rewards_per_func), atol=1e-3, rtol=0.0).float().sum().item()
+            format_eval = 0 # TODO: add
         total_rwd_eval = rewards_per_func.sum(dim=-1).sum().item()
-        local_counts = torch.tensor([correct_nums_eval, total_rwd_eval, num_val_prompts * num_completions_per_prompt], device=self.device, dtype=torch.long)
-        gathered = self.all_gather(local_counts)  # shape: (world_size, 3) for DDP
+        local_counts = torch.tensor([correct_nums_eval, format_eval, total_rwd_eval, num_val_prompts * num_completions_per_prompt], device=self.device, dtype=torch.long)
+        gathered = self.all_gather(local_counts)  # shape: (world_size, 4) for DDP
         global_correct = gathered[:, 0].sum()
-        global_rwd = gathered[:, 1].sum()
-        global_total   = gathered[:, 2].sum()
+        global_format = gathered[:, 1].sum()
+        global_rwd = gathered[:, 2].sum()
+        global_total   = gathered[:, 3].sum()
+        
+        global_format_score = (global_format.float() / global_total.float())
         global_acc = (global_correct.float() / global_total.float())
         global_rwd_avg = (global_rwd.float() / global_total.float())
 
-        print(f"[EVAL] Global accuracy is {global_acc:.4f}, global average reward is {global_rwd_avg:.4f}")
+        print(f"[EVAL] Global accuracy is {global_acc:.4f}, global average reward is {global_rwd_avg:.4f}, global format score is {global_format_score:.4f}")
+        self.dict_for_logs["eval/format_score"] = global_format_score.item()
         self.dict_for_logs["eval/correct_frac"] = global_acc.item()
         self.dict_for_logs["eval/avg_rwd"] = global_rwd_avg.item()
         # print(f"[EVAL] At global step {self.global_step}, for gpu {self.global_rank}, student correctness fraction: {global_acc:.4f}, avg reward: {global_rwd_avg:.4f}")

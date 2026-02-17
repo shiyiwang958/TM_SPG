@@ -8,7 +8,7 @@ from peft import LoraConfig, get_peft_model, set_peft_model_state_dict
 def chat():
     device = 'cuda'
     model = AutoModel.from_pretrained("/n/netscratch/albergo_lab/Everyone/frank/hf_models/LLaDA-8B-Instruct", trust_remote_code=True, torch_dtype=torch.bfloat16).to(device).eval()
-    path = "/n/netscratch/albergo_lab/Everyone/frank/llada_tm/countdown_0.1/checkpoint-a-2.200.ckpt"
+    path = "/n/netscratch/albergo_lab/Everyone/frank/llada_tm/math_test/last.ckpt"
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
     print(f"Loaded checkpoint from {path}")
     hparams = ckpt.get("hyper_parameters", {})

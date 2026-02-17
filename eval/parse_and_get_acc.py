@@ -467,4 +467,4 @@ def aggregate_results(directory="."):
 
 
 if __name__ == "__main__":
-    aggregate_results(directory="tilt_results/countdown_0.1")
+    aggregate_results(directory="tilt_results/justgrpo_256_steps")

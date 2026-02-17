@@ -181,7 +181,7 @@ def train(cfg: DictConfig):
         save_top_k = -1,
         every_n_train_steps = cfg.ckpt_freq,
         save_on_train_epoch_end = False,
-        filename = "a-{ckpt_a:.2f}-{ckpt_counter}",
+        filename = "checkpoint-{ckpt_a:.2f}-{ckpt_counter}",
         auto_insert_metric_name=False,
         save_on_exception=True,
     )
@@ -213,7 +213,7 @@ def train(cfg: DictConfig):
 
 
 #-------------------------------- Train ------------------------------------
-@hydra.main(config_path = "config", config_name = "interactive.yaml")
+@hydra.main(config_path = "config", config_name = "countdown.yaml")
 def main(cfg: DictConfig):
     train(cfg)
 

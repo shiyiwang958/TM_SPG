@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=eval_countdown
+#SBATCH --job-name=eval_math
 #SBATCH --partition=kempner
 #SBATCH --account=kempner_albergo_lab
-#SBATCH --output=../logs_eval/eval_countdown_%j.out
+#SBATCH --output=../logs_eval/eval_math_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:2
 #SBATCH --mem=64G
-#SBATCH --time=1:00:00
+#SBATCH --time=2:00:00
 #SBATCH --mail-type=END,FAIL,BEGIN
 #SBATCH --mail-user=fwang@math.harvard.edu
 
@@ -32,7 +32,7 @@ MASTER_PORT=$((RANDOM % 55536 + 10000))
 echo "Using random main_process_port: $MASTER_PORT"
 
 # Arrays of tasks and generation lengths
-TASKS=("countdown")
+TASKS=("math")
 GEN_LENGTHS=(256) # 128 is too short
 
 # no checkpoints to loop over
@@ -68,10 +68,10 @@ for task in "${TASKS[@]}"; do
       --dataset $task \
       --batch_size $batch_size \
       --gen_length $gen_length \
+      --diffusion_steps $((gen_length)) \
       --few_shot 0 \
-      --output_dir "tilt_results/countdown_0.2" \
-      --model_path "/n/netscratch/albergo_lab/Everyone/frank/hf_models/LLaDA-8B-Instruct" \
-      --checkpoint_path "/n/netscratch/albergo_lab/Everyone/frank/llada_tm/countdown_0.2/checkpoint-a-2.400.ckpt"
+      --output_dir "tilt_results/justgrpo_256_steps" \
+      --model_path "/n/netscratch/albergo_lab/Everyone/frank/llada_tm/JustGRPO" \
       # TODO: change to your checkpoint path
   done
 done
