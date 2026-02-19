@@ -255,6 +255,11 @@ class DTMModule(pl.LightningModule):
         if not matches:
             return None
         return matches[-1].strip()
+    
+    def extract_hash_answer(text: str) -> str | None:
+        if "####" not in text:
+            return None
+        return text.split("####")[1].strip()
 
     def _reset_micro_log_accum(self):
         self._micro_log_sums = {}
@@ -977,12 +982,16 @@ class DTMModule(pl.LightningModule):
                 else:
                     question = None
                 answer = row.get("answer", None)
-                boxed = self._extract_boxed_answer(answer)
+                
                 print(prompt_text, flush=True)
                 print(f"\n{'='*80}", flush=True)
                 print(f"Model = Teacher", flush=True)
                 print(f"Question: {question}", flush=True)
-                print(f"Ground truth answer (boxed): {boxed}", flush=True)
+                if self.hparams.dataset == "math":
+                    boxed = self._extract_boxed_answer(answer)
+                    print(f"Ground truth answer (boxed): {boxed}", flush=True)
+                elif self.hparams.dataset == "gsm8k":
+                    print(f"Ground truth answer: {answer}", flush=True)
             elif self.hparams.dataset == "countdown":
                 target = row.get("target", None)
                 numbers = row.get("numbers", None)
@@ -1002,7 +1011,10 @@ class DTMModule(pl.LightningModule):
                     equation = matches[-1].strip()
                 
                 # Get the reward for this completion
-                reward_val = rewards_per_func[global_idx, 0].item() if num_funcs > 0 else 0.0
+                if self.hparams.dataset == "gsm8k":
+                    reward_val = rewards_per_func[global_idx, -1].item() if num_funcs > 0 else 0.0
+                else:
+                    reward_val = rewards_per_func[global_idx, 0].item() if num_funcs > 0 else 0.0
                 
                 print(f"  Completion {comp_idx + 1}/{num_completions_per_prompt}:", flush=True)
                 print(f"  --------------------------------", flush=True)
@@ -1191,9 +1203,13 @@ class DTMModule(pl.LightningModule):
                 else:
                     question = None
                 answer = row.get("answer", None)
-                boxed = self._extract_boxed_answer(answer)
+                
                 print(f"Question: {question}", flush=True)
-                print(f"Ground truth answer (boxed): {boxed}", flush=True)
+                if self.hparams.dataset == "math":
+                    boxed = self._extract_boxed_answer(answer)
+                    print(f"Ground truth answer (boxed): {boxed}", flush=True)
+                elif self.hparams.dataset == "gsm8k":
+                    print(f"Ground truth answer: {answer}", flush=True)
             elif self.hparams.dataset == "countdown":
                 target = row.get("target", None)
                 numbers = row.get("numbers", None)
@@ -1206,7 +1222,12 @@ class DTMModule(pl.LightningModule):
             else:
                 equation = None
             
-            reward_val = rewards_per_func[i, 0].item() if num_funcs > 0 else 0.0
+
+            if self.hparams.dataset == "gsm8k":
+                reward_val = rewards_per_func[i, -1].item() if num_funcs > 0 else 0.0
+            else:
+                reward_val = rewards_per_func[i, 0].item() if num_funcs > 0 else 0.0
+
             print(f"  --------------------------------", flush=True)
             print(f"  Extracted equation: {equation}", flush=True)
             print(f"  Reward: {reward_val:.4f}", flush=True)
@@ -1233,7 +1254,7 @@ class DTMModule(pl.LightningModule):
         global_correct = gathered[:, 0].sum()
         global_format = gathered[:, 1].sum()
         global_rwd = gathered[:, 2].sum()
-        global_total   = gathered[:, 3].sum()
+        global_total = gathered[:, 3].sum()
         
         global_format_score = (global_format.float() / global_total.float())
         global_acc = (global_correct.float() / global_total.float())

@@ -8,7 +8,7 @@ tm:
   control_variate: 1.0
   control_variate_ema: 0.04
   ema_decay: 0.999 # modified
-  grad_accum_steps: 3 # modified
+  grad_accum_steps: 5 # modified
   h: 1.0
   learned_cv: false
   loss_type: itm
@@ -23,7 +23,7 @@ tm:
   steps_per_h: 800 # this is the number of optimizer steps per h
   log_student: true
   log_temperature: 0.0
-  student_log_steps: 200
+  student_log_steps: 100
   student_logs_per_prompt: 1
   use_ema: true
   hat_wv_neg_thresh: -1e-8
@@ -40,9 +40,9 @@ adam_epsilon: 1e-8
 weight_decay: 0.0 # modified
 
 max_grad_norm: 2.0
-learning_rate: 2e-5
-lr_decay_ratio: 0.25
-lr_min: 3e-6
+learning_rate: 5e-5 # modified
+lr_decay_ratio: 0.30
+lr_min: 3e-6 # modified
 lr_scheduler_type: linear
 lr_warmup_ratio: 0.0
 
@@ -51,7 +51,7 @@ block_length: 32
 cfg_scale: 0.0
 diffusion_steps: 128
 max_completion_length: 256
-max_prompt_length: 363
+max_prompt_length: 240 # 240 for gsm
 remasking_strategy: low_confidence
 sampling_temperature: 1.0
 
@@ -63,24 +63,24 @@ base_model_path: /n/netscratch/albergo_lab/Everyone/frank/hf_models/LLaDA-8B-Ins
 
 lora_r: 128
 lora_alpha: 64
-lora_dropout: 0.05 # modified
+lora_dropout: 0.10 # modified
 peft_task_type: CAUSAL_LM
 
 #-----------------Logging and Checkpointing Config-----------------
-checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/math_small_lr_small_batch/medium_lr_continued
+checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm_result
 ckpt_freq: 100 # in optimizer steps
 metrics_log_every: 1
-resume_path: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/math_small_lr_small_batch/last.ckpt
+resume_path:
 # leave empty if not resuming
 student_copy_over: false
 
 wandb:
   entity: "yuyuanchen-harvard-university"
   project: "LLaDA_TM"
-  name: "math_small_lr_small_batch"
+  name: "gsm"
 
 #-----------------Other Training Config-----------------
-dataset: math
+dataset: gsm8k
 max_rwd: 1.0
 few_shot: 0
 seed: 42
