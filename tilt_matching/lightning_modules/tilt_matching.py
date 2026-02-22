@@ -663,6 +663,11 @@ class DTMModule(pl.LightningModule):
         elif loss_type == "sg-itm":
             curr_probs = F.softmax(curr_logits, dim=-1) # [B, gen_length, V]
             target = self.cv * old_probs + x1_equals_v * (1 - self.cv + torch.expm1(hr)).view(-1, 1, 1) - torch.expm1(hr) * curr_probs.detach()
+        elif loss_type == "final-phase":
+            if self.hparams.dataset == "gsm8k":
+                target = x1_equals_v * rwds[:, -1].view(-1, 1, 1) # [B, gen_length, V]
+            elif self.hparams.dataset == "math":
+                target = x1_equals_v * rwds[:, 0].view(-1, 1, 1) # [B, gen_length, V]
         else:
             raise ValueError(f"Invalid loss_type: {loss_type}")
         
