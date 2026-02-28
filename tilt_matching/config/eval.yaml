@@ -10,9 +10,12 @@ tm:
   learned_cv: false
   loss_type: itm
   num_batch_prompts: 2
+  num_batch_states: 512
+  num_rebuilds_per_h: 25
   num_buffer_prompts: 80
   num_buffer_refresh: 20
   num_completions_per_prompt: 6
+  ce_topk: 64
   rescale_logits: false
   rwd_shift: -2.0
   rwd_shift_auto: true

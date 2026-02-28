@@ -213,7 +213,7 @@ def train(cfg: DictConfig):
 
 
 #-------------------------------- Train ------------------------------------
-@hydra.main(config_path = "config", config_name = "countdown.yaml")
+@hydra.main(config_path = "config", config_name = "debug.yaml")
 def main(cfg: DictConfig):
     train(cfg)
 

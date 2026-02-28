@@ -1,26 +1,25 @@
 #-----------------Tilt Matching Training Config-----------------
 tm:
   a_end: 100.0
-  buffer_chunk_size: 30
+  buffer_chunk_size: 40
   buffer_print_samples: 0
-  buffer_refresh_steps: 50
   buffer_student_print_prob: 0.10
   control_variate: 1.0
   control_variate_ema: 0.04
   ema_decay: 0.999 # modified
-  grad_accum_steps: 5 # modified
-  h: 1.0
+  grad_accum_steps: 8
+  h: 1.5
   learned_cv: false
   loss_type: itm
-  mix_batches: true
-  num_batch_prompts: 10 # modified
-  num_buffer_prompts: 80
-  num_buffer_refresh: 20
+  num_batch_states: 12
+  num_rebuilds_per_h: 1
+  num_buffer_prompts: 75
   num_completions_per_prompt: 6
+  ce_topk: 40
   rescale_logits: false
   rwd_shift: 0.0
   rwd_shift_auto: false
-  steps_per_h: 800 # this is the number of optimizer steps per h
+  steps_per_h: 600 # this is the number of optimizer steps per h
   log_student: true
   log_temperature: 0.0
   student_log_steps: 100
@@ -39,10 +38,10 @@ adam_beta2: 0.999 # modified
 adam_epsilon: 1e-8
 weight_decay: 0.0 # modified
 
-max_grad_norm: 2.0
-learning_rate: 5e-5 # modified
+max_grad_norm: 1.0
+learning_rate: 4e-6 # modified
 lr_decay_ratio: 0.30
-lr_min: 3e-6 # modified
+lr_min: 2e-6 # modified
 lr_scheduler_type: linear
 lr_warmup_ratio: 0.0
 
@@ -63,11 +62,11 @@ base_model_path: /n/netscratch/albergo_lab/Everyone/frank/hf_models/LLaDA-8B-Ins
 
 lora_r: 128
 lora_alpha: 64
-lora_dropout: 0.10 # modified
+lora_dropout: 0.05
 peft_task_type: CAUSAL_LM
 
 #-----------------Logging and Checkpointing Config-----------------
-checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm_result
+checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/conf_aligned/gsm8k/
 ckpt_freq: 100 # in optimizer steps
 metrics_log_every: 1
 resume_path:
@@ -77,13 +76,13 @@ student_copy_over: false
 wandb:
   entity: "yuyuanchen-harvard-university"
   project: "LLaDA_TM"
-  name: "gsm"
+  name: "gsm_conf_trial"
 
 #-----------------Other Training Config-----------------
 dataset: gsm8k
 max_rwd: 1.0
 few_shot: 0
 seed: 42
-nodes: 8
+nodes: 4
 devices: 2  # 8? 4?
-world_size: 16
+world_size: 8

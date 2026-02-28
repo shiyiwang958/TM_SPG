@@ -52,12 +52,33 @@ class DTMModule(pl.LightningModule):
 
         self.buffer = None
         self.buffer_rewards = None
-        self._rebuild_buffer_next_phase = False
+        self.buffer_xt = None
+        self.buffer_active_block_mask = None
+        self.buffer_num_steps = None
+        self._rebuild_buffer_next_segment = False
+        self._rebuild_due_to_phase = False
         self.num_buffer_prompts = self.hparams.tm.num_buffer_prompts
         self.comps_per_prompt = self.hparams.tm.num_completions_per_prompt
+        self.num_batch_states = int(self.hparams.tm.num_batch_states)
+        self.num_rebuilds_per_h = int(getattr(self.hparams.tm, "num_rebuilds_per_h", 1))
+        self.ce_topk = int(getattr(self.hparams.tm, "ce_topk", 0))
+        self._segment_opt_steps = None
         self.buffer_update_counter = 0
         self._grad_accum_counter = 0
         self._step_counter = 0
+        self._phase_opt_step = 0
+        self._state_perm = None
+        self._state_cursor = 0
+        self._accum_state_idx = None
+        self._segment_expected_states = None
+        self.g_cpu = None
+        self._flat_buffer_xt = None
+        self._flat_buffer_active_block_mask = None
+        self._flat_buffer = None
+        self._flat_buffer_rewards = None
+        self._loaded_ema_shadow = None
+        self._loaded_phase_opt_step = None
+        self._resuming_from_ckpt = False
 
         # --- Set up DTM hyperparameters ---
         self.a = 0.0
@@ -200,6 +221,8 @@ class DTMModule(pl.LightningModule):
         logical_rank = global_rank % logical_world_size
         self.g = torch.Generator(device=self.device)
         self.g.manual_seed(12345 + logical_rank)
+        self.g_cpu = torch.Generator()
+        self.g_cpu.manual_seed(12345 + logical_rank)
 
         self._start_step = getattr(self, "global_step", 0)
         
@@ -208,11 +231,28 @@ class DTMModule(pl.LightningModule):
         for g in self.tm_opt.param_groups:
             g["lr"] = self.lr
         self._init_tm_scheduler()
+        self._init_segment_schedule()
+        loaded_phase_step = None
+        segment_start = 0
+        if getattr(self, "_resuming_from_ckpt", False):
+            loaded_phase_step = int(self._loaded_phase_opt_step or 0)
+            segment_start = (loaded_phase_step // self._segment_opt_steps) * self._segment_opt_steps
+            self._phase_opt_step = segment_start
+            print(
+                "[DEBUG] Resume detected: "
+                f"loaded phase_opt_step={loaded_phase_step}, "
+                f"adjusted_segment_start={segment_start}, "
+                "segment replay restarts from a fresh rebuild."
+            )
+        else:
+            self._phase_opt_step = 0
 
         self._update_buffer(self.model, self.num_buffer_prompts, self.comps_per_prompt)
         print(f"[DEBUG] Buffer initialized with shape {self.buffer.shape}")
-        # Initialize EMA for the current h-phase
-        self._reset_ema()
+        # Initialize / restore EMA for the current h-phase
+        self._restore_or_reset_ema()
+        self._loaded_phase_opt_step = None
+        self._resuming_from_ckpt = False
     
     def configure_optimizers(self):
         params = [p for p in self.model.parameters() if p.requires_grad]
@@ -224,14 +264,71 @@ class DTMModule(pl.LightningModule):
             weight_decay=self.hparams.weight_decay,
         )
         return opt
+
+    def _init_segment_schedule(self):
+        if self.num_rebuilds_per_h <= 0:
+            raise ValueError(f"tm.num_rebuilds_per_h must be >= 1, got {self.num_rebuilds_per_h}")
+        if self.steps_per_h % self.num_rebuilds_per_h != 0:
+            raise ValueError(
+                f"tm.steps_per_h ({self.steps_per_h}) must be divisible by tm.num_rebuilds_per_h ({self.num_rebuilds_per_h})"
+            )
+        self._segment_opt_steps = self.steps_per_h // self.num_rebuilds_per_h
+        if self._segment_opt_steps <= 0:
+            raise ValueError(
+                f"Invalid segment size: steps_per_h={self.steps_per_h}, num_rebuilds_per_h={self.num_rebuilds_per_h}"
+            )
+
+    def _validate_replay_budget(self):
+        if self.buffer_num_steps is None:
+            raise RuntimeError("buffer_num_steps is not set; buffer must be built before validating replay budget.")
+        if self._segment_opt_steps is None:
+            raise RuntimeError("segment schedule is not initialized.")
+
+        segment_microsteps = self._segment_opt_steps * self.hparams.tm.grad_accum_steps
+        states_per_rebuild = self.num_buffer_prompts * self.comps_per_prompt * int(self.buffer_num_steps)
+        required_states = segment_microsteps * self.num_batch_states
+        if states_per_rebuild != required_states:
+            raise ValueError(
+                "Replay budget mismatch for no-reuse sampling: "
+                f"num_buffer_prompts({self.num_buffer_prompts}) * "
+                f"num_completions_per_prompt({self.comps_per_prompt}) * "
+                f"S({int(self.buffer_num_steps)}) = {states_per_rebuild}, but "
+                f"segment_opt_steps({self._segment_opt_steps}) * "
+                f"grad_accum_steps({self.hparams.tm.grad_accum_steps}) * "
+                f"num_batch_states({self.num_batch_states}) = {required_states}. "
+                "Require exact equality."
+            )
+        self._segment_expected_states = int(states_per_rebuild)
+        print(
+            "[DEBUG] Replay budget check passed: "
+            f"S={int(self.buffer_num_steps)}, states_per_rebuild={states_per_rebuild}, "
+            f"segment_microsteps={segment_microsteps}, num_batch_states={self.num_batch_states}"
+        )
+
+    def _reset_state_sampler_for_segment(self):
+        self._validate_replay_budget()
+        total_states = int(self._segment_expected_states)
+        self._state_perm = torch.randperm(total_states, generator=self.g_cpu)
+        self._state_cursor = 0
+        self._accum_state_idx = None
+
+    def _assert_segment_exhausted(self, tag: str):
+        expected = int(self._segment_expected_states or 0)
+        if self._state_cursor != expected:
+            raise RuntimeError(
+                f"Segment '{tag}' ended with unused or overused states: "
+                f"consumed={self._state_cursor}, expected={expected}."
+            )
     
     def on_train_batch_start(self, batch, batch_idx):
-        # If we scheduled a full buffer rebuild at the end of the previous h-phase,
-        # do it now (i.e., at the start of the new h-phase), after checkpointing.
-        if getattr(self, "_rebuild_buffer_next_phase", False):
+        if getattr(self, "_rebuild_buffer_next_segment", False):
+            if (self._grad_accum_counter % self.hparams.tm.grad_accum_steps) != 0:
+                raise RuntimeError("Buffer rebuild requested mid-accumulation window.")
             self._update_buffer(self.model, self.num_buffer_prompts, self.comps_per_prompt)
-            print(f"[DEBUG] Buffer built at start of new h-phase (global step {self.global_step})")
-            self._rebuild_buffer_next_phase = False
+            reason = "new h-phase" if self._rebuild_due_to_phase else "mid-phase segment"
+            print(f"[DEBUG] Buffer rebuilt for {reason} (global step {self.global_step})")
+            self._rebuild_buffer_next_segment = False
+            self._rebuild_due_to_phase = False
     
     # ---------------------------
     # Micro-step metric averaging
@@ -304,14 +401,96 @@ class DTMModule(pl.LightningModule):
     # EMA (student adapter only)
     # ---------------------------
     def _student_param_iter(self):
-        state = get_peft_model_state_dict(self.model, adapter_name="student")
-        for key, value in state.items():
-            yield key, value
+        for key, value in self.model.named_parameters():
+            if ".student." in key or key.endswith(".student"):
+                yield key, value
+
+    @staticmethod
+    def _student_to_teacher_param_name(student_name: str):
+        if ".student." in student_name:
+            return student_name.replace(".student.", ".teacher.", 1)
+        if student_name.endswith(".student"):
+            return f"{student_name[:-len('.student')]}.teacher"
+        return None
+
+    @torch.no_grad()
+    def _copy_student_to_teacher(self):
+        teacher_params = {}
+        for name, param in self.model.named_parameters():
+            if ".teacher." in name or name.endswith(".teacher"):
+                teacher_params[name] = param
+
+        missing_teacher = 0
+        for student_name, student_param in self._student_param_iter():
+            teacher_name = self._student_to_teacher_param_name(student_name)
+            if teacher_name is None or teacher_name not in teacher_params:
+                missing_teacher += 1
+                continue
+            src = student_param.detach()
+            if self.use_ema and self._ema_shadow is not None:
+                src = self._ema_shadow.get(student_name, src)
+            dst = teacher_params[teacher_name]
+            if src.shape != dst.shape:
+                print(
+                    "[WARNING] Teacher copy shape mismatch:",
+                    student_name,
+                    src.shape,
+                    "->",
+                    teacher_name,
+                    dst.shape,
+                )
+                src = student_param.detach()
+            dst.copy_(src.to(device=dst.device, dtype=dst.dtype))
+
+        if missing_teacher > 0:
+            print(f"[WARNING] Missing teacher counterparts for {missing_teacher} student parameters.")
+
+        for param in teacher_params.values():
+            param.requires_grad_(False)
 
     def _reset_ema(self):
+        if not self.use_ema:
+            self._ema_shadow = None
+            return
         self._ema_shadow = {}
         for key, param in self._student_param_iter():
             self._ema_shadow[key] = param.detach().clone()
+
+    def _restore_or_reset_ema(self):
+        if not self.use_ema:
+            self._ema_shadow = None
+            self._loaded_ema_shadow = None
+            return
+
+        loaded_shadow = self._loaded_ema_shadow if getattr(self, "_resuming_from_ckpt", False) else None
+        if not isinstance(loaded_shadow, dict):
+            self._reset_ema()
+            self._loaded_ema_shadow = None
+            return
+
+        restored = {}
+        student_params = dict(self._student_param_iter())
+        fallback_count = 0
+        for key, param in student_params.items():
+            loaded_tensor = loaded_shadow.get(key, None)
+            if isinstance(loaded_tensor, torch.Tensor) and loaded_tensor.shape == param.shape:
+                restored[key] = loaded_tensor.detach().to(device=param.device, dtype=param.dtype).clone()
+            else:
+                restored[key] = param.detach().clone()
+                fallback_count += 1
+
+        extra_keys = set(loaded_shadow.keys()) - set(student_params.keys())
+        if extra_keys:
+            print(f"[WARNING] Ignoring {len(extra_keys)} extra EMA keys from checkpoint.")
+        if fallback_count > 0:
+            print(f"[WARNING] EMA restore fell back to current student params for {fallback_count} keys.")
+        print(
+            "[DEBUG] EMA restore complete: "
+            f"restored_keys={len(restored)}, "
+            f"fallback_keys={fallback_count}"
+        )
+        self._ema_shadow = restored
+        self._loaded_ema_shadow = None
     
     @torch.no_grad()
     def _update_ema(self):
@@ -319,12 +498,12 @@ class DTMModule(pl.LightningModule):
             self._reset_ema()
             return
         decay = float(self.ema_decay)
-        with torch.no_grad():
-            for key, param in self._student_param_iter():
-                if key not in self._ema_shadow:
-                    self._ema_shadow[key] = param.detach().clone()
-                else:
-                    self._ema_shadow[key].mul_(decay).add_(param.detach(), alpha=1.0 - decay)
+        for key, param in self._student_param_iter():
+            src = param.detach()
+            if key not in self._ema_shadow:
+                self._ema_shadow[key] = src.clone()
+            else:
+                self._ema_shadow[key].mul_(decay).add_(src, alpha=1.0 - decay)
 
     def training_step(self, batch, batch_idx):
         """
@@ -347,12 +526,18 @@ class DTMModule(pl.LightningModule):
 
         # At the start of a new accumulation window:
         if (self._grad_accum_counter % accum) == 0:
-            if getattr(self.hparams.tm, "mix_batches", False):
-                total_sample_needed = self.hparams.tm.num_batch_prompts * accum
-                self._accum_prompts_idx = torch.randperm(self.buffer.shape[0] * self.comps_per_prompt, device=self.device, generator=self.g)[:total_sample_needed]              
-            else:
-                total_prompts_needed = self.hparams.tm.num_batch_prompts * accum
-                self._accum_prompts_idx = torch.randperm(self.buffer.shape[0], device=self.device, generator=self.g)[:total_prompts_needed]
+            total_states_needed = self.num_batch_states * accum
+            if self._state_perm is None:
+                raise RuntimeError("State sampler is not initialized. Buffer rebuild should initialize it.")
+            start_state = self._state_cursor
+            end_state = start_state + total_states_needed
+            if end_state > self._state_perm.numel():
+                raise RuntimeError(
+                    "Not enough replay states left in this segment for one grad-accum window: "
+                    f"needed={total_states_needed}, cursor={self._state_cursor}, total={self._state_perm.numel()}."
+                )
+            self._accum_state_idx = self._state_perm[start_state:end_state]
+            self._state_cursor = end_state
             self._reset_micro_log_accum()
             self._cv_num_accum = torch.zeros((), device=self.device)
             self._cv_den_accum = torch.zeros((), device=self.device)
@@ -539,30 +724,21 @@ class DTMModule(pl.LightningModule):
         self.dict_for_logs["grads/grad_clipped"] = grad_clipped
         self.dict_for_logs["train/cv"] = self.cv
 
+        self._phase_opt_step += 1
+        if (self._phase_opt_step % self._segment_opt_steps) == 0:
+            self._assert_segment_exhausted("segment")
+            if self._phase_opt_step < self.steps_per_h:
+                self._rebuild_buffer_next_segment = True
+                self._rebuild_due_to_phase = False
+                print(f"[DEBUG] Scheduled full rebuild for next segment at global step {self.global_step}")
+
         # At each h phase boundary, update a and the teacher adapter
-        if (self.global_step - self._start_step) % self.steps_per_h == 0:
+        if self._phase_opt_step == self.steps_per_h:
             self.a += self.h
             if self.a + self.h > self.a_end:
                 self.h = self.a_end - self.a
             with torch.no_grad():
-                if self.use_ema and self._ema_shadow is not None:
-                    # Copy EMA (student) weights into teacher adapter
-                    teacher_state = {}
-                    student_state = get_peft_model_state_dict(self.model, adapter_name="student")
-                    for key in student_state.keys():
-                        if key in self._ema_shadow:
-                            teacher_state[key] = self._ema_shadow[key]
-                        else:
-                            print("[WARNING] EMA key missing for student adapter weight:", key)
-                            # Fallback to current student weight if EMA key missing
-                            teacher_state[key] = student_state[key]
-                    set_peft_model_state_dict(self.model, teacher_state, adapter_name="teacher")
-                else:
-                    adapter_state = get_peft_model_state_dict(self.model, adapter_name="student")
-                    set_peft_model_state_dict(self.model, adapter_state, adapter_name="teacher")
-                for name, p in self.model.named_parameters():
-                    if ".teacher" in name:
-                        p.requires_grad_(False)
+                self._copy_student_to_teacher()
             print(f"Model weights copied. Degree of tilt a = {self.a:.4f} at global step {self.global_step}")
 
             if self.a >= self.a_end:
@@ -575,31 +751,46 @@ class DTMModule(pl.LightningModule):
             self._init_tm_scheduler()
             # Reset EMA for the new h-phase
             self._reset_ema()
+            self._phase_opt_step = 0
+            self._rebuild_buffer_next_segment = True
+            self._rebuild_due_to_phase = True
+            print(f"[DEBUG] Scheduled full rebuild for next h-phase at global step {self.global_step}")
 
         self.log("ckpt_a", self.a, on_step=True, on_epoch=False, sync_dist=True)
 
     def _tm_step(self):
-        num_buffer_prompts, comps_per_prompt, L = self.buffer.shape
-        num_batch_prompts = self.hparams.tm.num_batch_prompts
+        _, _, L = self.buffer.shape
+        accum = self.hparams.tm.grad_accum_steps
         gen_length = self.hparams.max_completion_length
+        S = int(self.buffer_num_steps)
 
-        # Draw a batch from the buffer
-        if getattr(self.hparams.tm, "mix_batches", False):
-            B = num_batch_prompts
-            start_idx = (self._grad_accum_counter % self.hparams.tm.grad_accum_steps) * B
-            prompts_idx = self._accum_prompts_idx[start_idx:start_idx + B]
-            flat_buffer = self.buffer.reshape(-1, L)
-            flat_rewards = self.buffer_rewards.reshape(-1, self.buffer_rewards.shape[-1])
-            x1s = flat_buffer[prompts_idx]           # [B, L]
-            del flat_buffer
-            rwds = flat_rewards[prompts_idx]         # [B, num_reward_funcs]
-            del flat_rewards
-        else:
-            B = num_batch_prompts * comps_per_prompt
-            start_idx = (self._grad_accum_counter % self.hparams.tm.grad_accum_steps) * num_batch_prompts
-            prompts_idx = self._accum_prompts_idx[start_idx:start_idx + num_batch_prompts]
-            x1s = self.buffer[prompts_idx].reshape(B, L)           # [B, L]
-            rwds = self.buffer_rewards[prompts_idx].reshape(B, -1) # [B, num_reward_funcs]
+        # Draw a batch of replay states (without replacement inside this segment)
+        B = self.num_batch_states
+        start_idx = (self._grad_accum_counter % accum) * B
+        state_idx = self._accum_state_idx[start_idx:start_idx + B]
+        if state_idx.numel() != B:
+            raise RuntimeError(
+                f"Expected {B} replay states for this microstep, got {state_idx.numel()}."
+            )
+
+        if (
+            self._flat_buffer_xt is None
+            or self._flat_buffer_active_block_mask is None
+            or self._flat_buffer is None
+            or self._flat_buffer_rewards is None
+        ):
+            raise RuntimeError("Flattened replay views are missing. Buffer rebuild must initialize cached views.")
+
+        flat_xt = self._flat_buffer_xt
+        flat_active_block_mask = self._flat_buffer_active_block_mask
+        xts = flat_xt[state_idx].to(self.device, non_blocking=True)  # [B, L]
+        mask_for_loss = flat_active_block_mask[state_idx].to(self.device, non_blocking=True)
+
+        completion_idx = torch.div(state_idx, S, rounding_mode="floor").to(self.device, non_blocking=True)
+        flat_buffer = self._flat_buffer
+        flat_rewards = self._flat_buffer_rewards
+        x1s = flat_buffer[completion_idx]   # [B, L]
+        rwds = flat_rewards[completion_idx] # [B, num_reward_funcs]
 
         # Aggregate rewards from multiple functions
         weights = torch.ones(rwds.shape[1], device=self.device, dtype=rwds.dtype)
@@ -610,12 +801,6 @@ class DTMModule(pl.LightningModule):
             correct_frac = torch.isclose(rwds[:, 0], 2.0 * torch.ones_like(rwd), atol=1e-6, rtol=0.0).float().mean()
         else:
             correct_frac = torch.isclose(rwd, self.hparams.max_rwd * torch.ones_like(rwd), atol=1e-6, rtol=0.0).float().mean()
-        
-        # Create x_t's by masking the x_1's
-        num_to_mask = torch.randint(low=1, high=gen_length+1, size=(x1s.shape[0],), device=self.device)
-        xts, mask_indices, active_block_mask = self._build_interpolant(x1s, num_to_mask, self.hparams.block_length)
-        use_sar = bool(getattr(self.hparams.tm, "use_sar_active_block_norm", False))
-        mask_for_loss = active_block_mask if use_sar else mask_indices
 
         # Get model predictions and compute loss
         temp = self.hparams.sampling_temperature
@@ -623,7 +808,7 @@ class DTMModule(pl.LightningModule):
             self.model.eval()
             old_logits = self._new_forward(self.model, xts, gen_length) # [B, gen_length, V]
         V = old_logits.shape[-1]
-        x1_equals_v = F.one_hot(x1s.long()[:, -gen_length:], num_classes = V) # [B, gen_length, V]
+        x1_equals_v = F.one_hot(x1s.long()[:, -gen_length:], num_classes=V).to(old_logits.dtype) # [B, gen_length, V]
         with self._use_adapter("student"):
             self.model.train()   
             curr_logits = self._new_forward(self.model, xts, gen_length) # [B, gen_length, V]
@@ -656,20 +841,31 @@ class DTMModule(pl.LightningModule):
             self.cv = self.hparams.tm.control_variate
 
         loss_type = self.hparams.tm.loss_type
-        if loss_type == "itm":
-            target = self.cv * old_probs + x1_equals_v * (1 - self.cv + torch.expm1(hr)).view(-1, 1, 1) # [B, gen_length, V]
-        elif loss_type == "etm":
-            target = (1 - hr) * old_probs + x1_equals_v * hr.view(-1, 1, 1) # [B, gen_length, V]
-        elif loss_type == "sg-itm":
-            curr_probs = F.softmax(curr_logits, dim=-1) # [B, gen_length, V]
-            target = self.cv * old_probs + x1_equals_v * (1 - self.cv + torch.expm1(hr)).view(-1, 1, 1) - torch.expm1(hr) * curr_probs.detach()
-        elif loss_type == "final-phase":
+        hr_view = hr.view(-1, 1, 1)
+        exp_hr = torch.exp(hr).view(-1, 1, 1)
+        expm1_hr = torch.expm1(hr).view(-1, 1, 1)
+        final_phase_scale = None
+        if loss_type == "final-phase":
             if self.hparams.dataset == "gsm8k":
-                target = x1_equals_v * rwds[:, -1].view(-1, 1, 1) # [B, gen_length, V]
+                final_phase_scale = rwds[:, -1]
             elif self.hparams.dataset == "math":
-                target = x1_equals_v * rwds[:, 0].view(-1, 1, 1) # [B, gen_length, V]
-        else:
-            raise ValueError(f"Invalid loss_type: {loss_type}")
+                final_phase_scale = rwds[:, 0]
+            else:
+                final_phase_scale = rwd
+
+        use_topk_ce = self.ce_topk > 0 and self.ce_topk < curr_logits.shape[-1]
+        target = None
+        if not use_topk_ce:
+            if loss_type == "itm":
+                target = self.cv * old_probs + x1_equals_v * (exp_hr - self.cv) # [B, gen_length, V]
+            elif loss_type == "etm":
+                target = (1.0 - hr_view) * old_probs + x1_equals_v * hr_view # [B, gen_length, V]
+            elif loss_type == "sg-itm":
+                target = self.cv * old_probs + x1_equals_v * (exp_hr - self.cv) - expm1_hr * curr_probs_ng.detach()
+            elif loss_type == "final-phase":
+                target = x1_equals_v * final_phase_scale.view(-1, 1, 1)
+            else:
+                raise ValueError(f"Invalid loss_type: {loss_type}")
         
         with torch.no_grad():
             if self._wv_num_accum is None:
@@ -688,7 +884,6 @@ class DTMModule(pl.LightningModule):
             per_row_pi_a = (old_probs * mask3).sum(dim=1) / row_cnt.unsqueeze(-1)          # [B, V]
             per_row_onehot = (x1_equals_v * mask3).sum(dim=1) / row_cnt.unsqueeze(-1)      # [B, V]
 
-            exp_hr = torch.exp(hr).view(-1, 1, 1)  # [B,1,1]
             per_row_exp_onehot = ((x1_equals_v * exp_hr) * mask3).sum(dim=1) / row_cnt.unsqueeze(-1)  # [B,V]
 
             # batch-average
@@ -696,8 +891,23 @@ class DTMModule(pl.LightningModule):
             onehot_hat = per_row_onehot.mean(dim=0)        # [V]
             exp_onehot_hat = per_row_exp_onehot.mean(dim=0)# [V]
 
+            if loss_type == "itm":
+                per_row_coeff = self.cv * per_row_pi_a + (torch.exp(hr).view(-1, 1) - self.cv) * per_row_onehot
+            elif loss_type == "etm":
+                per_row_coeff = (1.0 - hr).view(-1, 1) * per_row_pi_a + hr.view(-1, 1) * per_row_onehot
+            elif loss_type == "sg-itm":
+                per_row_curr = (curr_probs_ng * mask3).sum(dim=1) / row_cnt.unsqueeze(-1)
+                per_row_coeff = (
+                    self.cv * per_row_pi_a
+                    + (torch.exp(hr).view(-1, 1) - self.cv) * per_row_onehot
+                    - torch.expm1(hr).view(-1, 1) * per_row_curr
+                )
+            elif loss_type == "final-phase":
+                per_row_coeff = final_phase_scale.view(-1, 1).to(per_row_onehot.dtype) * per_row_onehot
+            else:
+                raise ValueError(f"Invalid loss_type: {loss_type}")
+
             # your existing hat_w accumulator (equivalent to batch mean of row-avg target)
-            per_row_coeff = (target.detach() * mask3).sum(dim=1) / row_cnt.unsqueeze(-1)  # [B,V]
             self._wv_num_accum += per_row_coeff.mean(dim=0)
 
             # new diagnostic accumulators
@@ -706,9 +916,36 @@ class DTMModule(pl.LightningModule):
             self._wv_exp_onehot_accum += exp_onehot_hat
 
 
-        per_position_losses = -(target * F.log_softmax(curr_logits, dim=-1)).sum(dim=-1) # [B, gen_length]
+        if use_topk_ce:
+            topk_ids = torch.topk(curr_logits.detach(), k=self.ce_topk, dim=-1).indices
+            topk_logits = torch.gather(curr_logits, dim=-1, index=topk_ids)
+            topk_log_probs = F.log_softmax(topk_logits, dim=-1)
+            old_probs_topk = torch.gather(old_probs, dim=-1, index=topk_ids)
+            topk_onehot = torch.gather(x1_equals_v, dim=-1, index=topk_ids)
+
+            if loss_type == "itm":
+                topk_target = self.cv * old_probs_topk + topk_onehot * (exp_hr - self.cv)
+            elif loss_type == "etm":
+                topk_target = (1.0 - hr_view) * old_probs_topk + topk_onehot * hr_view
+            elif loss_type == "sg-itm":
+                curr_log_z = torch.logsumexp(curr_logits.detach(), dim=-1, keepdim=True)
+                curr_probs_topk_fullnorm = torch.exp(topk_logits.detach() - curr_log_z)
+                topk_target = (
+                    self.cv * old_probs_topk
+                    + topk_onehot * (exp_hr - self.cv)
+                    - expm1_hr * curr_probs_topk_fullnorm
+                )
+            elif loss_type == "final-phase":
+                topk_target = final_phase_scale.view(-1, 1, 1).to(topk_onehot.dtype) * topk_onehot
+            else:
+                raise ValueError(f"Invalid loss_type: {loss_type}")
+            per_position_losses = -(topk_target * topk_log_probs).sum(dim=-1) # [B, gen_length]
+        else:
+            if target is None:
+                raise RuntimeError("Full-vocab CE path expected a full target tensor.")
+            per_position_losses = -(target * F.log_softmax(curr_logits, dim=-1)).sum(dim=-1) # [B, gen_length]
         per_row_losses = (per_position_losses * mask_for_loss).sum(dim=1)  # [B]
-        loss = (per_row_losses / mask_for_loss.sum(dim=1).to(per_row_losses.dtype)).mean()
+        loss = (per_row_losses / mask_for_loss.sum(dim=1).to(per_row_losses.dtype).clamp_min(1.0)).mean()
         self.cv = prev_cv
 
         log_dict = {
@@ -733,13 +970,6 @@ class DTMModule(pl.LightningModule):
                 self.log("ckpt_counter", self.ckpt_counter, on_step=True, on_epoch=False, sync_dist=True)
             if (self.global_step - self._start_step) % self.log_student_steps == 0 and self.log_student:
                 self.logging_student(self.model, self.student_logs_per_prompt)
-            if (self.global_step - self._start_step) % self.steps_per_h == 0:
-                self._rebuild_buffer_next_phase = True
-                print(f"[DEBUG] Scheduled buffer rebuild for next h-phase at global step {self.global_step}")
-            # Partially refresh buffer
-            elif (self.global_step - self._start_step) % self.hparams.tm.buffer_refresh_steps == 0:
-                print(f"[DEBUG] Refreshing {self.hparams.tm.num_buffer_refresh} prompts at global step {self.global_step}")
-                self._update_buffer(self.model, self.hparams.tm.num_buffer_refresh, self.comps_per_prompt)
         if not self.dict_for_logs or (self.global_step - self._start_step - 1) % self.hparams.metrics_log_every != 0:
             return
         # log all at once
@@ -766,6 +996,9 @@ class DTMModule(pl.LightningModule):
         checkpoint["tm_sched_state"] = copy.deepcopy(getattr(self, "_tm_sched_state", None))
         checkpoint["step_counter"] = self._step_counter + 1 # since ckpt saving is before on_train_batch_end
         checkpoint["ckpt_counter"] = self.ckpt_counter
+        checkpoint["phase_opt_step"] = int(self._phase_opt_step)
+        if self.use_ema and self._ema_shadow is not None:
+            checkpoint["ema_shadow"] = {k: v.detach().to("cpu") for k, v in self._ema_shadow.items()}
         
     def on_load_checkpoint(self, checkpoint: dict):
         self.a = checkpoint.get("tilt_a", 0.0)
@@ -775,6 +1008,8 @@ class DTMModule(pl.LightningModule):
         self._step_counter = checkpoint.get("step_counter", 0)
         self._resuming_from_ckpt = True
         self.ckpt_counter = checkpoint.get("ckpt_counter", 0)
+        self._loaded_phase_opt_step = int(checkpoint.get("phase_opt_step", 0))
+        self._loaded_ema_shadow = checkpoint.get("ema_shadow", None)
 
     def _prepare_prompts(self, num_dinstinct_prompts, num_completions_per_prompts):
         """
@@ -843,20 +1078,15 @@ class DTMModule(pl.LightningModule):
 
     def _update_buffer(self, model, num_buffer_updates, num_completions_per_prompt):
         """
-        Partially update the replay buffer of generated sequences and their rewards.
-        - selects `num_buffer_updates` *distinct buffer rows* (along the first
-          dimension of `self.buffer`) starting at `self.buffer_update_counter`
-          (with wrap-around),
-        - generates new completions for fresh prompts for those rows,
-        - recomputes rewards for those new samples,
-        - writes them into `self.buffer` and `self.buffer_rewards`,
-        - and advances `self.buffer_update_counter`.
-
-        Shapes:
-          buffer shape: [num_buffer_prompts, num_completions_per_prompt, prompt_len + completion_len]
-          buffer_rewards shape: [num_buffer_prompts, num_completions_per_prompt, num_reward_funcs]
+        Fully rebuild the replay buffer for one segment.
+        Stores terminal completions/rewards and all rollout partial states.
         """
-        build_or_refresh = "building" if num_buffer_updates == self.num_buffer_prompts else "refreshing"
+        if num_buffer_updates != self.num_buffer_prompts:
+            raise ValueError(
+                "This implementation only supports full rebuilds. "
+                f"Expected num_buffer_updates={self.num_buffer_prompts}, got {num_buffer_updates}."
+            )
+        build_or_refresh = "building" if self.buffer is None else "rebuilding"
         
         device = self.device
 
@@ -867,18 +1097,6 @@ class DTMModule(pl.LightningModule):
         buffer_start_time = datetime.now()
 
         # ---- 1. Prepare prompts as token IDs ----
-        if num_buffer_updates == self.num_buffer_prompts:
-            update_rows = list(range(self.num_buffer_prompts))
-            self.buffer_update_counter = 0
-            self.buffer = None
-            self.buffer_rewards = None
-        else:
-            update_rows = [
-                (self.buffer_update_counter + u) % self.num_buffer_prompts
-                for u in range(num_buffer_updates)
-            ]
-            self.buffer_update_counter += num_buffer_updates
-            self.buffer_update_counter %= self.num_buffer_prompts
         prompt_ids = self._prepare_prompts(num_buffer_updates, num_completions_per_prompt)
         total_batch, prompt_len = prompt_ids.shape
 
@@ -892,10 +1110,18 @@ class DTMModule(pl.LightningModule):
             device=prompt_ids.device,
             dtype=prompt_ids.dtype,
         )
+        traj_xt = None
+        traj_active_block_mask = None
+        num_steps = None
+        pin_cpu_replay = bool(torch.cuda.is_available())
         for start in range(0, total_batch, chunk_size):
             end = min(start + chunk_size, total_batch)
             with torch.no_grad():
-                chunk_completion_ids = self._generate(
+                (
+                    chunk_completion_ids,
+                    chunk_traj_xt,
+                    chunk_traj_active_block_mask,
+                ) = self._generate(
                     model=model,
                     prompt=prompt_ids[start:end],
                     steps=self.hparams.diffusion_steps,
@@ -904,16 +1130,40 @@ class DTMModule(pl.LightningModule):
                     temperature=self.hparams.sampling_temperature,
                     cfg_scale=self.hparams.cfg_scale,
                     remasking=self.hparams.remasking_strategy,
-                )  # [end-start, seq_len]
+                    return_trajectory=True,
+                )
 
             prompt_completion_ids[start:end].copy_(chunk_completion_ids)
+            if num_steps is None:
+                num_steps = int(chunk_traj_xt.shape[1])
+                # Keep large replay state tensors on CPU; move only sampled micro-batches to GPU.
+                traj_xt = torch.empty(
+                    (total_batch, num_steps, seq_len),
+                    device="cpu",
+                    dtype=prompt_ids.dtype,
+                    pin_memory=pin_cpu_replay,
+                )
+                traj_active_block_mask = torch.empty(
+                    (total_batch, num_steps, gen_length),
+                    device="cpu",
+                    dtype=torch.bool,
+                    pin_memory=pin_cpu_replay,
+                )
+            elif int(chunk_traj_xt.shape[1]) != num_steps:
+                raise RuntimeError(
+                    f"Inconsistent denoising steps in trajectory chunks: {chunk_traj_xt.shape[1]} vs expected {num_steps}."
+                )
+            traj_xt[start:end].copy_(chunk_traj_xt, non_blocking=pin_cpu_replay)
+            traj_active_block_mask[start:end].copy_(chunk_traj_active_block_mask, non_blocking=pin_cpu_replay)
 
-        # ---- 3. Reshape into [num_updates, num_completions, seq_len] and update corresponding rows ----
-        new_buffer_block = prompt_completion_ids.view(num_buffer_updates, -1, seq_len)
-        if self.buffer is None:
-            self.buffer = new_buffer_block
-        else:
-            self.buffer[update_rows, :, :] = new_buffer_block
+        if num_steps is None:
+            raise RuntimeError("Trajectory capture failed: no generation chunks produced.")
+
+        # ---- 3. Reshape into [num_updates, num_completions, ...] and store ----
+        self.buffer = prompt_completion_ids.view(num_buffer_updates, -1, seq_len).contiguous()
+        self.buffer_xt = traj_xt.view(num_buffer_updates, -1, num_steps, seq_len).contiguous()
+        self.buffer_active_block_mask = traj_active_block_mask.view(num_buffer_updates, -1, num_steps, gen_length).contiguous()
+        self.buffer_num_steps = int(num_steps)
 
         # ---- 4. Decode completions to text for reward computation ----
         completion_ids = prompt_completion_ids[:, prompt_len:]  # [total_batch, gen_length]
@@ -1031,18 +1281,21 @@ class DTMModule(pl.LightningModule):
 
         # Store as shape [num_buffer_updates, num_completions_per_prompt, num_funcs]
         new_rewards_block = rewards_per_func.view(num_buffer_updates, -1, num_funcs)
-        if self.buffer_rewards is None:
-            self.buffer_rewards = new_rewards_block
-        else:
-            self.buffer_rewards[update_rows, :, :] = new_rewards_block
+        self.buffer_rewards = new_rewards_block.contiguous()
+        self._flat_buffer_xt = self.buffer_xt.reshape(-1, seq_len)
+        self._flat_buffer_active_block_mask = self.buffer_active_block_mask.reshape(-1, gen_length)
+        self._flat_buffer = self.buffer.reshape(-1, seq_len)
+        self._flat_buffer_rewards = self.buffer_rewards.reshape(-1, num_funcs)
         
         avg_rwd = float(new_rewards_block.mean() * new_rewards_block.shape[-1])
 
         print(f"[EVAL] average reward = {avg_rwd:.3f}")
         
-        if getattr(self, "_rebuild_buffer_next_phase", False) and getattr(self.hparams.tm, "rwd_shift_auto", True):
+        if getattr(self, "_rebuild_due_to_phase", False) and getattr(self.hparams.tm, "rwd_shift_auto", True):
             self.rwd_shift = - self.all_gather(torch.tensor(avg_rwd, device=self.device)).mean().item()
             print(f"New phase: setting rwd_shift = {self.rwd_shift:.3f}")
+
+        self._reset_state_sampler_for_segment()
 
         buffer_end_time = datetime.now()
         buffer_build_time = (buffer_end_time - buffer_start_time).total_seconds()
@@ -1389,6 +1642,7 @@ class DTMModule(pl.LightningModule):
         cfg_scale=0.0,
         remasking="low_confidence",
         mask_id=126336,
+        return_trajectory=False,
     ):
         """generation code adopted from llada (https://github.com/ML-GSAI/LLaDA)"""
         with torch.amp.autocast("cuda", enabled=True):
@@ -1405,6 +1659,11 @@ class DTMModule(pl.LightningModule):
 
             # Adjust steps if needed
             steps_per_block = max(1, steps // num_blocks)
+            total_steps = num_blocks * steps_per_block
+            if return_trajectory:
+                traj_xt = torch.empty((bs, total_steps, prompt_len + gen_length), dtype=x.dtype, device=x.device)
+                traj_active_block_mask = torch.empty((bs, total_steps, gen_length), dtype=torch.bool, device=x.device)
+                step_ptr = 0
 
             for num_block in range(num_blocks):
                 start_idx = prompt_len + num_block * block_length
@@ -1416,6 +1675,12 @@ class DTMModule(pl.LightningModule):
                 for i in range(steps_per_block):
                     torch.cuda.empty_cache()
                     mask_index = x[:, prompt_len:] == mask_id # [B, gen_len]
+                    if return_trajectory:
+                        traj_xt[:, step_ptr].copy_(x)
+                        active_mask = torch.zeros_like(mask_index, dtype=torch.bool)
+                        active_slice = slice(start_idx - prompt_len, end_idx - prompt_len)
+                        active_mask[:, active_slice] = mask_index[:, active_slice]
+                        traj_active_block_mask[:, step_ptr].copy_(active_mask)
 
                     # Handle classifier-free guidance more efficiently
                     if cfg_scale > 0.0:
@@ -1424,18 +1689,11 @@ class DTMModule(pl.LightningModule):
                         x_ = torch.cat([x, un_x], dim=0)
 
                         # Get logits in a single forward pass
-                        # logits = model(x_).logits
                         logits = self._new_forward(model, x_, gen_length) # [2*B, gen_len, V]
                         logits, un_logits = torch.chunk(logits, 2, dim=0)
                         logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
                     else:
                         logits = self._new_forward(model, x, gen_length) # [B, gen_len, V]
-                        # logits_old_suffix = model(x).logits[:, -gen_length:, :] # [B, gen_len, V]
-                        # diff = (logits_old_suffix - logits).abs()
-                        # if diff.max().item() > 1e-8:
-                        #     print("[BUG] Large discrepancy between new_forward and model(x):")
-                        #     print("max_abs:", diff.max().item())
-                        #     print("max_rel:", (diff / (logits_old_suffix.abs() + 1e-4)).max().item())
 
                     # Apply Gumbel noise for sampling
                     logits_with_noise = self._add_gumbel_noise(
@@ -1473,7 +1731,11 @@ class DTMModule(pl.LightningModule):
 
                     x[:, prompt_len:][transfer_index] = x0[transfer_index]
                     del x0, confidence, transfer_index
+                    if return_trajectory:
+                        step_ptr += 1
 
+            if return_trajectory:
+                return x, traj_xt, traj_active_block_mask
             return x
 
     def _get_num_transfer_tokens(self, mask_index, steps):

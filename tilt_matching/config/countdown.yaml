@@ -13,9 +13,12 @@ tm:
   loss_type: itm
   mix_batches: true
   num_batch_prompts: 2
+  num_batch_states: 512
+  num_rebuilds_per_h: 5
   num_buffer_prompts: 4
   num_buffer_refresh: 2
   num_completions_per_prompt: 1
+  ce_topk: 64
   rescale_logits: false
   rwd_shift: -0.45
   rwd_shift_auto: false
