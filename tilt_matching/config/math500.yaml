@@ -6,7 +6,7 @@ tm:
   buffer_student_print_prob: 0.10
   control_variate: 1.0
   control_variate_ema: 0.04
-  ema_decay: 0.999 # modified
+  ema_decay: 0.996 # modified
   grad_accum_steps: 8
   h: 1.5
   learned_cv: false
@@ -33,17 +33,17 @@ tm:
   use_sar_active_block_norm: true
 
 #-----------------Optimizer Config-----------------
-adam_beta1: 0.85 # modified
-adam_beta2: 0.999 # modified
+adam_beta1: 0.9 # modified
+adam_beta2: 0.996 # modified
 adam_epsilon: 1e-8
 weight_decay: 0.0 # modified
 
 max_grad_norm: 1.0
 learning_rate: 4e-6 # modified
-lr_decay_ratio: 0.30
+lr_decay_ratio: 0.2
 lr_min: 2e-6 # modified
 lr_scheduler_type: linear
-lr_warmup_ratio: 0.0
+lr_warmup_ratio: 0.1
 
 #-----------------Diffusion Generation Config-----------------
 block_length: 32

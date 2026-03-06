@@ -53,7 +53,8 @@ class DTMModule(pl.LightningModule):
         self.buffer = None
         self.buffer_rewards = None
         self.buffer_xt = None
-        self.buffer_active_block_mask = None
+        self.buffer_local_mask = None
+        self.buffer_block_start = None
         self.buffer_num_steps = None
         self._rebuild_buffer_next_segment = False
         self._rebuild_due_to_phase = False
@@ -73,7 +74,8 @@ class DTMModule(pl.LightningModule):
         self._segment_expected_states = None
         self.g_cpu = None
         self._flat_buffer_xt = None
-        self._flat_buffer_active_block_mask = None
+        self._flat_buffer_local_mask = None
+        self._flat_buffer_block_start = None
         self._flat_buffer = None
         self._flat_buffer_rewards = None
         self._loaded_ema_shadow = None
@@ -775,16 +777,33 @@ class DTMModule(pl.LightningModule):
 
         if (
             self._flat_buffer_xt is None
-            or self._flat_buffer_active_block_mask is None
+            or self._flat_buffer_local_mask is None
+            or self._flat_buffer_block_start is None
             or self._flat_buffer is None
             or self._flat_buffer_rewards is None
         ):
             raise RuntimeError("Flattened replay views are missing. Buffer rebuild must initialize cached views.")
 
         flat_xt = self._flat_buffer_xt
-        flat_active_block_mask = self._flat_buffer_active_block_mask
+        flat_local_mask = self._flat_buffer_local_mask
+        flat_block_start = self._flat_buffer_block_start
         xts = flat_xt[state_idx].to(self.device, non_blocking=True)  # [B, L]
-        mask_for_loss = flat_active_block_mask[state_idx].to(self.device, non_blocking=True)
+        mask_for_loss = flat_local_mask[state_idx].to(self.device, non_blocking=True)
+        block_start = flat_block_start[state_idx].to(self.device, non_blocking=True).long()
+
+        block_size = int(self.hparams.block_length)
+        if mask_for_loss.shape[1] != block_size:
+            raise RuntimeError(
+                f"Expected local masks of width {block_size}, got {mask_for_loss.shape[1]}."
+            )
+        if (block_start % block_size != 0).any():
+            bad = block_start[block_start % block_size != 0][:4].tolist()
+            raise RuntimeError(f"Replay block_start must align to block_size={block_size}, got examples {bad}.")
+        if (block_start < 0).any() or (block_start > (gen_length - block_size)).any():
+            raise RuntimeError(
+                f"Replay block_start out of range: min={int(block_start.min().item())}, "
+                f"max={int(block_start.max().item())}, allowed=[0, {gen_length - block_size}]."
+            )
 
         completion_idx = torch.div(state_idx, S, rounding_mode="floor").to(self.device, non_blocking=True)
         flat_buffer = self._flat_buffer
@@ -802,22 +821,26 @@ class DTMModule(pl.LightningModule):
         else:
             correct_frac = torch.isclose(rwd, self.hparams.max_rwd * torch.ones_like(rwd), atol=1e-6, rtol=0.0).float().mean()
 
+        block_pos = torch.arange(block_size, device=self.device).unsqueeze(0) + block_start.unsqueeze(1)  # [B, block_size]
+        completion_tokens = x1s.long()[:, -gen_length:]  # [B, gen_length]
+        x1_block_tokens = torch.gather(completion_tokens, dim=1, index=block_pos)  # [B, block_size]
+
         # Get model predictions and compute loss
         temp = self.hparams.sampling_temperature
         with torch.no_grad(), self._use_adapter("teacher"):
             self.model.eval()
-            old_logits = self._new_forward(self.model, xts, gen_length) # [B, gen_length, V]
+            old_logits = self._new_forward_block(self.model, xts, gen_length, block_start, block_size) # [B, block_size, V]
         V = old_logits.shape[-1]
-        x1_equals_v = F.one_hot(x1s.long()[:, -gen_length:], num_classes=V).to(old_logits.dtype) # [B, gen_length, V]
+        x1_equals_v = F.one_hot(x1_block_tokens, num_classes=V).to(old_logits.dtype) # [B, block_size, V]
         with self._use_adapter("student"):
             self.model.train()   
-            curr_logits = self._new_forward(self.model, xts, gen_length) # [B, gen_length, V]
+            curr_logits = self._new_forward_block(self.model, xts, gen_length, block_start, block_size) # [B, block_size, V]
         if temp > 0.0 and self.hparams.tm.rescale_logits:
             old_logits  /= temp
             curr_logits /= temp
-        old_probs = F.softmax(old_logits, dim=-1) # [B, gen_length, V]
+        old_probs = F.softmax(old_logits, dim=-1) # [B, block_size, V]
         with torch.no_grad():
-            curr_probs_ng = F.softmax(curr_logits, dim=-1)  # [B, gen_length, V]
+            curr_probs_ng = F.softmax(curr_logits, dim=-1)  # [B, block_size, V]
         
         # shift reward for minimizing gradient variance for loss computation
         hr = self.h * (rwd + self.rwd_shift) # [B,]
@@ -857,9 +880,9 @@ class DTMModule(pl.LightningModule):
         target = None
         if not use_topk_ce:
             if loss_type == "itm":
-                target = self.cv * old_probs + x1_equals_v * (exp_hr - self.cv) # [B, gen_length, V]
+                target = self.cv * old_probs + x1_equals_v * (exp_hr - self.cv) # [B, block_size, V]
             elif loss_type == "etm":
-                target = (1.0 - hr_view) * old_probs + x1_equals_v * hr_view # [B, gen_length, V]
+                target = (1.0 - hr_view) * old_probs + x1_equals_v * hr_view # [B, block_size, V]
             elif loss_type == "sg-itm":
                 target = self.cv * old_probs + x1_equals_v * (exp_hr - self.cv) - expm1_hr * curr_probs_ng.detach()
             elif loss_type == "final-phase":
@@ -939,11 +962,11 @@ class DTMModule(pl.LightningModule):
                 topk_target = final_phase_scale.view(-1, 1, 1).to(topk_onehot.dtype) * topk_onehot
             else:
                 raise ValueError(f"Invalid loss_type: {loss_type}")
-            per_position_losses = -(topk_target * topk_log_probs).sum(dim=-1) # [B, gen_length]
+            per_position_losses = -(topk_target * topk_log_probs).sum(dim=-1) # [B, block_size]
         else:
             if target is None:
                 raise RuntimeError("Full-vocab CE path expected a full target tensor.")
-            per_position_losses = -(target * F.log_softmax(curr_logits, dim=-1)).sum(dim=-1) # [B, gen_length]
+            per_position_losses = -(target * F.log_softmax(curr_logits, dim=-1)).sum(dim=-1) # [B, block_size]
         per_row_losses = (per_position_losses * mask_for_loss).sum(dim=1)  # [B]
         loss = (per_row_losses / mask_for_loss.sum(dim=1).to(per_row_losses.dtype).clamp_min(1.0)).mean()
         self.cv = prev_cv
@@ -1111,8 +1134,12 @@ class DTMModule(pl.LightningModule):
             dtype=prompt_ids.dtype,
         )
         traj_xt = None
-        traj_active_block_mask = None
+        traj_local_mask = None
+        traj_block_start = None
         num_steps = None
+        block_size = int(self.hparams.block_length)
+        if gen_length % block_size != 0:
+            raise ValueError(f"max_completion_length ({gen_length}) must be divisible by block_length ({block_size}).")
         pin_cpu_replay = bool(torch.cuda.is_available())
         for start in range(0, total_batch, chunk_size):
             end = min(start + chunk_size, total_batch)
@@ -1120,7 +1147,8 @@ class DTMModule(pl.LightningModule):
                 (
                     chunk_completion_ids,
                     chunk_traj_xt,
-                    chunk_traj_active_block_mask,
+                    chunk_traj_local_mask,
+                    chunk_traj_block_start,
                 ) = self._generate(
                     model=model,
                     prompt=prompt_ids[start:end],
@@ -1143,10 +1171,16 @@ class DTMModule(pl.LightningModule):
                     dtype=prompt_ids.dtype,
                     pin_memory=pin_cpu_replay,
                 )
-                traj_active_block_mask = torch.empty(
-                    (total_batch, num_steps, gen_length),
+                traj_local_mask = torch.empty(
+                    (total_batch, num_steps, block_size),
                     device="cpu",
                     dtype=torch.bool,
+                    pin_memory=pin_cpu_replay,
+                )
+                traj_block_start = torch.empty(
+                    (total_batch, num_steps),
+                    device="cpu",
+                    dtype=torch.int64,
                     pin_memory=pin_cpu_replay,
                 )
             elif int(chunk_traj_xt.shape[1]) != num_steps:
@@ -1154,15 +1188,19 @@ class DTMModule(pl.LightningModule):
                     f"Inconsistent denoising steps in trajectory chunks: {chunk_traj_xt.shape[1]} vs expected {num_steps}."
                 )
             traj_xt[start:end].copy_(chunk_traj_xt, non_blocking=pin_cpu_replay)
-            traj_active_block_mask[start:end].copy_(chunk_traj_active_block_mask, non_blocking=pin_cpu_replay)
+            traj_local_mask[start:end].copy_(chunk_traj_local_mask, non_blocking=pin_cpu_replay)
+            traj_block_start[start:end].copy_(chunk_traj_block_start, non_blocking=pin_cpu_replay)
 
         if num_steps is None:
             raise RuntimeError("Trajectory capture failed: no generation chunks produced.")
+        if traj_local_mask is None or traj_block_start is None:
+            raise RuntimeError("Trajectory capture failed: local block metadata was not produced.")
 
         # ---- 3. Reshape into [num_updates, num_completions, ...] and store ----
         self.buffer = prompt_completion_ids.view(num_buffer_updates, -1, seq_len).contiguous()
         self.buffer_xt = traj_xt.view(num_buffer_updates, -1, num_steps, seq_len).contiguous()
-        self.buffer_active_block_mask = traj_active_block_mask.view(num_buffer_updates, -1, num_steps, gen_length).contiguous()
+        self.buffer_local_mask = traj_local_mask.view(num_buffer_updates, -1, num_steps, block_size).contiguous()
+        self.buffer_block_start = traj_block_start.view(num_buffer_updates, -1, num_steps).contiguous()
         self.buffer_num_steps = int(num_steps)
 
         # ---- 4. Decode completions to text for reward computation ----
@@ -1283,7 +1321,8 @@ class DTMModule(pl.LightningModule):
         new_rewards_block = rewards_per_func.view(num_buffer_updates, -1, num_funcs)
         self.buffer_rewards = new_rewards_block.contiguous()
         self._flat_buffer_xt = self.buffer_xt.reshape(-1, seq_len)
-        self._flat_buffer_active_block_mask = self.buffer_active_block_mask.reshape(-1, gen_length)
+        self._flat_buffer_local_mask = self.buffer_local_mask.reshape(-1, block_size)
+        self._flat_buffer_block_start = self.buffer_block_start.reshape(-1)
         self._flat_buffer = self.buffer.reshape(-1, seq_len)
         self._flat_buffer_rewards = self.buffer_rewards.reshape(-1, num_funcs)
         
@@ -1662,7 +1701,8 @@ class DTMModule(pl.LightningModule):
             total_steps = num_blocks * steps_per_block
             if return_trajectory:
                 traj_xt = torch.empty((bs, total_steps, prompt_len + gen_length), dtype=x.dtype, device=x.device)
-                traj_active_block_mask = torch.empty((bs, total_steps, gen_length), dtype=torch.bool, device=x.device)
+                traj_local_mask = torch.empty((bs, total_steps, block_length), dtype=torch.bool, device=x.device)
+                traj_block_start = torch.empty((bs, total_steps), dtype=torch.int64, device=x.device)
                 step_ptr = 0
 
             for num_block in range(num_blocks):
@@ -1677,10 +1717,16 @@ class DTMModule(pl.LightningModule):
                     mask_index = x[:, prompt_len:] == mask_id # [B, gen_len]
                     if return_trajectory:
                         traj_xt[:, step_ptr].copy_(x)
-                        active_mask = torch.zeros_like(mask_index, dtype=torch.bool)
-                        active_slice = slice(start_idx - prompt_len, end_idx - prompt_len)
-                        active_mask[:, active_slice] = mask_index[:, active_slice]
-                        traj_active_block_mask[:, step_ptr].copy_(active_mask)
+                        block_start = start_idx - prompt_len
+                        if block_start < 0 or block_start > (gen_length - block_length):
+                            raise RuntimeError(
+                                f"Invalid block_start {block_start} for gen_length={gen_length}, block_length={block_length}."
+                            )
+                        if (block_start % block_length) != 0:
+                            raise RuntimeError(f"block_start {block_start} is not divisible by block_length={block_length}.")
+                        active_slice = slice(block_start, block_start + block_length)
+                        traj_local_mask[:, step_ptr].copy_(mask_index[:, active_slice])
+                        traj_block_start[:, step_ptr].fill_(int(block_start))
 
                     # Handle classifier-free guidance more efficiently
                     if cfg_scale > 0.0:
@@ -1735,7 +1781,7 @@ class DTMModule(pl.LightningModule):
                         step_ptr += 1
 
             if return_trajectory:
-                return x, traj_xt, traj_active_block_mask
+                return x, traj_xt, traj_local_mask, traj_block_start
             return x
 
     def _get_num_transfer_tokens(self, mask_index, steps):
@@ -1985,13 +2031,22 @@ class DTMModule(pl.LightningModule):
         Returns:
             logits_suffix: [B, gen_len, V]
         """
-        lm = model.base_model
-        core = self._unwrap_llada_core(model)
-        cfg = core.config
-
         B, L, d_model = hidden.shape
         assert gen_len <= L, f"gen_len={gen_len} cannot exceed sequence length L={L}"
         hidden_suffix = hidden[:, -gen_len:, :]  # [B, gen_len, d_model]
+        return self._llada_logits_from_hidden(model, hidden_suffix)
+
+    def _llada_logits_from_hidden(
+        self,
+        model: torch.nn.Module,
+        hidden_positions: torch.Tensor,  # [B, K, d_model]
+    ) -> torch.Tensor:
+        """
+        Project precomputed hidden states at selected positions to vocabulary logits.
+        """
+        lm = model.base_model
+        core = self._unwrap_llada_core(model)
+        cfg = core.config
 
         # Get the output embedding / projection the same way HF does.
         out_module = lm.get_output_embeddings()  # nn.Embedding or nn.Linear 
@@ -2000,10 +2055,10 @@ class DTMModule(pl.LightningModule):
             # Weight tying case: logits = F.linear(x, wte.weight)
             weight = out_module.weight          # [V, d_model]
             bias = None
-            logits = F.linear(hidden_suffix, weight, bias)
+            logits = F.linear(hidden_positions, weight, bias)
         elif isinstance(out_module, torch.nn.Linear):
             # Non-tying case: use ff_out directly
-            logits = out_module(hidden_suffix)  # [B, gen_len, V]
+            logits = out_module(hidden_positions)  # [B, K, V]
         else:
             raise TypeError(
                 f"Unsupported output embeddings module type: {type(out_module)} "
@@ -2019,3 +2074,19 @@ class DTMModule(pl.LightningModule):
         # x: [B, L]
         hidden = self._llada_hidden_no_logits(model, x, attention_mask=None)
         return self._llada_logits_on_suffix(model, hidden, gen_length)  # [B, gen_len, V]
+
+    def _new_forward_block(self, model, x, gen_length, block_start, block_size):
+        """
+        Compute logits only on per-row completion block positions.
+        Args:
+            x: [B, L_total]
+            block_start: [B] completion-space block starts
+        Returns:
+            [B, block_size, V]
+        """
+        hidden = self._llada_hidden_no_logits(model, x, attention_mask=None)  # [B, L_total, d]
+        completion_hidden = hidden[:, -gen_length:, :]  # [B, L_g, d]
+        pos = torch.arange(block_size, device=completion_hidden.device).unsqueeze(0) + block_start.long().unsqueeze(1)
+        gather_idx = pos.unsqueeze(-1).expand(-1, -1, completion_hidden.shape[-1])
+        hidden_block = torch.gather(completion_hidden, dim=1, index=gather_idx)
+        return self._llada_logits_from_hidden(model, hidden_block)
