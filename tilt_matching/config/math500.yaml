@@ -1,19 +1,19 @@
 #-----------------Tilt Matching Training Config-----------------
 tm:
   a_end: 100.0
-  buffer_chunk_size: 40
+  buffer_chunk_size: 79
   buffer_print_samples: 0
   buffer_student_print_prob: 0.10
   control_variate: 1.0
   control_variate_ema: 0.04
   ema_decay: 0.996 # modified
-  grad_accum_steps: 8
+  grad_accum_steps: 5
   h: 1.5
   learned_cv: false
   loss_type: itm
-  num_batch_states: 12
+  num_batch_states: 20
   num_rebuilds_per_h: 1
-  num_buffer_prompts: 75
+  num_buffer_prompts: 79
   num_completions_per_prompt: 6
   ce_topk: 40
   loss_topk_in_block: 4
@@ -40,9 +40,9 @@ adam_epsilon: 1e-8
 weight_decay: 0.0 # modified
 
 max_grad_norm: 1.0
-learning_rate: 4e-6 # modified
+learning_rate: 2e-5 # modified
 lr_decay_ratio: 0.2
-lr_min: 2e-6 # modified
+lr_min: 1e-5 # modified
 lr_scheduler_type: linear
 lr_warmup_ratio: 0.1
 
@@ -67,7 +67,7 @@ lora_dropout: 0.05
 peft_task_type: CAUSAL_LM
 
 #-----------------Logging and Checkpointing Config-----------------
-checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/conf_aligned/gsm8k/
+checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/conf_aligned/gsm8k_top4/
 ckpt_freq: 100 # in optimizer steps
 metrics_log_every: 1
 resume_path:
@@ -77,7 +77,7 @@ student_copy_over: false
 wandb:
   entity: "yuyuanchen-harvard-university"
   project: "LLaDA_TM"
-  name: "gsm_conf_trial"
+  name: "gsm_conf_top4"
 
 #-----------------Other Training Config-----------------
 dataset: gsm8k
@@ -85,5 +85,5 @@ max_rwd: 1.0
 few_shot: 0
 seed: 42
 nodes: 4
-devices: 2  # 8? 4?
+devices: 2
 world_size: 8

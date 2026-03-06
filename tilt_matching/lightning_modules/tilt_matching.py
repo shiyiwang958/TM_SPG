@@ -73,6 +73,7 @@ class DTMModule(pl.LightningModule):
         self._state_cursor = 0
         self._accum_state_idx = None
         self._segment_expected_states = None
+        self._segment_total_states = None
         self.g_cpu = None
         self._flat_buffer_xt = None
         self._flat_buffer_local_mask = None
@@ -290,37 +291,41 @@ class DTMModule(pl.LightningModule):
         segment_microsteps = self._segment_opt_steps * self.hparams.tm.grad_accum_steps
         states_per_rebuild = self.num_buffer_prompts * self.comps_per_prompt * int(self.buffer_num_steps)
         required_states = segment_microsteps * self.num_batch_states
-        if states_per_rebuild != required_states:
+        if states_per_rebuild < required_states:
             raise ValueError(
-                "Replay budget mismatch for no-reuse sampling: "
+                "Replay budget too small for no-reuse sampling: "
                 f"num_buffer_prompts({self.num_buffer_prompts}) * "
                 f"num_completions_per_prompt({self.comps_per_prompt}) * "
                 f"S({int(self.buffer_num_steps)}) = {states_per_rebuild}, but "
                 f"segment_opt_steps({self._segment_opt_steps}) * "
                 f"grad_accum_steps({self.hparams.tm.grad_accum_steps}) * "
                 f"num_batch_states({self.num_batch_states}) = {required_states}. "
-                "Require exact equality."
+                "Require states_per_rebuild >= required_states."
             )
-        self._segment_expected_states = int(states_per_rebuild)
+        self._segment_expected_states = int(required_states)
+        self._segment_total_states = int(states_per_rebuild)
         print(
             "[DEBUG] Replay budget check passed: "
             f"S={int(self.buffer_num_steps)}, states_per_rebuild={states_per_rebuild}, "
+            f"required_states={required_states}, "
+            f"unused_states={states_per_rebuild - required_states}, "
             f"segment_microsteps={segment_microsteps}, num_batch_states={self.num_batch_states}"
         )
 
     def _reset_state_sampler_for_segment(self):
         self._validate_replay_budget()
-        total_states = int(self._segment_expected_states)
+        total_states = int(self._segment_total_states or 0)
         self._state_perm = torch.randperm(total_states, generator=self.g_cpu)
         self._state_cursor = 0
         self._accum_state_idx = None
 
     def _assert_segment_exhausted(self, tag: str):
         expected = int(self._segment_expected_states or 0)
+        total = int(self._segment_total_states or 0)
         if self._state_cursor != expected:
             raise RuntimeError(
-                f"Segment '{tag}' ended with unused or overused states: "
-                f"consumed={self._state_cursor}, expected={expected}."
+                f"Segment '{tag}' replay consumption mismatch: "
+                f"consumed={self._state_cursor}, expected_consumed={expected}, total_available={total}."
             )
     
     def on_train_batch_start(self, batch, batch_idx):
