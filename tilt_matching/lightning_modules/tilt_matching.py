@@ -63,6 +63,7 @@ class DTMModule(pl.LightningModule):
         self.num_batch_states = int(self.hparams.tm.num_batch_states)
         self.num_rebuilds_per_h = int(getattr(self.hparams.tm, "num_rebuilds_per_h", 1))
         self.ce_topk = int(getattr(self.hparams.tm, "ce_topk", 0))
+        self.loss_topk_in_block = int(getattr(self.hparams.tm, "loss_topk_in_block", 0))
         self._segment_opt_steps = None
         self.buffer_update_counter = 0
         self._grad_accum_counter = 0
@@ -839,6 +840,23 @@ class DTMModule(pl.LightningModule):
             old_logits  /= temp
             curr_logits /= temp
         old_probs = F.softmax(old_logits, dim=-1) # [B, block_size, V]
+
+        # SAR base mask is the currently active block mask from replay.
+        base_mask_for_loss = mask_for_loss.bool()
+        if 0 < self.loss_topk_in_block < block_size:
+            teacher_conf = old_probs.max(dim=-1).values
+            teacher_conf = teacher_conf.masked_fill(~base_mask_for_loss, float("-inf"))
+            top_pos = torch.topk(
+                teacher_conf,
+                k=min(self.loss_topk_in_block, block_size),
+                dim=1,
+            ).indices
+            selected_mask = torch.zeros_like(base_mask_for_loss)
+            selected_mask.scatter_(1, top_pos, True)
+            mask_for_loss = base_mask_for_loss & selected_mask
+        else:
+            mask_for_loss = base_mask_for_loss
+
         with torch.no_grad():
             curr_probs_ng = F.softmax(curr_logits, dim=-1)  # [B, block_size, V]
         
@@ -976,6 +994,7 @@ class DTMModule(pl.LightningModule):
             f"train/a": self.a,
             f"train/h": self.h,
             f"train/drift_gap_kl": self._kl_from_logits(old_logits, curr_logits, mask_for_loss),
+            f"train/loss_active_pos_mean": mask_for_loss.sum(dim=1).to(torch.float32).mean(),
             f"train/rwd_max": rwd.max(),
             f"train/rwd_min": rwd.min(),
             f"train/rwd_mean": rwd.mean(),

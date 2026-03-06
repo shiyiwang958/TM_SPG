@@ -16,6 +16,7 @@ tm:
   num_buffer_prompts: 75
   num_completions_per_prompt: 6
   ce_topk: 40
+  loss_topk_in_block: 4
   rescale_logits: false
   rwd_shift: 0.0
   rwd_shift_auto: false
