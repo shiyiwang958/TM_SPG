@@ -67,10 +67,10 @@ lora_dropout: 0.05
 peft_task_type: CAUSAL_LM
 
 #-----------------Logging and Checkpointing Config-----------------
-checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/conf_aligned/gsm8k_top4/
+checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/conf_aligned/gsm8k_top4_fixed_copyover/
 ckpt_freq: 100 # in optimizer steps
 metrics_log_every: 1
-resume_path:
+resume_path: #/n/netscratch/albergo_lab/Everyone/frank/llada_tm/conf_aligned/gsm8k_top4/checkpoint-10.50-42.0.ckpt
 # leave empty if not resuming
 student_copy_over: false
 

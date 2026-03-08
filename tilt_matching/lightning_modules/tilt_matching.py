@@ -456,6 +456,82 @@ class DTMModule(pl.LightningModule):
         for param in teacher_params.values():
             param.requires_grad_(False)
 
+    @torch.no_grad()
+    def _copy_ema_to_student_and_teacher(self):
+        """
+        Phase-boundary anchoring:
+          - student <- ema_shadow (fallback to current student if missing/incompatible)
+          - teacher <- same anchored source
+        """
+        teacher_params = {}
+        for name, param in self.model.named_parameters():
+            if ".teacher." in name or name.endswith(".teacher"):
+                teacher_params[name] = param
+
+        missing_teacher = 0
+        ema_fallback = 0
+        shape_mismatch = 0
+        for student_name, student_param in self._student_param_iter():
+            teacher_name = self._student_to_teacher_param_name(student_name)
+            if teacher_name is None or teacher_name not in teacher_params:
+                missing_teacher += 1
+                continue
+
+            src = student_param.detach()
+            if self.use_ema:
+                ema_src = None if self._ema_shadow is None else self._ema_shadow.get(student_name, None)
+                if isinstance(ema_src, torch.Tensor) and ema_src.shape == student_param.shape:
+                    src = ema_src
+                else:
+                    ema_fallback += 1
+
+            src_student = src.to(device=student_param.device, dtype=student_param.dtype)
+            student_param.copy_(src_student)
+
+            teacher_param = teacher_params[teacher_name]
+            if teacher_param.shape != student_param.shape:
+                shape_mismatch += 1
+                continue
+            teacher_param.copy_(src_student.to(device=teacher_param.device, dtype=teacher_param.dtype))
+
+        if missing_teacher > 0:
+            print(f"[WARNING] Missing teacher counterparts for {missing_teacher} student parameters.")
+        if shape_mismatch > 0:
+            print(f"[WARNING] Teacher/student shape mismatches during boundary anchor: {shape_mismatch}.")
+        if self.use_ema and ema_fallback > 0:
+            print(f"[WARNING] EMA boundary anchor fell back to student params for {ema_fallback} keys.")
+
+        for param in teacher_params.values():
+            param.requires_grad_(False)
+
+    @torch.no_grad()
+    def _student_teacher_max_abs_diff(self):
+        teacher_params = {}
+        for name, param in self.model.named_parameters():
+            if ".teacher." in name or name.endswith(".teacher"):
+                teacher_params[name] = param
+
+        max_diff = 0.0
+        num_compared = 0
+        for student_name, student_param in self._student_param_iter():
+            teacher_name = self._student_to_teacher_param_name(student_name)
+            if teacher_name is None or teacher_name not in teacher_params:
+                continue
+            teacher_param = teacher_params[teacher_name]
+            if teacher_param.shape != student_param.shape:
+                continue
+            diff = (student_param.detach() - teacher_param.detach().to(student_param.device, student_param.dtype)).abs().max().item()
+            max_diff = max(max_diff, float(diff))
+            num_compared += 1
+        return max_diff, num_compared
+
+    def _reset_optimizer_state(self, opt):
+        if opt is None:
+            return
+        num_state_entries = len(opt.state)
+        opt.state.clear()
+        print(f"[DEBUG] Reset optimizer state entries at phase boundary: cleared={num_state_entries}")
+
     def _reset_ema(self):
         if not self.use_ema:
             self._ema_shadow = None
@@ -746,8 +822,13 @@ class DTMModule(pl.LightningModule):
             if self.a + self.h > self.a_end:
                 self.h = self.a_end - self.a
             with torch.no_grad():
-                self._copy_student_to_teacher()
-            print(f"Model weights copied. Degree of tilt a = {self.a:.4f} at global step {self.global_step}")
+                self._copy_ema_to_student_and_teacher()
+                max_diff, num_compared = self._student_teacher_max_abs_diff()
+            print(
+                f"Model weights anchored from EMA. Degree of tilt a = {self.a:.4f} at global step {self.global_step}. "
+                f"student_teacher_max_abs_diff={max_diff:.3e} over {num_compared} parameter tensors."
+            )
+            self._reset_optimizer_state(opt)
 
             if self.a >= self.a_end:
                 print(f"Reached final a = {self.a_end:.2f}. Training Stopped", flush=True)
