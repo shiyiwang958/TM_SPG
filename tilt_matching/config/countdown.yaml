@@ -3,26 +3,26 @@ tm:
   a_end: 100.0
   buffer_chunk_size: 60
   buffer_print_samples: 0
-  buffer_refresh_steps: 50
+  buffer_refresh_steps: 25
   control_variate: 1.0
   control_variate_ema: 0.04
   ema_decay: 0.95
-  grad_accum_steps: 1
+  grad_accum_steps: 8
   h: 3.0
   learned_cv: false
   loss_type: itm
   mix_batches: true
-  num_batch_prompts: 2
-  num_buffer_prompts: 4
-  num_buffer_refresh: 2
-  num_completions_per_prompt: 1
+  num_batch_prompts: 12
+  num_buffer_prompts: 40
+  num_buffer_refresh: 10
+  num_completions_per_prompt: 6
   rescale_logits: false
-  rwd_shift: -0.45
+  rwd_shift: 0.0
   rwd_shift_auto: false
-  steps_per_h: 5 # this is the number of optimizer steps per h
+  steps_per_h: 800 # this is the number of optimizer steps per h
   log_student: true
   log_temperature: 0.0
-  student_log_steps: 400
+  student_log_steps: 100
   student_logs_per_prompt: 1
   use_ema: true
   hat_wv_neg_thresh: -1e-8
@@ -38,12 +38,12 @@ adam_beta2: 0.99
 adam_epsilon: 1e-8
 weight_decay: 0.1
 
-max_grad_norm: 1.3
+max_grad_norm: 2.0
 learning_rate: 4e-6
-lr_decay_ratio: 0.20
+lr_decay_ratio: 0.15
 lr_min: 2e-6
 lr_scheduler_type: linear
-lr_warmup_ratio: 0.0
+lr_warmup_ratio: 0.05
 
 #-----------------Diffusion Generation Config-----------------
 block_length: 32
@@ -51,7 +51,7 @@ cfg_scale: 0.0
 diffusion_steps: 128
 max_completion_length: 256
 max_prompt_length: 172
-remasking_strategy: random
+remasking_strategy: "low_confidence"
 sampling_temperature: 1.0
 
 #-----------------Model Config-----------------
@@ -66,7 +66,7 @@ lora_dropout: 0.05
 peft_task_type: CAUSAL_LM
 
 #-----------------Logging and Checkpointing Config-----------------
-checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/new_scratch
+checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/debug0325
 ckpt_freq: 100 # in optimizer steps
 metrics_log_every: 1
 resume_path:
@@ -76,7 +76,7 @@ student_copy_over: true
 wandb:
   entity: "yuyuanchen-harvard-university"
   project: "LLaDA_TM"
-  name: "ctd_cv_shift_sar"
+  name: "ctd_conf"
 
 #-----------------Other Training Config-----------------
 dataset: countdown

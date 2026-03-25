@@ -312,6 +312,31 @@ class DTMModule(pl.LightningModule):
         self._ema_shadow = {}
         for key, param in self._student_param_iter():
             self._ema_shadow[key] = param.detach().clone()
+
+    @torch.no_grad()
+    def _sync_phase_models_from_ema(self):
+        student_state = get_peft_model_state_dict(self.model, adapter_name="student")
+
+        if self.use_ema:
+            if self._ema_shadow is None:
+                raise RuntimeError("EMA shadow is missing at phase boundary.")
+            missing_keys = sorted(set(student_state.keys()) - set(self._ema_shadow.keys()))
+            if missing_keys:
+                raise RuntimeError(f"EMA shadow is missing keys at phase boundary: {missing_keys}")
+            set_peft_model_state_dict(self.model, self._ema_shadow, adapter_name="student")
+            set_peft_model_state_dict(self.model, self._ema_shadow, adapter_name="teacher")
+        else:
+            set_peft_model_state_dict(self.model, student_state, adapter_name="teacher")
+
+        for name, p in self.model.named_parameters():
+            if ".teacher" in name:
+                p.requires_grad_(False)
+        self.model.set_adapter("student")
+
+    def _reset_phase_optimizer_state(self):
+        if self.tm_opt is None:
+            return
+        self.tm_opt.state.clear()
     
     @torch.no_grad()
     def _update_ema(self):
@@ -539,30 +564,14 @@ class DTMModule(pl.LightningModule):
         self.dict_for_logs["grads/grad_clipped"] = grad_clipped
         self.dict_for_logs["train/cv"] = self.cv
 
-        # At each h phase boundary, update a and the teacher adapter
+        # At each h phase boundary, sync teacher/student to the EMA state.
         if (self.global_step - self._start_step) % self.steps_per_h == 0:
             self.a += self.h
             if self.a + self.h > self.a_end:
                 self.h = self.a_end - self.a
             with torch.no_grad():
-                if self.use_ema and self._ema_shadow is not None:
-                    # Copy EMA (student) weights into teacher adapter
-                    teacher_state = {}
-                    student_state = get_peft_model_state_dict(self.model, adapter_name="student")
-                    for key in student_state.keys():
-                        if key in self._ema_shadow:
-                            teacher_state[key] = self._ema_shadow[key]
-                        else:
-                            print("[WARNING] EMA key missing for student adapter weight:", key)
-                            # Fallback to current student weight if EMA key missing
-                            teacher_state[key] = student_state[key]
-                    set_peft_model_state_dict(self.model, teacher_state, adapter_name="teacher")
-                else:
-                    adapter_state = get_peft_model_state_dict(self.model, adapter_name="student")
-                    set_peft_model_state_dict(self.model, adapter_state, adapter_name="teacher")
-                for name, p in self.model.named_parameters():
-                    if ".teacher" in name:
-                        p.requires_grad_(False)
+                self._sync_phase_models_from_ema()
+            self._reset_phase_optimizer_state()
             print(f"Model weights copied. Degree of tilt a = {self.a:.4f} at global step {self.global_step}")
 
             if self.a >= self.a_end:
