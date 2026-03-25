@@ -2,11 +2,11 @@
 #SBATCH --job-name=gsm
 #SBATCH --account=kempner_albergo_lab
 #SBATCH --partition=kempner_h100
-#SBATCH --nodes=4
-#SBATCH --gpus-per-node=2
+#SBATCH --nodes=2
+#SBATCH --gpus-per-node=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --mem=50GB
-#SBATCH --time=21:29:59
+#SBATCH --time=71:59:59
 #SBATCH --mail-type=END,FAIL,BEGIN
 #SBATCH --mail-user=yuyuanchen@math.harvard.edu
 
@@ -15,7 +15,7 @@ mkdir -p "$OUTPUT_DIR"
 
 module load cuda/12.4.1-fasrc01
 source /n/sw/Anaconda2-2019.10/etc/profile.d/conda.sh
-conda activate /n/home06/yuyuan0/conda/envs/spg
+conda activate /n/netscratch/albergo_lab/Everyone/yuyuan0/conda/envs/spg
 
 # -------------------------
 # Networking configuration
@@ -82,9 +82,9 @@ mkdir -p "$LOGDIR"
 cd /n/home06/yuyuan0/TM_SPG/tilt_matching
 
 
-srun --ntasks-per-node=1 --gpus-per-task=2 \
+srun --ntasks-per-node=1 --gpus-per-task=4 \
   python -m torch.distributed.run \
-    --nproc_per_node=2 \
+    --nproc_per_node=4 \
     --nnodes="$NNODES" \
     --node_rank="$NODE_RANK" \
     --rdzv_backend=c10d \
@@ -96,6 +96,6 @@ srun --ntasks-per-node=1 --gpus-per-task=2 \
     tilt_train.py \
     --config-path /n/home06/yuyuan0/TM_SPG/tilt_matching/config \
     --config-name math500.yaml \
-    nodes=4 \
-    devices=2 \
+    nodes=2 \
+    devices=4 \
     world_size=8 \

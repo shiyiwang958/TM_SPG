@@ -144,6 +144,46 @@ class DTMModule(pl.LightningModule):
         finally:
             self.model.set_adapter(prev)
 
+    @contextmanager
+    def _use_student_ema_for_eval(self):
+        """
+        Temporarily swap student adapter weights with EMA weights for evaluation.
+        Restores original student weights on exit.
+        """
+        if (not self.use_ema) or (self._ema_shadow is None):
+            yield False
+            return
+
+        backups = {}
+        missing = 0
+        mismatched = 0
+        with torch.no_grad():
+            for key, param in self._student_param_iter():
+                ema_tensor = self._ema_shadow.get(key, None)
+                if not isinstance(ema_tensor, torch.Tensor):
+                    missing += 1
+                    continue
+                if ema_tensor.shape != param.shape:
+                    mismatched += 1
+                    continue
+                backups[key] = param.detach().clone()
+                param.copy_(ema_tensor.to(device=param.device, dtype=param.dtype))
+
+        if missing > 0:
+            print(f"[WARNING] EMA eval swap missing {missing} student keys; kept current student weights for those.")
+        if mismatched > 0:
+            print(f"[WARNING] EMA eval swap had {mismatched} shape mismatches; kept current student weights for those.")
+
+        try:
+            yield True
+        finally:
+            with torch.no_grad():
+                for key, param in self._student_param_iter():
+                    backup = backups.get(key, None)
+                    if backup is None:
+                        continue
+                    param.copy_(backup.to(device=param.device, dtype=param.dtype))
+
     def state_dict(self, destination=None, keep_vars=False):
         destination = OrderedDict() if destination is None else destination
 
@@ -1462,219 +1502,223 @@ class DTMModule(pl.LightningModule):
         prev_adapter = model.active_adapter
         model.set_adapter("student")
         model.eval()
-        print(f"Start Logging Student ...")
+        ema_eval_ctx = self._use_student_ema_for_eval()
+        using_ema = ema_eval_ctx.__enter__()
+        print(f"Start Logging Student {'(EMA)' if using_ema else ''}...")
         buffer_start_time = datetime.now()
-
-        # ---- 1. Distribute validation set across GPUs ----
-        global_world_size = getattr(self.trainer, "world_size", 1)
-        global_rank = getattr(self.trainer, "global_rank", 0)
-        
-        total_val_examples = len(self.validation_set)
-        examples_per_gpu = total_val_examples // global_world_size
-        start_idx = global_rank * examples_per_gpu
-        
-        # Last GPU takes any remainder
-        if global_rank == global_world_size - 1:
-            end_idx = total_val_examples
-        else:
-            end_idx = start_idx + examples_per_gpu
-        
-        # Get this GPU's subset of validation examples
-        val_subset_indices = list(range(start_idx, end_idx))
-        num_val_prompts = len(val_subset_indices)
-        print(f"[GPU {global_rank}/{global_world_size}] Evaluating {num_val_prompts} validation examples (indices {start_idx} to {end_idx-1})")
-        
-        # ---- 2. Prepare prompts from validation set ----
-        if self.hparams.dataset == "countdown":
-            structured_prompts = []
-            targets = []
-            numbers_list = []
-        
-            for idx in val_subset_indices:
-                val_entry = self.validation_set[idx]
-                target = int(val_entry["output"])
-                numbers_str = val_entry["input"]
-                numbers = [int(num) for num in numbers_str.split(",")]
-                
-                # Create structured prompt matching countdown.py format
-                prompt_text = f"{SYSTEM_PROMPT}\nUsing only the numbers {numbers}, create an arithmetic expression that evaluates to exactly {target}. You must use all numbers from the list, and each number must be used exactly once. You may use the operations +, -, *, and / as needed. After reasoning, provide only your final expression inside <answer></answer> tags without including an equals sign or the target number. For example, if the numbers are [2, 3, 4] and the target is 5, a valid answer is: <answer>\n2*4-3\n</answer>"
-                structured_prompts.append([{"role": "user", "content": prompt_text}])
-                targets.append(target)
-                numbers_list.append(numbers)
-        else:
-            structured_prompts = [self.validation_set[i]["prompt"] for i in val_subset_indices]
-        
-        prompts_text = [self.tokenizer.apply_chat_template(sp, tokenize=False, add_generation_prompt=True) for sp in structured_prompts]
-        prompt_ids = self.tokenizer(
-            text=prompts_text,
-            return_tensors="pt",
-            padding="longest",
-            padding_side="left",
-            add_special_tokens=False,
-        )["input_ids"].to(device)
-        
-        # Repeat each prompt for num_completions_per_prompt completions
-        prompt_ids = prompt_ids.repeat_interleave(num_completions_per_prompt, dim=0)
-        total_batch, prompt_len = prompt_ids.shape
-
-        # ---- 3. Run diffusion generation to get prompt+completion sequences ----
-        chunk_size = max(1, min(self.hparams.tm.buffer_chunk_size, total_batch)//4)
-        gen_length = self.hparams.max_completion_length
-        seq_len = prompt_len + gen_length
-        # pre-allocate
-        prompt_completion_ids = torch.empty(
-            (total_batch, seq_len),
-            device=prompt_ids.device,
-            dtype=prompt_ids.dtype,
-        )
-        for start in range(0, total_batch, chunk_size):
-            end = min(start + chunk_size, total_batch)
-            with torch.no_grad():
-                chunk_completion_ids = self._generate(
-                    model=model,
-                    prompt=prompt_ids[start:end],
-                    steps=self.hparams.diffusion_steps,
-                    gen_length=gen_length,
-                    block_length=self.hparams.block_length,
-                    temperature=self.log_temperature,
-                    cfg_scale=self.hparams.cfg_scale,
-                    remasking='low_confidence',
-                )  # [end-start, seq_len]
-
-            prompt_completion_ids[start:end].copy_(chunk_completion_ids)
-            del chunk_completion_ids
-        
-        # ---- 4. Decode completions to text for reward computation ----
-        completion_ids = prompt_completion_ids[:, prompt_len:]  # [total_batch, gen_length]
-        completions_text = self.tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
-
-        # ---- 5. Build reward inputs: prompts, completions, and extra dataset columns ----
-        data_keys = [key for key in self.train_set[0].keys() if key != "prompt"]
-        if self.hparams.dataset == "countdown":
-            reward_kwargs = {"target": [], "numbers": []}
-            prompts_for_rewards = structured_prompts
-            for i in range(num_val_prompts):
-                # Add target and numbers for reward computation
-                reward_kwargs["target"].append(targets[i])
-                reward_kwargs["numbers"].append(numbers_list[i])
-        else:
-            reward_kwargs = {key: [] for key in data_keys}
-            prompts_for_rewards = [self.validation_set[i]["prompt"] for i in val_subset_indices]
-            for row_idx in val_subset_indices:
-                # Copy all extra fields for this completion
-                for key in data_keys:
-                    reward_kwargs[key].append(self.validation_set[row_idx][key])
-
-        # Turn plain completions into chat-style completions [{"role": "assistant", "content": "..."}]
-        completions_for_rewards = [[{"role": "assistant", "content": text}] for text in completions_text]
-
-        # ---- 6. Compute rewards for every generated completion ----
-        num_funcs = len(self.reward_funcs)
-        rewards_per_func = torch.zeros(total_batch, num_funcs, device=device)
-        reward_kwargs["buffer_print_samples"] = int(getattr(self.hparams.tm, "buffer_print_samples", 0))
-        reward_kwargs["rank"] = int(getattr(self.trainer, "global_rank", 0))
-
-        for j, reward_func in enumerate(self.reward_funcs):
-            scores = reward_func(
-                prompts=prompts_for_rewards,
-                completions=completions_for_rewards,
-                **reward_kwargs,
-            )
-            rewards_per_func[:, j] = torch.tensor(scores, device=device, dtype=torch.float32)
-
-        do_print = torch.rand(num_val_prompts, device=device) < getattr(self.hparams.tm, "buffer_student_print_prob", 0.1)
-        for i in range(num_val_prompts):
-            if not do_print[i]:
-                continue
+        try:
+            # ---- 1. Distribute validation set across GPUs ----
+            global_world_size = getattr(self.trainer, "world_size", 1)
+            global_rank = getattr(self.trainer, "global_rank", 0)
             
-            row_idx = val_subset_indices[i]
-            row = self.validation_set[row_idx]
-
-            print(f"\n{'='*80}", flush=True)
-            print(f"Model = Student", flush=True)
-            if self.hparams.dataset == "math" or self.hparams.dataset == "gsm8k":
-                prompt = row.get("prompt", None)
-                prompt_text = None
-                if isinstance(prompt, list) and prompt:
-                    prompt_text = prompt[0].get("content", None)
-                elif isinstance(prompt, str):
-                    prompt_text = prompt
-                if prompt_text:
-                    parts = prompt_text.split("\n\n", 1)
-                    question = parts[1] if len(parts) > 1 else prompt_text
-                else:
-                    question = None
-                answer = row.get("answer", None)
-                
-                print(f"Question: {question}", flush=True)
-                if self.hparams.dataset == "math":
-                    boxed = self._extract_boxed_answer(answer)
-                    print(f"Ground truth answer (boxed): {boxed}", flush=True)
-                elif self.hparams.dataset == "gsm8k":
-                    print(f"Ground truth answer: {answer}", flush=True)
-            elif self.hparams.dataset == "countdown":
-                target = row.get("target", None)
-                numbers = row.get("numbers", None)
-                print(f"Target: {target} | Numbers: {numbers}", flush=True)
-            print(f"{'='*80}\n", flush=True)    
-
-            matches = re.findall(r"<answer>(.*?)</answer>", completions_text[i], re.DOTALL)
-            if matches:
-                equation = matches[-1].strip()
+            total_val_examples = len(self.validation_set)
+            examples_per_gpu = total_val_examples // global_world_size
+            start_idx = global_rank * examples_per_gpu
+            
+            # Last GPU takes any remainder
+            if global_rank == global_world_size - 1:
+                end_idx = total_val_examples
             else:
-                equation = None
+                end_idx = start_idx + examples_per_gpu
             
+            # Get this GPU's subset of validation examples
+            val_subset_indices = list(range(start_idx, end_idx))
+            num_val_prompts = len(val_subset_indices)
+            print(f"[GPU {global_rank}/{global_world_size}] Evaluating {num_val_prompts} validation examples (indices {start_idx} to {end_idx-1})")
+            
+            # ---- 2. Prepare prompts from validation set ----
+            if self.hparams.dataset == "countdown":
+                structured_prompts = []
+                targets = []
+                numbers_list = []
+            
+                for idx in val_subset_indices:
+                    val_entry = self.validation_set[idx]
+                    target = int(val_entry["output"])
+                    numbers_str = val_entry["input"]
+                    numbers = [int(num) for num in numbers_str.split(",")]
+                    
+                    # Create structured prompt matching countdown.py format
+                    prompt_text = f"{SYSTEM_PROMPT}\nUsing only the numbers {numbers}, create an arithmetic expression that evaluates to exactly {target}. You must use all numbers from the list, and each number must be used exactly once. You may use the operations +, -, *, and / as needed. After reasoning, provide only your final expression inside <answer></answer> tags without including an equals sign or the target number. For example, if the numbers are [2, 3, 4] and the target is 5, a valid answer is: <answer>\n2*4-3\n</answer>"
+                    structured_prompts.append([{"role": "user", "content": prompt_text}])
+                    targets.append(target)
+                    numbers_list.append(numbers)
+            else:
+                structured_prompts = [self.validation_set[i]["prompt"] for i in val_subset_indices]
+            
+            prompts_text = [self.tokenizer.apply_chat_template(sp, tokenize=False, add_generation_prompt=True) for sp in structured_prompts]
+            prompt_ids = self.tokenizer(
+                text=prompts_text,
+                return_tensors="pt",
+                padding="longest",
+                padding_side="left",
+                add_special_tokens=False,
+            )["input_ids"].to(device)
+            
+            # Repeat each prompt for num_completions_per_prompt completions
+            prompt_ids = prompt_ids.repeat_interleave(num_completions_per_prompt, dim=0)
+            total_batch, prompt_len = prompt_ids.shape
+
+            # ---- 3. Run diffusion generation to get prompt+completion sequences ----
+            chunk_size = max(1, min(self.hparams.tm.buffer_chunk_size, total_batch)//4)
+            gen_length = self.hparams.max_completion_length
+            seq_len = prompt_len + gen_length
+            # pre-allocate
+            prompt_completion_ids = torch.empty(
+                (total_batch, seq_len),
+                device=prompt_ids.device,
+                dtype=prompt_ids.dtype,
+            )
+            for start in range(0, total_batch, chunk_size):
+                end = min(start + chunk_size, total_batch)
+                with torch.no_grad():
+                    chunk_completion_ids = self._generate(
+                        model=model,
+                        prompt=prompt_ids[start:end],
+                        steps=self.hparams.diffusion_steps,
+                        gen_length=gen_length,
+                        block_length=self.hparams.block_length,
+                        temperature=self.log_temperature,
+                        cfg_scale=self.hparams.cfg_scale,
+                        remasking='low_confidence',
+                    )  # [end-start, seq_len]
+
+                prompt_completion_ids[start:end].copy_(chunk_completion_ids)
+                del chunk_completion_ids
+            
+            # ---- 4. Decode completions to text for reward computation ----
+            completion_ids = prompt_completion_ids[:, prompt_len:]  # [total_batch, gen_length]
+            completions_text = self.tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
+
+            # ---- 5. Build reward inputs: prompts, completions, and extra dataset columns ----
+            data_keys = [key for key in self.train_set[0].keys() if key != "prompt"]
+            if self.hparams.dataset == "countdown":
+                reward_kwargs = {"target": [], "numbers": []}
+                prompts_for_rewards = structured_prompts
+                for i in range(num_val_prompts):
+                    # Add target and numbers for reward computation
+                    reward_kwargs["target"].append(targets[i])
+                    reward_kwargs["numbers"].append(numbers_list[i])
+            else:
+                reward_kwargs = {key: [] for key in data_keys}
+                prompts_for_rewards = [self.validation_set[i]["prompt"] for i in val_subset_indices]
+                for row_idx in val_subset_indices:
+                    # Copy all extra fields for this completion
+                    for key in data_keys:
+                        reward_kwargs[key].append(self.validation_set[row_idx][key])
+
+            # Turn plain completions into chat-style completions [{"role": "assistant", "content": "..."}]
+            completions_for_rewards = [[{"role": "assistant", "content": text}] for text in completions_text]
+
+            # ---- 6. Compute rewards for every generated completion ----
+            num_funcs = len(self.reward_funcs)
+            rewards_per_func = torch.zeros(total_batch, num_funcs, device=device)
+            reward_kwargs["buffer_print_samples"] = int(getattr(self.hparams.tm, "buffer_print_samples", 0))
+            reward_kwargs["rank"] = int(getattr(self.trainer, "global_rank", 0))
+
+            for j, reward_func in enumerate(self.reward_funcs):
+                scores = reward_func(
+                    prompts=prompts_for_rewards,
+                    completions=completions_for_rewards,
+                    **reward_kwargs,
+                )
+                rewards_per_func[:, j] = torch.tensor(scores, device=device, dtype=torch.float32)
+
+            do_print = torch.rand(num_val_prompts, device=device) < getattr(self.hparams.tm, "buffer_student_print_prob", 0.1)
+            model_label = "Student (EMA)" if using_ema else "Student"
+            for i in range(num_val_prompts):
+                if not do_print[i]:
+                    continue
+                
+                row_idx = val_subset_indices[i]
+                row = self.validation_set[row_idx]
+
+                print(f"\n{'='*80}", flush=True)
+                print(f"Model = {model_label}", flush=True)
+                if self.hparams.dataset == "math" or self.hparams.dataset == "gsm8k":
+                    prompt = row.get("prompt", None)
+                    prompt_text = None
+                    if isinstance(prompt, list) and prompt:
+                        prompt_text = prompt[0].get("content", None)
+                    elif isinstance(prompt, str):
+                        prompt_text = prompt
+                    if prompt_text:
+                        parts = prompt_text.split("\n\n", 1)
+                        question = parts[1] if len(parts) > 1 else prompt_text
+                    else:
+                        question = None
+                    answer = row.get("answer", None)
+                    
+                    print(f"Question: {question}", flush=True)
+                    if self.hparams.dataset == "math":
+                        boxed = self._extract_boxed_answer(answer)
+                        print(f"Ground truth answer (boxed): {boxed}", flush=True)
+                    elif self.hparams.dataset == "gsm8k":
+                        print(f"Ground truth answer: {answer}", flush=True)
+                elif self.hparams.dataset == "countdown":
+                    target = row.get("target", None)
+                    numbers = row.get("numbers", None)
+                    print(f"Target: {target} | Numbers: {numbers}", flush=True)
+                print(f"{'='*80}\n", flush=True)    
+
+                matches = re.findall(r"<answer>(.*?)</answer>", completions_text[i], re.DOTALL)
+                if matches:
+                    equation = matches[-1].strip()
+                else:
+                    equation = None
+                
+
+                if self.hparams.dataset == "gsm8k":
+                    reward_val = rewards_per_func[i, -1].item() if num_funcs > 0 else 0.0
+                else:
+                    reward_val = rewards_per_func[i, 0].item() if num_funcs > 0 else 0.0
+
+                print(f"  --------------------------------", flush=True)
+                print(f"  Extracted equation: {equation}", flush=True)
+                print(f"  Reward: {reward_val:.4f}", flush=True)
+                print(f"  Full completion: {completions_text[i]}", flush=True)  # truncate long completions
+                print()
+
+            # Free memory after reward computation
+            del prompts_for_rewards
+            del completions_for_rewards
+            del reward_kwargs
 
             if self.hparams.dataset == "gsm8k":
-                reward_val = rewards_per_func[i, -1].item() if num_funcs > 0 else 0.0
+                correct_nums_eval = torch.isclose(rewards_per_func[:, -1], 2.0 * torch.ones_like(rewards_per_func[:, -1]), atol=1e-3, rtol=0.0).float().sum().item()
+                format_eval = 0 # TODO: add
+            elif self.hparams.dataset == "math":
+                correct_nums_eval = torch.isclose(rewards_per_func[:, 0], 2.0 * torch.ones_like(rewards_per_func[:, 0]), atol=1e-3, rtol=0.0).float().sum().item()
+                format_eval = torch.isclose(rewards_per_func[:, 1], 0.375 * torch.ones_like(rewards_per_func[:, 1]), atol=1e-3, rtol=0.0).float().sum().item()  
             else:
-                reward_val = rewards_per_func[i, 0].item() if num_funcs > 0 else 0.0
+                correct_nums_eval = torch.isclose(rewards_per_func, self.hparams.max_rwd * torch.ones_like(rewards_per_func), atol=1e-3, rtol=0.0).float().sum().item()
+                format_eval = 0 # TODO: add
+            total_rwd_eval = rewards_per_func.sum(dim=-1).sum().item()
+            local_counts = torch.tensor([correct_nums_eval, format_eval, total_rwd_eval, num_val_prompts * num_completions_per_prompt], device=self.device, dtype=torch.long)
+            gathered = self.all_gather(local_counts)  # shape: (world_size, 4) for DDP
+            global_correct = gathered[:, 0].sum()
+            global_format = gathered[:, 1].sum()
+            global_rwd = gathered[:, 2].sum()
+            global_total = gathered[:, 3].sum()
+            
+            global_format_score = (global_format.float() / global_total.float())
+            global_acc = (global_correct.float() / global_total.float())
+            global_rwd_avg = (global_rwd.float() / global_total.float())
 
-            print(f"  --------------------------------", flush=True)
-            print(f"  Extracted equation: {equation}", flush=True)
-            print(f"  Reward: {reward_val:.4f}", flush=True)
-            print(f"  Full completion: {completions_text[i]}", flush=True)  # truncate long completions
-            print()
-
-        # Free memory after reward computation
-        del prompts_for_rewards
-        del completions_for_rewards
-        del reward_kwargs
-
-        if self.hparams.dataset == "gsm8k":
-            correct_nums_eval = torch.isclose(rewards_per_func[:, -1], 2.0 * torch.ones_like(rewards_per_func[:, -1]), atol=1e-3, rtol=0.0).float().sum().item()
-            format_eval = 0 # TODO: add
-        elif self.hparams.dataset == "math":
-            correct_nums_eval = torch.isclose(rewards_per_func[:, 0], 2.0 * torch.ones_like(rewards_per_func[:, 0]), atol=1e-3, rtol=0.0).float().sum().item()
-            format_eval = torch.isclose(rewards_per_func[:, 1], 0.375 * torch.ones_like(rewards_per_func[:, 1]), atol=1e-3, rtol=0.0).float().sum().item()  
-        else:
-            correct_nums_eval = torch.isclose(rewards_per_func, self.hparams.max_rwd * torch.ones_like(rewards_per_func), atol=1e-3, rtol=0.0).float().sum().item()
-            format_eval = 0 # TODO: add
-        total_rwd_eval = rewards_per_func.sum(dim=-1).sum().item()
-        local_counts = torch.tensor([correct_nums_eval, format_eval, total_rwd_eval, num_val_prompts * num_completions_per_prompt], device=self.device, dtype=torch.long)
-        gathered = self.all_gather(local_counts)  # shape: (world_size, 4) for DDP
-        global_correct = gathered[:, 0].sum()
-        global_format = gathered[:, 1].sum()
-        global_rwd = gathered[:, 2].sum()
-        global_total = gathered[:, 3].sum()
-        
-        global_format_score = (global_format.float() / global_total.float())
-        global_acc = (global_correct.float() / global_total.float())
-        global_rwd_avg = (global_rwd.float() / global_total.float())
-
-        print(f"[EVAL] Global accuracy is {global_acc:.4f}, global average reward is {global_rwd_avg:.4f}, global format score is {global_format_score:.4f}")
-        self.dict_for_logs["eval/format_score"] = global_format_score.item()
-        self.dict_for_logs["eval/correct_frac"] = global_acc.item()
-        self.dict_for_logs["eval/avg_rwd"] = global_rwd_avg.item()
-        # print(f"[EVAL] At global step {self.global_step}, for gpu {self.global_rank}, student correctness fraction: {global_acc:.4f}, avg reward: {global_rwd_avg:.4f}")
-        
-        buffer_end_time = datetime.now()
-        buffer_build_time = (buffer_end_time - buffer_start_time).total_seconds()
-        print(f"Logging Student finished, took {buffer_build_time}")
-
-        # restore adapter
-        model.set_adapter(prev_adapter)
-        model.train()
+            print(f"[EVAL] Global accuracy is {global_acc:.4f}, global average reward is {global_rwd_avg:.4f}, global format score is {global_format_score:.4f}")
+            self.dict_for_logs["eval/format_score"] = global_format_score.item()
+            self.dict_for_logs["eval/correct_frac"] = global_acc.item()
+            self.dict_for_logs["eval/avg_rwd"] = global_rwd_avg.item()
+            # print(f"[EVAL] At global step {self.global_step}, for gpu {self.global_rank}, student correctness fraction: {global_acc:.4f}, avg reward: {global_rwd_avg:.4f}")
+            
+            buffer_end_time = datetime.now()
+            buffer_build_time = (buffer_end_time - buffer_start_time).total_seconds()
+            print(f"Logging Student finished, took {buffer_build_time}")
+        finally:
+            ema_eval_ctx.__exit__(None, None, None)
+            # restore adapter
+            model.set_adapter(prev_adapter)
+            model.train()
 
     def _init_tm_scheduler(self):
         """Initialize a per-h-phase, linear LR scheduler with warmup.
