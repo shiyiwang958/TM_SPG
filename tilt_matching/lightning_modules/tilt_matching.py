@@ -622,7 +622,7 @@ class DTMModule(pl.LightningModule):
         
         # Create x_t's by masking the x_1's
         num_to_mask = torch.randint(low=1, high=gen_length+1, size=(x1s.shape[0],), device=self.device)
-        itpl_block_len = getattr(self.hparams.tm, "itpl_block_length", self.hparams.tm.block_length)
+        itpl_block_len = getattr(self.hparams.tm, "itpl_block_length", self.hparams.block_length)
         xts, mask_indices, active_block_mask = self._build_interpolant(x1s, num_to_mask, itpl_block_len)
         use_sar = bool(getattr(self.hparams.tm, "use_sar_active_block_norm", False))
         mask_for_loss = active_block_mask if use_sar else mask_indices
