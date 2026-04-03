@@ -6,7 +6,7 @@
 #SBATCH --gpus-per-node=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --mem=50GB
-#SBATCH --time=21:29:59
+#SBATCH --time=72:00:00
 #SBATCH --mail-type=END,FAIL,BEGIN
 #SBATCH --mail-user=yuyuanchen@math.harvard.edu
 
@@ -95,6 +95,6 @@ srun --ntasks-per-node=1 --gpus-per-task=2 \
     --tee 3 \
     tilt_train.py \
     --config-path /n/home06/yuyuan0/TM_SPG/tilt_matching/config \
-    --config-name countdown.yaml \
+    --config-name gsm8k.yaml \
     nodes=4 \
     devices=2 \

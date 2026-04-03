@@ -492,9 +492,10 @@ class DTMModule(pl.LightningModule):
         # Create x_t's by masking the x_1's
         num_to_mask = torch.randint(low=1, high=gen_length+1, size=(x1s.shape[0],), device=self.device)
         itpl_block_len = getattr(self.hparams.tm, "itpl_block_length", self.hparams.block_length)
+        completion_ids = x1s[:, -gen_length:]
         xts, mask_indices, active_block_mask = self._build_interpolant(x1s, num_to_mask, itpl_block_len)
         aux_mask, loss_weights = self._build_loss_weights(
-            completion_ids=x1s[:, -gen_length:],
+            completion_ids=completion_ids,
             mask_indices=mask_indices,
             active_block_mask=active_block_mask,
             block_size=itpl_block_len,
@@ -507,7 +508,7 @@ class DTMModule(pl.LightningModule):
             self.model.eval()
             old_logits = self._new_forward(self.model, xts, gen_length) # [B, gen_length, V]
         V = old_logits.shape[-1]
-        x1_equals_v = F.one_hot(x1s.long()[:, -gen_length:], num_classes = V) # [B, gen_length, V]
+        x1_equals_v = F.one_hot(completion_ids.long(), num_classes = V) # [B, gen_length, V]
         with self._use_adapter("student"):
             self.model.train()   
             curr_logits = self._new_forward(self.model, xts, gen_length) # [B, gen_length, V]
@@ -559,12 +560,14 @@ class DTMModule(pl.LightningModule):
         per_row_losses = (per_position_losses * loss_weights).sum(dim=1)  # [B]
         per_row_weight = loss_weights.sum(dim=1).clamp_min(1e-12)
         loss = (per_row_losses / per_row_weight).mean()
+        effective_gen_len = self._compute_effective_gen_lengths(completion_ids).float().mean()
 
         log_dict = {
             f"train/loss": loss,
             f"train/a": self.a,
             f"train/h": self.h,
             f"train/drift_gap_kl": self._kl_from_logits(old_logits, curr_logits, aux_mask),
+            f"train/effective_gen_len": effective_gen_len,
             f"train/rwd_max": rwd.max(),
             f"train/rwd_min": rwd.min(),
             f"train/rwd_mean": rwd.mean(),
@@ -1256,6 +1259,13 @@ class DTMModule(pl.LightningModule):
         eos_hits = completion_ids.eq(self._eos_id)
         seen_eos_before = eos_hits.to(torch.int32).cumsum(dim=1) - eos_hits.to(torch.int32)
         return seen_eos_before == 0
+
+    def _compute_effective_gen_lengths(self, completion_ids):
+        eos_hits = completion_ids.eq(self._eos_id)
+        has_eos = eos_hits.any(dim=1)
+        first_eos = eos_hits.to(torch.int64).argmax(dim=1)
+        full_length = torch.full_like(first_eos, completion_ids.shape[1])
+        return torch.where(has_eos, first_eos, full_length)
 
     def _generate(
         self,
