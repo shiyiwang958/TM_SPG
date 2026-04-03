@@ -58,6 +58,9 @@ class DTMModule(pl.LightningModule):
         self.buffer_update_counter = 0
         self._grad_accum_counter = 0
         self._step_counter = 0
+        self._eos_id = getattr(self.tokenizer, "eos_token_id", None)
+        if self._eos_id is None:
+            raise ValueError("tokenizer.eos_token_id must be set to exclude post-EOS positions from the loss.")
 
         # --- Set up DTM hyperparameters ---
         self.a = 0.0
@@ -86,6 +89,12 @@ class DTMModule(pl.LightningModule):
         self._cv_ema_beta = float(getattr(self.hparams.tm, "control_variate_ema", 0.05))
         self._track_cv = bool(getattr(self.hparams.tm, "track_cv", False))
         self._compute_cv = bool(getattr(self.hparams.tm, "learned_cv", False) or self._track_cv)
+        self._use_sar_discounted_future_loss = bool(getattr(self.hparams.tm, "use_sar_discounted_future_loss", False))
+        self._sar_future_discount_alpha = float(getattr(self.hparams.tm, "sar_future_discount_alpha", 1.0))
+        if self._use_sar_discounted_future_loss and not (0.0 <= self._sar_future_discount_alpha <= 1.0):
+            raise ValueError(
+                "tm.sar_future_discount_alpha must be in [0, 1] when tm.use_sar_discounted_future_loss is enabled"
+            )
         self.dict_for_logs = {}
         self.ckpt_counter = 0
         self.log_student_steps = self.hparams.tm.student_log_steps
@@ -484,8 +493,13 @@ class DTMModule(pl.LightningModule):
         num_to_mask = torch.randint(low=1, high=gen_length+1, size=(x1s.shape[0],), device=self.device)
         itpl_block_len = getattr(self.hparams.tm, "itpl_block_length", self.hparams.block_length)
         xts, mask_indices, active_block_mask = self._build_interpolant(x1s, num_to_mask, itpl_block_len)
-        use_sar = bool(getattr(self.hparams.tm, "use_sar_active_block_norm", False))
-        mask_for_loss = active_block_mask if use_sar else mask_indices
+        aux_mask, loss_weights = self._build_loss_weights(
+            completion_ids=x1s[:, -gen_length:],
+            mask_indices=mask_indices,
+            active_block_mask=active_block_mask,
+            block_size=itpl_block_len,
+            dtype=torch.float32,
+        )
 
         # Get model predictions and compute loss
         temp = self.hparams.sampling_temperature
@@ -519,8 +533,8 @@ class DTMModule(pl.LightningModule):
                 dot = (Bv * A).sum(dim=-1)  # [B,L]
                 den = (A * A).sum(dim=-1)   # [B,L]
 
-                self._cv_num_accum += (w * dot)[mask_for_loss].sum()
-                self._cv_den_accum += den[mask_for_loss].sum()
+                self._cv_num_accum += (w * dot)[aux_mask].sum()
+                self._cv_den_accum += den[aux_mask].sum()
 
         active_cv = self.cv if getattr(self.hparams.tm, "learned_cv", False) else self.hparams.tm.control_variate
 
@@ -541,14 +555,16 @@ class DTMModule(pl.LightningModule):
             raise ValueError(f"Invalid loss_type: {loss_type}")
         
         per_position_losses = -(target * F.log_softmax(curr_logits, dim=-1)).sum(dim=-1) # [B, gen_length]
-        per_row_losses = (per_position_losses * mask_for_loss).sum(dim=1)  # [B]
-        loss = (per_row_losses / mask_for_loss.sum(dim=1).to(per_row_losses.dtype)).mean()
+        loss_weights = loss_weights.to(per_position_losses.dtype)
+        per_row_losses = (per_position_losses * loss_weights).sum(dim=1)  # [B]
+        per_row_weight = loss_weights.sum(dim=1).clamp_min(1e-12)
+        loss = (per_row_losses / per_row_weight).mean()
 
         log_dict = {
             f"train/loss": loss,
             f"train/a": self.a,
             f"train/h": self.h,
-            f"train/drift_gap_kl": self._kl_from_logits(old_logits, curr_logits, mask_for_loss),
+            f"train/drift_gap_kl": self._kl_from_logits(old_logits, curr_logits, aux_mask),
             f"train/rwd_max": rwd.max(),
             f"train/rwd_min": rwd.min(),
             f"train/rwd_mean": rwd.mean(),
@@ -1210,6 +1226,36 @@ class DTMModule(pl.LightningModule):
         log_B = F.log_softmax(logits_B, dim=-1)
         kl = F.kl_div(log_A, log_B, reduction='none', log_target=True).sum(-1)
         return kl[mask_indices].float().mean()
+
+    def _build_loss_weights(self, completion_ids, mask_indices, active_block_mask, block_size, dtype):
+        use_sar = bool(getattr(self.hparams.tm, "use_sar_active_block_norm", False))
+        aux_mask = active_block_mask if use_sar else mask_indices
+        pre_eos_mask = self._build_pre_eos_mask(completion_ids)
+
+        if not (use_sar and self._use_sar_discounted_future_loss):
+            return aux_mask, aux_mask.to(dtype=dtype) * pre_eos_mask.to(dtype=dtype)
+
+        if not torch.all(active_block_mask.any(dim=1)):
+            raise RuntimeError("Expected every sample to have at least one masked token in the SAR active block.")
+
+        gen_length = mask_indices.shape[1]
+        if gen_length % block_size != 0:
+            raise ValueError("SAR discounted future loss requires the generation length to be divisible by block_size.")
+
+        device = mask_indices.device
+        block_ids = torch.arange(gen_length, device=device, dtype=torch.long) // block_size  # [L]
+        active_block_ids = (active_block_mask.to(torch.long) * block_ids.unsqueeze(0)).amax(dim=1)  # [B]
+        block_offsets = block_ids.unsqueeze(0) - active_block_ids.unsqueeze(1)  # [B, L]
+        masked_offsets = torch.where(mask_indices, block_offsets, torch.zeros_like(block_offsets))
+
+        alpha = torch.tensor(self._sar_future_discount_alpha, device=device, dtype=dtype)
+        loss_weights = mask_indices.to(dtype) * torch.pow(alpha, masked_offsets.to(dtype)) * pre_eos_mask.to(dtype)
+        return aux_mask, loss_weights
+
+    def _build_pre_eos_mask(self, completion_ids):
+        eos_hits = completion_ids.eq(self._eos_id)
+        seen_eos_before = eos_hits.to(torch.int32).cumsum(dim=1) - eos_hits.to(torch.int32)
+        return seen_eos_before == 0
 
     def _generate(
         self,

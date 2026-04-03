@@ -26,12 +26,9 @@ tm:
   student_log_steps: 100
   student_logs_per_prompt: 1
   use_ema: true
-  hat_wv_neg_thresh: -1e-8
-  hat_wv_print_max: 10
-  hat_wv_cum_print_every: 20
-  hat_wv_cum_min_steps: 8
-  hat_wv_cum_print_max: 30
   use_sar_active_block_norm: true
+  use_sar_discounted_future_loss: false
+  sar_future_discount_alpha: 1.0
 
 #-----------------Optimizer Config-----------------
 adam_beta1: 0.85 # modified

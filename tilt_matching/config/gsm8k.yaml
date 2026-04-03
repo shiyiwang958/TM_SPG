@@ -1,36 +1,35 @@
 #-----------------Tilt Matching Training Config-----------------
 tm:
   a_end: 100.0
-  buffer_chunk_size: 60
+  buffer_chunk_size: 48
   buffer_print_samples: 0
-  buffer_refresh_steps: 25
-  control_variate: 1.0
+  buffer_student_print_prob: 0.1
+  buffer_refresh_steps: 20
+  control_variate: 2.0
   control_variate_ema: 0.04
-  ema_decay: 0.95
+  ema_decay: 0.97
   grad_accum_steps: 8
-  h: 6.0
+  h: 3.0
   learned_cv: false
+  track_cv: false # when false, skip CV estimation/logging unless learned_cv is true
   loss_type: itm
   mix_batches: true
   num_batch_prompts: 12
-  num_buffer_prompts: 40
-  num_buffer_refresh: 10
-  num_completions_per_prompt: 6
+  num_buffer_prompts: 60
+  num_buffer_refresh: 6
+  num_completions_per_prompt: 8
   rescale_logits: false
-  rwd_shift: 0.0
+  rwd_shift: -1.0
   rwd_shift_auto: false
-  steps_per_h: 1200 # this is the number of optimizer steps per h
+  steps_per_h: 800 # this is the number of optimizer steps per h
   log_student: true
   log_temperature: 0.0
-  student_log_steps: 300
+  student_log_steps: 200
   student_logs_per_prompt: 1
   use_ema: true
-  hat_wv_neg_thresh: -1e-8
-  hat_wv_print_max: 10
-  hat_wv_cum_print_every: 20
-  hat_wv_cum_min_steps: 8
-  hat_wv_cum_print_max: 30
   use_sar_active_block_norm: true
+  use_sar_discounted_future_loss: false
+  sar_future_discount_alpha: 0.7
 
 #-----------------Optimizer Config-----------------
 adam_beta1: 0.9
@@ -43,14 +42,14 @@ learning_rate: 4e-6
 lr_decay_ratio: 0.1
 lr_min: 2e-6
 lr_scheduler_type: linear
-lr_warmup_ratio: 0.05
+lr_warmup_ratio: 0.0
 
 #-----------------Diffusion Generation Config-----------------
 block_length: 32
 cfg_scale: 0.0
 diffusion_steps: 128
 max_completion_length: 256
-max_prompt_length: 172
+max_prompt_length: 240
 remasking_strategy: "low_confidence"
 sampling_temperature: 1.0
 
@@ -66,7 +65,7 @@ lora_dropout: 0.05
 peft_task_type: CAUSAL_LM
 
 #-----------------Logging and Checkpointing Config-----------------
-checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/ctd_ablate_h6.0
+checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm0403
 ckpt_freq: 100 # in optimizer steps
 metrics_log_every: 1
 resume_path: 
@@ -76,10 +75,10 @@ student_copy_over: false
 wandb:
   entity: "yuyuanchen-harvard-university"
   project: "LLaDA_TM"
-  name: "ctd_ablate_h6"
+  name: "gsm8k"
 
 #-----------------Other Training Config-----------------
-dataset: countdown
+dataset: gsm8k
 max_rwd: 1.0
 few_shot: 0
 seed: 42
