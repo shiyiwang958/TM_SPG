@@ -188,8 +188,9 @@ class DTMModule(pl.LightningModule):
 
     def on_train_start(self):
         super().on_train_start()
+        self._start_step = getattr(self, "global_step", 0)
         if getattr(self.hparams, "eval", False):
-            self.logging_student(self.model, self.student_logs_per_prompt)
+            self.logging_student(self.model, self.student_logs_per_prompt, eval_label="initial_pretrain")
 
         global_world_size = getattr(self.trainer, "world_size", 1)
         global_rank = getattr(self.trainer, "global_rank", 0)
@@ -198,8 +199,6 @@ class DTMModule(pl.LightningModule):
         self.g = torch.Generator(device=self.device)
         self.g.manual_seed(12345 + logical_rank)
 
-        self._start_step = getattr(self, "global_step", 0)
-        
         # Set up optimizer and LR
         self.tm_opt = self.optimizers()
         for g in self.tm_opt.param_groups:
@@ -912,7 +911,7 @@ class DTMModule(pl.LightningModule):
         model.set_adapter(prev_adapter)
         model.train()
 
-    def logging_student(self, model, num_completions_per_prompt):
+    def logging_student(self, model, num_completions_per_prompt, eval_label=None):
         """
         Evaluate the student model on the validation set.
         - Distributes validation examples across GPUs
@@ -1114,30 +1113,45 @@ class DTMModule(pl.LightningModule):
             correct_nums_eval = torch.isclose(rewards_per_func, self.hparams.max_rwd * torch.ones_like(rewards_per_func), atol=1e-3, rtol=0.0).float().sum().item()
             format_eval = 0 # TODO: add
         total_rwd_eval = rewards_per_func.sum(dim=-1).sum().item()
-        local_counts = torch.tensor([correct_nums_eval, format_eval, total_rwd_eval, num_val_prompts * num_completions_per_prompt], device=self.device, dtype=torch.long)
+        local_counts = torch.tensor(
+            [correct_nums_eval, format_eval, total_rwd_eval, num_val_prompts * num_completions_per_prompt],
+            device=self.device,
+            dtype=torch.float32,
+        )
         gathered = self.all_gather(local_counts)  # shape: (world_size, 4) for DDP
         global_correct = gathered[:, 0].sum()
         global_format = gathered[:, 1].sum()
         global_rwd = gathered[:, 2].sum()
-        global_total = gathered[:, 3].sum()
-        
-        global_format_score = (global_format.float() / global_total.float())
-        global_acc = (global_correct.float() / global_total.float())
-        global_rwd_avg = (global_rwd.float() / global_total.float())
+        global_total = gathered[:, 3].sum().clamp_min(1.0)
 
-        print(f"[EVAL] Global accuracy is {global_acc:.4f}, global average reward is {global_rwd_avg:.4f}, global format score is {global_format_score:.4f}")
-        self.dict_for_logs["eval/format_score"] = global_format_score.item()
-        self.dict_for_logs["eval/correct_frac"] = global_acc.item()
-        self.dict_for_logs["eval/avg_rwd"] = global_rwd_avg.item()
-        # print(f"[EVAL] At global step {self.global_step}, for gpu {self.global_rank}, student correctness fraction: {global_acc:.4f}, avg reward: {global_rwd_avg:.4f}")
-        
+        global_format_score = global_format / global_total
+        global_acc = global_correct / global_total
+        global_rwd_avg = global_rwd / global_total
+
+        eval_metrics = {
+            "eval/format_score": global_format_score.item(),
+            "eval/correct_frac": global_acc.item(),
+            "eval/avg_rwd": global_rwd_avg.item(),
+        }
+        eval_name = eval_label or f"step_{self.global_step}"
+        if global_rank == 0:
+            print(
+                f"[EVAL][{eval_name}] accuracy={eval_metrics['eval/correct_frac']:.4f}, " 
+                f"avg_reward={eval_metrics['eval/avg_rwd']:.4f}, "
+                f"format_score={eval_metrics['eval/format_score']:.4f}",
+                flush=True,
+            )
+        self.dict_for_logs.update(eval_metrics)
+
         buffer_end_time = datetime.now()
         buffer_build_time = (buffer_end_time - buffer_start_time).total_seconds()
-        print(f"Logging Student finished, took {buffer_build_time}")
+        if global_rank == 0:
+            print(f"Logging Student finished, took {buffer_build_time}", flush=True)
 
         # restore adapter
         model.set_adapter(prev_adapter)
         model.train()
+        return eval_metrics
 
     def _init_tm_scheduler(self):
         """Initialize a per-h-phase, linear LR scheduler with warmup.
