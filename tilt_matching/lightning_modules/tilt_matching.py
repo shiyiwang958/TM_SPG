@@ -558,8 +558,14 @@ class DTMModule(pl.LightningModule):
         per_position_losses = -(target * F.log_softmax(curr_logits, dim=-1)).sum(dim=-1) # [B, gen_length]
         loss_weights = loss_weights.to(per_position_losses.dtype)
         per_row_losses = (per_position_losses * loss_weights).sum(dim=1)  # [B]
-        per_row_weight = loss_weights.sum(dim=1).clamp_min(1e-12)
-        loss = (per_row_losses / per_row_weight).mean()
+        per_row_weight = loss_weights.sum(dim=1)
+        valid_loss_rows = per_row_weight > 0
+        num_valid_loss_rows = valid_loss_rows.sum()
+        if bool(num_valid_loss_rows.item()):
+            normalized_row_losses = per_row_losses[valid_loss_rows] / per_row_weight[valid_loss_rows]
+            loss = normalized_row_losses.mean()
+        else:
+            loss = per_row_losses.new_zeros(())
         effective_gen_len = self._compute_effective_gen_lengths(completion_ids).float().mean()
 
         log_dict = {
@@ -568,6 +574,8 @@ class DTMModule(pl.LightningModule):
             f"train/h": self.h,
             f"train/drift_gap_kl": self._kl_from_logits(old_logits, curr_logits, aux_mask),
             f"train/effective_gen_len": effective_gen_len,
+            f"train/valid_loss_rows": num_valid_loss_rows.to(per_position_losses.dtype),
+            f"train/zero_loss_rows": loss_weights.new_full((), loss_weights.shape[0]) - num_valid_loss_rows.to(per_position_losses.dtype),
             f"train/rwd_max": rwd.max(),
             f"train/rwd_min": rwd.min(),
             f"train/rwd_mean": rwd.mean(),
