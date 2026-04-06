@@ -555,7 +555,6 @@ class TiltLogModule(pl.LightningModule):
             else:
                 loss = per_row_losses.new_zeros(())
             log_mask = loss_weights > 0
-            effective_gen_len = self._compute_effective_gen_lengths(completion_ids).float().mean()
         else:
             loss = per_position_losses[mask_indices.bool()].mean()
             log_mask = mask_indices.bool()
@@ -572,8 +571,6 @@ class TiltLogModule(pl.LightningModule):
             f"train/correct_sum": correct_sum,
             f"train/correct_count": correct_count,
         }
-        if self.use_eos_aware_weighted_loss:
-            log_dict["train/effective_gen_len"] = effective_gen_len
         
         return loss, log_dict
     
@@ -1077,13 +1074,42 @@ class TiltLogModule(pl.LightningModule):
             # print(f"[Student Validation] Number of correct completions with format reward: {frac_format_correct:.2f}")
 
             if self.hparams.dataset == "gsm8k":
-                correct_frac_eval = torch.isclose(rewards_per_func[:, -1], 2.0 * torch.ones_like(rewards_per_func[:, -1]), atol=1e-6, rtol=0.0).float().mean()
+                correct_mask = torch.isclose(rewards_per_func[:, -1], 2.0 * torch.ones_like(rewards_per_func[:, -1]), atol=1e-6, rtol=0.0)
             elif self.hparams.dataset == "math":
-                correct_frac_eval = torch.isclose(rewards_per_func[:, 0], 2.0 * torch.ones_like(rewards_per_func[:, 0]), atol=1e-6, rtol=0.0).float().mean()
-            avg_rwd_eval = rewards_per_func.sum(dim=-1).mean() # [N_eval,]
+                correct_mask = torch.isclose(rewards_per_func[:, 0], 2.0 * torch.ones_like(rewards_per_func[:, 0]), atol=1e-6, rtol=0.0)
+            else:
+                raise ValueError(f"Unsupported dataset for eval correctness metric: {self.hparams.dataset}")
+
+            local_eval_count = torch.tensor(total_batch, device=device, dtype=torch.float32)
+            global_eval_count = self._distributed_sum(local_eval_count)
+            global_correct_count = self._distributed_sum(correct_mask.to(torch.float32).sum())
+            global_reward_sum = self._distributed_sum(rewards_per_func.sum(dim=-1).sum())
+
+            denom = global_eval_count.clamp_min(1.0)
+            correct_frac_eval = global_correct_count / denom
+            avg_rwd_eval = global_reward_sum / denom
+
             self.dict_for_logs["eval/correct_frac"] = correct_frac_eval
             self.dict_for_logs["eval/avg_rwd"] = avg_rwd_eval
-            print(f"[EVAL] At global step {self.global_step}, for gpu {self.global_rank}, {eval_source} correctness fraction: {correct_frac_eval:.4f}, avg reward: {avg_rwd_eval:.4f}")
+
+            effective_gen_len_eval = None
+            if self._eos_id is not None:
+                global_effective_gen_len_sum = self._distributed_sum(
+                    self._compute_effective_gen_lengths(completion_ids).to(torch.float32).sum()
+                )
+                effective_gen_len_eval = global_effective_gen_len_sum / denom
+                self.dict_for_logs["eval/effective_gen_len"] = effective_gen_len_eval
+
+            if global_rank == 0:
+                eval_msg = (
+                    f"[EVAL] At global step {self.global_step}, {eval_source} "
+                    f"correctness fraction: {correct_frac_eval.item():.4f} "
+                    f"({int(global_correct_count.item())}/{int(global_eval_count.item())}), "
+                    f"avg reward: {avg_rwd_eval.item():.4f}"
+                )
+                if effective_gen_len_eval is not None:
+                    eval_msg += f", avg effective gen length: {effective_gen_len_eval.item():.2f}"
+                print(eval_msg, flush=True)
             
             buffer_end_time = datetime.now()
             buffer_build_time = (buffer_end_time - buffer_start_time).total_seconds()
@@ -1212,6 +1238,11 @@ class TiltLogModule(pl.LightningModule):
         first_eos = eos_hits.to(torch.int64).argmax(dim=1)
         full_length = torch.full_like(first_eos, completion_ids.shape[1])
         return torch.where(has_eos, first_eos + 1, full_length)
+
+    def _distributed_sum(self, value):
+        if not isinstance(value, torch.Tensor):
+            value = torch.tensor(value, device=self.device)
+        return self.all_gather(value).sum()
 
     def _build_eos_aware_num_to_mask(self, completion_ids, block_size, gen_length):
         if gen_length % block_size != 0:
