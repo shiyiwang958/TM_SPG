@@ -235,7 +235,10 @@ class TiltLogModule(pl.LightningModule):
         self._update_buffer(self.model, self.num_buffer_prompts, self.comps_per_prompt)
         print(f"[DEBUG] Buffer initialized with shape {self.buffer.shape}")
         # Initialize EMA for the current h-phase
-        self._reset_ema()
+        if self.use_ema:
+            self._reset_ema()
+        else:
+            self._ema_shadow = None
     
     def configure_optimizers(self):
         params = [p for p in self.model.parameters() if p.requires_grad]
@@ -324,6 +327,9 @@ class TiltLogModule(pl.LightningModule):
             yield key, value
 
     def _reset_ema(self):
+        if not self.use_ema:
+            self._ema_shadow = None
+            return
         self._ema_shadow = {}
         for key, param in self._student_param_iter():
             self._ema_shadow[key] = param.detach().clone()
@@ -350,6 +356,8 @@ class TiltLogModule(pl.LightningModule):
     
     @torch.no_grad()
     def _update_ema(self):
+        if not self.use_ema:
+            return
         if self._ema_shadow is None:
             self._reset_ema()
             return
@@ -460,7 +468,10 @@ class TiltLogModule(pl.LightningModule):
                 g["lr"] = self.lr
             self._init_tm_scheduler()
             # Reset EMA for the new h-phase
-            self._reset_ema()
+            if self.use_ema:
+                self._reset_ema()
+            else:
+                self._ema_shadow = None
 
         self.log("ckpt_a", self.a, on_step=True, on_epoch=False, sync_dist=True)
         step_end_time = datetime.now()

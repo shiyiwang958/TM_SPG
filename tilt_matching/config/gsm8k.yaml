@@ -20,7 +20,7 @@ tm:
   student_logs_per_prompt: 1
   student_copy_over: false
   reset_global_step: false
-  use_ema: true
+  use_ema: false
   ema_decay: 0.96
   use_eos_aware_weighted_loss: true
   eos_future_discount_alpha: 0.7

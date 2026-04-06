@@ -95,4 +95,4 @@ srun --ntasks-per-node=1 --gpus-per-task=2 \
     --tee 3 \
     tilt_train.py \
     --config-path /n/home06/yuyuan0/temp/TM_SPG/tilt_matching/config \
-    --config-name gsm8k.yaml
+    --config-name gsm8k_rand.yaml
