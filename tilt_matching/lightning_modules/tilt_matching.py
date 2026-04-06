@@ -68,6 +68,7 @@ class TiltLogModule(pl.LightningModule):
         self.cv = self.hparams.tm.control_variate
         self.buffer = None
         self.buffer_rewards = None
+        self.buffer_prompt_attention_mask = None
         self.student_buffer = None
         self.student_rewards = None
         self._rebuild_buffer_next_phase = False
@@ -471,6 +472,7 @@ class TiltLogModule(pl.LightningModule):
         prompts_idx = self._accum_prompts_idx[idx]
         x1s = self.buffer[prompts_idx].reshape(B, L)           # [B, L]
         rwds = self.buffer_rewards[prompts_idx].reshape(B, -1) # [B, num_reward_funcs]
+        prompt_attention_mask = self.buffer_prompt_attention_mask[prompts_idx].reshape(B, -1) # [B, prompt_len]
 
         # Aggregate rewards from multiple functions
         if self.reward_weights is None:
@@ -492,17 +494,18 @@ class TiltLogModule(pl.LightningModule):
         # Create x_t's by masking the x_1's
         num_to_mask = torch.randint(low=1, high=gen_length+1, size=(x1s.shape[0],), device=self.device)
         xts, mask_indices = self._build_interpolant(x1s, num_to_mask, self.hparams.block_length)
+        sequence_attention_mask = self._build_sequence_attention_mask(prompt_attention_mask, gen_length)
 
         # Get model predictions and compute loss
         temp = self.hparams.sampling_temperature
         with torch.no_grad(), self._use_adapter("teacher"):
             self.model.eval()
-            old_logits = self._new_forward(self.model, xts, gen_length) # [B, gen_length, V]
+            old_logits = self._new_forward(self.model, xts, gen_length, attention_mask=sequence_attention_mask) # [B, gen_length, V]
         V = old_logits.shape[-1]
         x1_equals_v = F.one_hot(x1s.long()[:, -gen_length:], num_classes = V) # [B, gen_length, V]
         with self._use_adapter("student"):
             self.model.train()   
-            curr_logits = self._new_forward(self.model, xts, gen_length) # [B, gen_length, V]
+            curr_logits = self._new_forward(self.model, xts, gen_length, attention_mask=sequence_attention_mask) # [B, gen_length, V]
         if temp > 0.0 and self.hparams.tm.rescale_logits:
             old_logits  /= temp
             curr_logits /= temp
@@ -645,7 +648,7 @@ class TiltLogModule(pl.LightningModule):
                 raise TypeError(f"Unsupported prompt type {type(sp)} in training_prompts_dataset")
             prompts_text.append(text)
 
-        input_ids = self.tokenizer(
+        tokenized = self.tokenizer(
             text=prompts_text,
             return_tensors="pt",
             padding="max_length",
@@ -653,13 +656,18 @@ class TiltLogModule(pl.LightningModule):
             max_length=self.hparams.max_prompt_length,
             padding_side="left",
             add_special_tokens=False,
-        )["input_ids"].to(self.device)
+        )
+        input_ids = tokenized["input_ids"].to(self.device)
+        attention_mask = tokenized["attention_mask"].to(device=self.device, dtype=torch.bool)
 
         # # Debug prompt length
         # prompt_input = self.tokenizer.batch_decode(input_ids, skip_special_tokens=False)
         # print(f"Prompts are: {prompt_input[:2]} ...")
 
-        return input_ids.repeat_interleave(num_completions_per_prompts, dim=0)
+        return (
+            input_ids.repeat_interleave(num_completions_per_prompts, dim=0),
+            attention_mask.repeat_interleave(num_completions_per_prompts, dim=0),
+        )
 
     def _update_buffer(self, model, num_buffer_updates, num_completions_per_prompt):
         """
@@ -692,6 +700,7 @@ class TiltLogModule(pl.LightningModule):
             self.buffer_update_counter = 0
             self.buffer = None
             self.buffer_rewards = None
+            self.buffer_prompt_attention_mask = None
         else:
             update_rows = [
                 (self.buffer_update_counter + u) % self.num_buffer_prompts
@@ -699,7 +708,7 @@ class TiltLogModule(pl.LightningModule):
             ]
             self.buffer_update_counter += num_buffer_updates
             self.buffer_update_counter %= self.num_buffer_prompts
-        prompt_ids = self._prepare_prompts(num_buffer_updates, num_completions_per_prompt)
+        prompt_ids, prompt_attention_mask = self._prepare_prompts(num_buffer_updates, num_completions_per_prompt)
         total_batch, prompt_len = prompt_ids.shape
 
         # ---- 2. Run diffusion generation to get prompt+completion sequences ----
@@ -718,6 +727,7 @@ class TiltLogModule(pl.LightningModule):
                 chunk_completion_ids = self._generate(
                     model=model,
                     prompt=prompt_ids[start:end],
+                    prompt_attention_mask=prompt_attention_mask[start:end],
                     steps=self.hparams.diffusion_steps,
                     gen_length=gen_length,
                     block_length=self.hparams.block_length,
@@ -730,10 +740,15 @@ class TiltLogModule(pl.LightningModule):
 
         # ---- 3. Reshape into [num_updates, num_completions, seq_len] and update corresponding rows ----
         new_buffer_block = prompt_completion_ids.view(num_buffer_updates, -1, seq_len)
+        new_prompt_attention_mask_block = prompt_attention_mask.view(num_buffer_updates, -1, prompt_len)
         if self.buffer is None:
             self.buffer = new_buffer_block
         else:
             self.buffer[update_rows, :, :] = new_buffer_block
+        if self.buffer_prompt_attention_mask is None:
+            self.buffer_prompt_attention_mask = new_prompt_attention_mask_block
+        else:
+            self.buffer_prompt_attention_mask[update_rows, :, :] = new_prompt_attention_mask_block
 
         # ---- 4. Decode completions to text for reward computation ----
         completion_ids = prompt_completion_ids[:, prompt_len:]  # [total_batch, gen_length]
@@ -919,18 +934,21 @@ class TiltLogModule(pl.LightningModule):
             #     targets.append(target)
             #     numbers_list.append(numbers)
             
-            prompt_ids = self.tokenizer(
+            tokenized = self.tokenizer(
                 text=prompts_text,
                 return_tensors="pt",
-                padding="max_length",
+                padding="longest",
                 truncation=True,
                 max_length=self.hparams.max_prompt_length,
                 padding_side="left",
                 add_special_tokens=False,
-            )["input_ids"].to(device)
+            )
+            prompt_ids = tokenized["input_ids"].to(device)
+            prompt_attention_mask = tokenized["attention_mask"].to(device=device, dtype=torch.bool)
             
             # Repeat each prompt for num_completions_per_prompt completions
             prompt_ids = prompt_ids.repeat_interleave(num_completions_per_prompt, dim=0)
+            prompt_attention_mask = prompt_attention_mask.repeat_interleave(num_completions_per_prompt, dim=0)
             total_batch, prompt_len = prompt_ids.shape
 
             # ---- 2. Run diffusion generation to get prompt+completion sequences ----
@@ -949,6 +967,7 @@ class TiltLogModule(pl.LightningModule):
                     chunk_completion_ids = self._generate(
                         model=model,
                         prompt=prompt_ids[start:end],
+                        prompt_attention_mask=prompt_attention_mask[start:end],
                         steps=self.hparams.diffusion_steps,
                         gen_length=gen_length,
                         block_length=self.hparams.block_length,
@@ -1143,10 +1162,20 @@ class TiltLogModule(pl.LightningModule):
         kl = F.kl_div(log_A, log_B, reduction='none', log_target=True).sum(-1)
         return kl[mask_indices.bool()].float().mean()
 
+    def _build_sequence_attention_mask(self, prompt_attention_mask, gen_length):
+        completion_attention_mask = torch.ones(
+            prompt_attention_mask.shape[0],
+            gen_length,
+            device=prompt_attention_mask.device,
+            dtype=prompt_attention_mask.dtype,
+        )
+        return torch.cat([prompt_attention_mask, completion_attention_mask], dim=1)
+
     def _generate(
         self,
         model,
         prompt,
+        prompt_attention_mask,
         steps=128,
         gen_length=128,
         block_length=128,
@@ -1162,6 +1191,7 @@ class TiltLogModule(pl.LightningModule):
             prompt_len = prompt.shape[1]
             x = torch.full((bs, prompt_len + gen_length), mask_id, dtype=torch.long).to(model.device)
             x[:, :prompt_len] = prompt.clone()
+            sequence_attention_mask = self._build_sequence_attention_mask(prompt_attention_mask.to(model.device), gen_length)
 
             prompt_index = x != mask_id
 
@@ -1187,14 +1217,15 @@ class TiltLogModule(pl.LightningModule):
                         un_x = x.clone()
                         un_x[prompt_index] = mask_id
                         x_ = torch.cat([x, un_x], dim=0)
+                        attention_mask_ = torch.cat([sequence_attention_mask, sequence_attention_mask], dim=0)
 
                         # Get logits in a single forward pass
                         # logits = model(x_).logits
-                        logits = self._new_forward(model, x_, gen_length) # [2*B, gen_len, V]
+                        logits = self._new_forward(model, x_, gen_length, attention_mask=attention_mask_) # [2*B, gen_len, V]
                         logits, un_logits = torch.chunk(logits, 2, dim=0)
                         logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
                     else:
-                        logits = self._new_forward(model, x, gen_length) # [B, gen_len, V]
+                        logits = self._new_forward(model, x, gen_length, attention_mask=sequence_attention_mask) # [B, gen_len, V]
                         # logits_old_suffix = model(x).logits[:, -gen_length:, :] # [B, gen_len, V]
                         # diff = (logits_old_suffix - logits).abs()
                         # if diff.max().item() > 1e-8:
@@ -1382,12 +1413,15 @@ class TiltLogModule(pl.LightningModule):
         x = tfm.emb_drop(x)
 
         # ---- Attention mask → additive bias ---- (2107–2118)
-        if attention_mask is not None and 0.0 in attention_mask:
+        if attention_mask is not None:
+            if attention_mask.dtype != torch.bool:
+                attention_mask = attention_mask != 0
+            if bool(attention_mask.all().item()):
+                attention_mask = None
+            else:
             # [B, 1, 1, L], 0 for keep, -inf for pad
-            attention_mask = attention_mask.to(dtype=torch.float).view(batch_size, -1)[:, None, None, :]
-            attention_mask = (1.0 - attention_mask) * torch.finfo(attention_mask.dtype).min
-        else:
-            attention_mask = None
+                attention_mask = attention_mask.to(dtype=torch.float32).view(batch_size, -1)[:, None, None, :]
+                attention_mask = (1.0 - attention_mask) * torch.finfo(attention_mask.dtype).min
 
         attention_bias = None
 
@@ -1517,7 +1551,7 @@ class TiltLogModule(pl.LightningModule):
 
         return logits  # [B, gen_len, V]
 
-    def _new_forward(self, model, x, gen_length):
+    def _new_forward(self, model, x, gen_length, attention_mask=None):
         # x: [B, L]
-        hidden = self._llada_hidden_no_logits(model, x, attention_mask=None)
+        hidden = self._llada_hidden_no_logits(model, x, attention_mask=attention_mask)
         return self._llada_logits_on_suffix(model, hidden, gen_length)  # [B, gen_len, V]
