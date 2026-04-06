@@ -1,24 +1,21 @@
 #!/bin/bash
-#SBATCH --job-name=tilt_countdown
+#SBATCH --job-name=gsm_arch
 #SBATCH --account=kempner_albergo_lab
 #SBATCH --partition=kempner_h100
 #SBATCH --nodes=4
 #SBATCH --gpus-per-node=2
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=100GB
-#SBATCH --time=14:30:00
+#SBATCH --mem=50GB
+#SBATCH --time=40:00:00
 #SBATCH --mail-type=END,FAIL,BEGIN
-#SBATCH --mail-user=fwang@math.harvard.edu
-#SBATCH --output=/n/home03/sw958/project_1/SPG/tilt_matching/outputs/output_%j.out
+#SBATCH --mail-user=yuyuanchen@math.harvard.edu
 
-OUTPUT_DIR="/n/home03/sw958/project_1/SPG/tilt_matching/outputs/output_${SLURM_JOB_ID}"
+OUTPUT_DIR="/n/home06/yuyuan0/temp/TM_SPG/tilt_matching/gsm_outputs/output_${SLURM_JOB_ID}"
 mkdir -p "$OUTPUT_DIR"
 
-source ~/.bashrc
-mamba deactivate
-mamba activate spg
 module load cuda/12.4.1-fasrc01
+source /n/sw/Anaconda2-2019.10/etc/profile.d/conda.sh
+conda activate /n/netscratch/albergo_lab/Everyone/yuyuan0/conda/envs/spg
 
 # -------------------------
 # Networking configuration
@@ -26,20 +23,14 @@ module load cuda/12.4.1-fasrc01
 export NCCL_SOCKET_FAMILY=AF_INET
 export GLOO_USE_IPV6=0
 
-# Pick default IPv4 route interface for rendezvous (ethernet)
-DEFAULT_IF=$(ip -o -4 route show to default | awk '{print $5}' | head -n 1)
-if [ -z "${DEFAULT_IF:-}" ]; then
-  echo "ERROR: could not determine default IPv4 interface"
-  ip -o -4 route show
-  exit 2
-fi
-export GLOO_SOCKET_IFNAME="$DEFAULT_IF"
+# Rendezvous (TCPStore/GLOO) over Ethernet (em2)
+export GLOO_SOCKET_IFNAME=em4
 
 # NCCL data plane over InfiniBand (ib0)
 export NCCL_SOCKET_IFNAME=ib0
 
 # Choose a fixed port first (avoids "random port blocked" issues)
-export MASTER_PORT=$(( 10000 + SLURM_JOB_ID % 50000 ))
+export MASTER_PORT=29500
 
 export NODE_RANK=$SLURM_NODEID
 export NNODES=$SLURM_JOB_NUM_NODES
@@ -51,10 +42,10 @@ MASTER_NODE=$(scontrol show hostnames "${SLURM_JOB_NODELIST:-$SLURM_NODELIST}" |
 MASTER_FILE="$OUTPUT_DIR/master_addr.txt"
 
 if [ "$SLURM_NODEID" -eq 0 ]; then
-  # Pick em3 IPv4 on rank0 as MASTER_ADDR (rendezvous address)
-  MASTER_ADDR=$(ip -o -4 addr show dev "$DEFAULT_IF" | awk '{print $4}' | cut -d/ -f1 | head -n 1 || true)
+  # Pick em2 IPv4 on rank0 as MASTER_ADDR (rendezvous address)
+  MASTER_ADDR=$(ip -o -4 addr show dev em4 | awk '{print $4}' | cut -d/ -f1 || true)
   if [ -z "${MASTER_ADDR:-}" ]; then
-    echo "ERROR: could not find IPv4 on $DEFAULT_IF for rank0"
+    echo "ERROR: could not find IPv4 on em2 for rank0"
     ip -o -4 addr show
     exit 2
   fi
@@ -88,7 +79,7 @@ srun --ntasks-per-node=1 bash -lc \
 LOGDIR="$OUTPUT_DIR/logs"
 mkdir -p "$LOGDIR"
 
-cd /n/home03/sw958/project_1/SPG/tilt_matching
+cd /n/home06/yuyuan0/temp/TM_SPG/tilt_matching
 
 
 srun --ntasks-per-node=1 --gpus-per-task=2 \
@@ -102,6 +93,6 @@ srun --ntasks-per-node=1 --gpus-per-task=2 \
     --log_dir="$LOGDIR" \
     --redirects 3 \
     --tee 3 \
-    train_log.py \
-    --config-path /n/home03/sw958/project_1/SPG/tilt_matching/config \
-    --config-name trial_countdown.yaml
+    tilt_train.py \
+    --config-path /n/home06/yuyuan0/temp/TM_SPG/tilt_matching/config \
+    --config-name gsm8k.yaml

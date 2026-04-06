@@ -1,27 +1,27 @@
 #-----------------Tilt Matching Training Config-----------------
 tm:
   a_end: 100.0
-  buffer_chunk_size: 64
-  buffer_refresh_steps: 24
-  control_variate: 1
+  buffer_chunk_size: 30
+  buffer_refresh_steps: 25
+  control_variate: 1.0
   grad_accum_steps: 8
-  h: 1.0
+  h: 2.5
   loss_type: itm
   num_batch_prompts: 2
-  num_buffer_prompts: 40  # grad accum steps can't use more prompts than the buffer has, otherwise indexing error
+  num_buffer_prompts: 40
   num_buffer_refresh: 10
   num_completions_per_prompt: 6
   rescale_logits: false
-  rwd_shift: 0.0
-  steps_per_h: 800 # this is the number of optimizer steps per h
+  rwd_shift: -1.2
+  steps_per_h: 600 # this is the number of optimizer steps per h
   log_student: true
   log_temperature: 0.0
-  student_log_steps: 100
+  student_log_steps: 200
   student_logs_per_prompt: 1
   student_copy_over: false
   reset_global_step: false
   use_ema: true
-  ema_decay: 0.95
+  ema_decay: 0.96
 
 #-----------------Optimizer Config-----------------
 adam_beta1: 0.9
@@ -29,20 +29,20 @@ adam_beta2: 0.99
 adam_epsilon: 1e-8
 weight_decay: 0.1
 
-max_grad_norm: 2.0 # to be decreased
-learning_rate: 8e-6
-lr_decay_ratio: 0.25
-lr_min: 4e-6
+max_grad_norm: 2.0
+learning_rate: 4e-6
+lr_decay_ratio: 0.1
+lr_min: 2e-6
 lr_scheduler_type: linear
-lr_warmup_ratio: 0.0
+lr_warmup_ratio: 0.1
 
 #-----------------Diffusion Generation Config-----------------
 block_length: 32
-cfg_scale: 0.0 #TODO: check
+cfg_scale: 0.0
 diffusion_steps: 128
 max_completion_length: 256
-max_prompt_length: 172  # short for countdown
-remasking_strategy: random # or random
+max_prompt_length: 240
+remasking_strategy: low_confidence
 sampling_temperature: 1.0
 
 #-----------------Model Config-----------------
@@ -50,29 +50,26 @@ use_peft: true
 torch_dtype: bfloat16
 load_in_4bit: true
 base_model_path: /n/netscratch/albergo_lab/Everyone/frank/hf_models/LLaDA-8B-Instruct
-# don't implement any attention for llada
 
 lora_r: 128
 lora_alpha: 64
-lora_dropout: 0.05
+lora_dropout: 0.07
 peft_task_type: CAUSAL_LM
 
 #-----------------Logging and Checkpointing Config-----------------
-checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/countdown_scratch/resume_again3
+checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm_archeologist_0405
 metrics_log_every: 1
-resume_path: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/countdown_scratch/resume_again2/last.ckpt
+resume_path: # /n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_h1_re/checkpoint-a-3.000-24.0.ckpt
 # leave empty if not resuming
-
 wandb:
   entity: "yuyuanchen-harvard-university"
   project: "LLaDA_TM"
-  name: "log_countdown_h1.0"
+  name: "gsm"
 
 #-----------------Other Training Config-----------------
-dataset: countdown
-max_rwd: 5.0
-scale_factor: 1.1
-format_rwd: 0.50
+dataset: "gsm8k"
+max_rwd: 2.0
+math_split_idx: null
 few_shot: 0
 seed: 42
 nodes: 4

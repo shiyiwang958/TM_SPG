@@ -141,7 +141,6 @@ def train(cfg: DictConfig):
     tokenizer = AutoTokenizer.from_pretrained(cfg.base_model_path, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
     base_model.config.use_cache = False
-    # TODO: Need to load the LoRA weights onto the base model when starting from a checkpoint
 
     # Load the Tilt Matching training module
     model = TiltLogModule(

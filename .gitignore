@@ -167,3 +167,5 @@ slurm-*.out
 generated/
 cache/
 tmp/ 
+
+.codex
