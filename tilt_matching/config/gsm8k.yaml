@@ -12,7 +12,7 @@ tm:
   num_buffer_refresh: 10
   num_completions_per_prompt: 6
   rescale_logits: false
-  rwd_shift: -1.2
+  rwd_shift: -1.0
   steps_per_h: 600 # this is the number of optimizer steps per h
   log_student: true
   log_temperature: 0.0
@@ -22,6 +22,8 @@ tm:
   reset_global_step: false
   use_ema: true
   ema_decay: 0.96
+  use_eos_aware_weighted_loss: true
+  eos_future_discount_alpha: 0.7
 
 #-----------------Optimizer Config-----------------
 adam_beta1: 0.9
@@ -57,21 +59,21 @@ lora_dropout: 0.07
 peft_task_type: CAUSAL_LM
 
 #-----------------Logging and Checkpointing Config-----------------
-checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm_archeologist_0405
+checkpoint_dir: /n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm_archeologist_0405_alpha0.7
 metrics_log_every: 1
 resume_path: # /n/netscratch/albergo_lab/Everyone/frank/llada_tm/gsm8k_h1_re/checkpoint-a-3.000-24.0.ckpt
 # leave empty if not resuming
 wandb:
   entity: "yuyuanchen-harvard-university"
   project: "LLaDA_TM"
-  name: "gsm"
+  name: "gsm_avg_alpha"
 
 #-----------------Other Training Config-----------------
 dataset: "gsm8k"
 max_rwd: 2.0
 math_split_idx: null
 few_shot: 0
-seed: 42
+seed: 8000
 nodes: 4
 devices: 2  # 8? 4?
 world_size: 8

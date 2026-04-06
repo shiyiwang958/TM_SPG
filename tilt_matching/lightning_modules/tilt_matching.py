@@ -83,6 +83,14 @@ class TiltLogModule(pl.LightningModule):
         self.log_temperature = getattr(self.hparams.tm, "log_temperature", 1.0) 
         self.student_logs_per_prompt = getattr(self.hparams.tm, "student_logs_per_prompt", 4)
         self.validation_set = validation_set
+        self._eos_id = getattr(self.tokenizer, "eos_token_id", None)
+        self.use_eos_aware_weighted_loss = bool(getattr(self.hparams.tm, "use_eos_aware_weighted_loss", False))
+        self.eos_future_discount_alpha = float(getattr(self.hparams.tm, "eos_future_discount_alpha", 0.5))
+        if self.use_eos_aware_weighted_loss:
+            if self._eos_id is None:
+                raise ValueError("tokenizer.eos_token_id must be set when tm.use_eos_aware_weighted_loss is enabled.")
+            if not (0.0 < self.eos_future_discount_alpha < 1.0):
+                raise ValueError("tm.eos_future_discount_alpha must be in (0, 1) when tm.use_eos_aware_weighted_loss is enabled.")
         # micro-step metric accumulation
         self._micro_log_sums = {}
         self._micro_log_counts = {}
@@ -464,6 +472,7 @@ class TiltLogModule(pl.LightningModule):
         num_batch_prompts = self.hparams.tm.num_batch_prompts
         B = num_batch_prompts * comps_per_prompt
         gen_length = self.hparams.max_completion_length
+        block_length = self.hparams.block_length
 
         # Draw a batch from the buffer
         start_idx = ((self._grad_accum_counter % self.hparams.tm.grad_accum_steps) * num_batch_prompts) % self.buffer.shape[0]
@@ -492,8 +501,13 @@ class TiltLogModule(pl.LightningModule):
         correct_count = torch.tensor(float(correct_mask.numel()), device=self.device)
         
         # Create x_t's by masking the x_1's
-        num_to_mask = torch.randint(low=1, high=gen_length+1, size=(x1s.shape[0],), device=self.device)
-        xts, mask_indices = self._build_interpolant(x1s, num_to_mask, self.hparams.block_length)
+        completion_ids = x1s[:, -gen_length:]
+        if self.use_eos_aware_weighted_loss:
+            num_to_mask = self._build_eos_aware_num_to_mask(completion_ids, block_length, gen_length)
+            xts, mask_indices, active_block_mask = self._build_interpolant(x1s, num_to_mask, block_length)
+        else:
+            num_to_mask = torch.randint(low=1, high=gen_length+1, size=(x1s.shape[0],), device=self.device)
+            xts, mask_indices = self._build_interpolant(x1s, num_to_mask, block_length)
         sequence_attention_mask = self._build_sequence_attention_mask(prompt_attention_mask, gen_length)
 
         # Get model predictions and compute loss
@@ -502,7 +516,7 @@ class TiltLogModule(pl.LightningModule):
             self.model.eval()
             old_logits = self._new_forward(self.model, xts, gen_length, attention_mask=sequence_attention_mask) # [B, gen_length, V]
         V = old_logits.shape[-1]
-        x1_equals_v = F.one_hot(x1s.long()[:, -gen_length:], num_classes = V) # [B, gen_length, V]
+        x1_equals_v = F.one_hot(completion_ids.long(), num_classes = V) # [B, gen_length, V]
         with self._use_adapter("student"):
             self.model.train()   
             curr_logits = self._new_forward(self.model, xts, gen_length, attention_mask=sequence_attention_mask) # [B, gen_length, V]
@@ -523,14 +537,34 @@ class TiltLogModule(pl.LightningModule):
             target = self.cv * old_probs + x1_equals_v * (1 - self.cv + torch.expm1(hr)).view(-1, 1, 1) - torch.expm1(hr) * curr_probs.detach()
         else:
             raise ValueError(f"Invalid loss_type: {loss_type}")
-        per_sample_losses = -(target * F.log_softmax(curr_logits, dim=-1)).sum(dim=-1) # [B, gen_length]
-        loss = per_sample_losses[mask_indices.bool()].mean()
+        per_position_losses = -(target * F.log_softmax(curr_logits, dim=-1)).sum(dim=-1) # [B, gen_length]
+        if self.use_eos_aware_weighted_loss:
+            loss_weights = self._build_loss_weights(
+                completion_ids=completion_ids,
+                mask_indices=mask_indices,
+                active_block_mask=active_block_mask,
+                block_size=block_length,
+                dtype=per_position_losses.dtype,
+            )
+            per_row_losses = (per_position_losses * loss_weights).sum(dim=1)
+            per_row_weight = loss_weights.sum(dim=1)
+            valid_loss_rows = per_row_weight > 0
+            if bool(valid_loss_rows.any().item()):
+                normalized_row_losses = per_row_losses[valid_loss_rows] / per_row_weight[valid_loss_rows]
+                loss = normalized_row_losses.mean()
+            else:
+                loss = per_row_losses.new_zeros(())
+            log_mask = loss_weights > 0
+            effective_gen_len = self._compute_effective_gen_lengths(completion_ids).float().mean()
+        else:
+            loss = per_position_losses[mask_indices.bool()].mean()
+            log_mask = mask_indices.bool()
 
         log_dict = {
             f"train/loss": loss,
             f"train/a": self.a,
             f"train/h": self.h,
-            f"train/drift_gap_kl": self._kl_from_logits(old_logits, curr_logits, mask_indices),
+            f"train/drift_gap_kl": self._kl_from_logits(old_logits, curr_logits, log_mask),
             f"train/rwd_max": rwd.max(),
             f"train/rwd_min": rwd.min(),
             f"train/rwd_mean": rwd.mean(),
@@ -538,6 +572,8 @@ class TiltLogModule(pl.LightningModule):
             f"train/correct_sum": correct_sum,
             f"train/correct_count": correct_count,
         }
+        if self.use_eos_aware_weighted_loss:
+            log_dict["train/effective_gen_len"] = effective_gen_len
         
         return loss, log_dict
     
@@ -1160,7 +1196,48 @@ class TiltLogModule(pl.LightningModule):
         log_A = F.log_softmax(logits_A, dim=-1)
         log_B = F.log_softmax(logits_B, dim=-1)
         kl = F.kl_div(log_A, log_B, reduction='none', log_target=True).sum(-1)
-        return kl[mask_indices.bool()].float().mean()
+        masked = kl[mask_indices.bool()].float()
+        if masked.numel() == 0:
+            return kl.new_zeros(())
+        return masked.mean()
+
+    def _build_pre_eos_mask(self, completion_ids):
+        eos_hits = completion_ids.eq(self._eos_id)
+        seen_eos_before = eos_hits.to(torch.int32).cumsum(dim=1) - eos_hits.to(torch.int32)
+        return seen_eos_before == 0
+
+    def _compute_effective_gen_lengths(self, completion_ids):
+        eos_hits = completion_ids.eq(self._eos_id)
+        has_eos = eos_hits.any(dim=1)
+        first_eos = eos_hits.to(torch.int64).argmax(dim=1)
+        full_length = torch.full_like(first_eos, completion_ids.shape[1])
+        return torch.where(has_eos, first_eos + 1, full_length)
+
+    def _build_eos_aware_num_to_mask(self, completion_ids, block_size, gen_length):
+        if gen_length % block_size != 0:
+            raise ValueError("EOS-aware num_to_mask sampling requires generation length to be divisible by block_size.")
+        eff_lengths = self._compute_effective_gen_lengths(completion_ids)
+        eos_block_idx = (eff_lengths - 1) // block_size
+        num_blocks = gen_length // block_size
+        min_to_mask = block_size * (num_blocks - 1 - eos_block_idx) + 1
+        span = gen_length - min_to_mask + 1
+        rand = torch.rand_like(span, dtype=torch.float32)
+        return min_to_mask + torch.floor(rand * span.to(torch.float32)).to(torch.long)
+
+    def _build_loss_weights(self, completion_ids, mask_indices, active_block_mask, block_size, dtype):
+        pre_eos_mask = self._build_pre_eos_mask(completion_ids)
+        gen_length = mask_indices.shape[1]
+        if gen_length % block_size != 0:
+            raise ValueError("EOS-aware weighted loss requires generation length to be divisible by block_size.")
+
+        device = mask_indices.device
+        block_ids = torch.arange(gen_length, device=device, dtype=torch.long) // block_size
+        active_block_ids = (active_block_mask.to(torch.long) * block_ids.unsqueeze(0)).amax(dim=1)
+        block_offsets = block_ids.unsqueeze(0) - active_block_ids.unsqueeze(1)
+        masked_offsets = torch.where(mask_indices, block_offsets, torch.zeros_like(block_offsets))
+
+        alpha = torch.tensor(self.eos_future_discount_alpha, device=device, dtype=dtype)
+        return mask_indices.to(dtype) * torch.pow(alpha, masked_offsets.to(dtype)) * pre_eos_mask.to(dtype)
 
     def _build_sequence_attention_mask(self, prompt_attention_mask, gen_length):
         completion_attention_mask = torch.ones(
@@ -1318,6 +1395,7 @@ class TiltLogModule(pl.LightningModule):
         Returns:
             xts: Tensor of shape [B, L], the partially masked sequences at time t.
             mask_indices: BoolTensor of shape [B, gen_length], True where tokens are masked.
+            active_block_mask: BoolTensor of shape [B, gen_length], True on the partially masked active block.
         """
         device = x1s.device
         B, L = x1s.shape
@@ -1361,7 +1439,7 @@ class TiltLogModule(pl.LightningModule):
         ) # [B, gen_len]
         xts[:, prompt_len:] = completion_region
 
-        return xts, mask_indices
+        return xts, mask_indices, partial_to_mask.bool()
 
     def _unwrap_llada_core(self, m: torch.nn.Module):
         """

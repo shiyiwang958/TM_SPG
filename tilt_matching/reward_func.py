@@ -125,7 +125,7 @@ def correctness_reward_func(prompts, completions, answer, step=None, run_name=No
                                 pass
 
         is_correct = parsed_answer is not None and parsed_answer == float(ground_truth.replace(",", ""))
-        print(parsed_answer if parsed_answer is not None else "None", ground_truth, is_correct)
+        # print(parsed_answer if parsed_answer is not None else "None", ground_truth, is_correct)
         extracted_responses.append(parsed_answer if parsed_answer is not None else "<no valid answer>")
         if is_correct:
             scores.append(2.0)
