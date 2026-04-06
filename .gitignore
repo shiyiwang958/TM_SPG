@@ -169,3 +169,5 @@ cache/
 tmp/ 
 
 .codex
+
+gsm_outputs/
